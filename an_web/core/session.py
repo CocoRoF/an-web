@@ -7,10 +7,11 @@ if TYPE_CHECKING:
     from an_web.core.engine import ANWebEngine
     from an_web.core.scheduler import EventLoopScheduler
     from an_web.core.snapshot import SnapshotManager
+    from an_web.dom.nodes import Document
+    from an_web.dom.semantics import PageSemantics
     from an_web.net.client import NetworkClient
     from an_web.net.cookies import CookieJar
     from an_web.policy.rules import PolicyRules
-    from an_web.semantic.extractor import PageSemantics
 
 
 class Session:
@@ -33,12 +34,18 @@ class Session:
         self.policy = policy
         self._closed = False
 
-        # These are initialized in _init()
+        # Subsystems — initialized in _init()
         self.scheduler: EventLoopScheduler | None = None
         self.network: NetworkClient | None = None
         self.cookies: CookieJar | None = None
         self.snapshots: SnapshotManager | None = None
+
+        # Current page state
         self._current_url: str = "about:blank"
+        self._current_document: Document | None = None
+
+        # Navigation history
+        self._history: list[str] = []
 
     async def _init(self) -> None:
         """Lazy initialization of all subsystems."""
@@ -53,19 +60,33 @@ class Session:
         self.snapshots = SnapshotManager()
 
     async def navigate(self, url: str) -> dict[str, Any]:
-        """Navigate to a URL and return action result."""
+        """
+        Navigate to a URL, parse HTML, and settle the page.
+
+        Returns ActionResult as a dict.
+        """
         from an_web.actions.navigate import NavigateAction
-        action = NavigateAction()
-        return await action.execute(url=url, session=self)
+        result = await NavigateAction().execute(session=self, url=url)
+        if result.is_ok():
+            self._history.append(url)
+        return result.to_dict()
 
     async def snapshot(self) -> PageSemantics:
-        """Return current page semantic state."""
+        """Return current page semantic state as a PageSemantics object."""
         from an_web.semantic.extractor import SemanticExtractor
         extractor = SemanticExtractor()
         return await extractor.extract(session=self)
 
     async def act(self, tool_call: dict[str, Any]) -> dict[str, Any]:
-        """Execute an AI tool call and return structured result."""
+        """
+        Execute an AI tool call and return a structured ActionResult dict.
+
+        tool_call format::
+
+            {"tool": "click", "target": "#submit-btn"}
+            {"tool": "type", "target": "#email", "text": "user@example.com"}
+            {"tool": "navigate", "url": "https://example.com"}
+        """
         from an_web.api.rpc import dispatch_tool
         return await dispatch_tool(tool_call, session=self)
 
@@ -76,6 +97,14 @@ class Session:
         if self.network:
             await self.network.close()
         self._closed = True
+
+    @property
+    def current_url(self) -> str:
+        return self._current_url
+
+    @property
+    def history(self) -> list[str]:
+        return list(self._history)
 
     async def __aenter__(self) -> Session:
         return self

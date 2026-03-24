@@ -1,210 +1,229 @@
 """
 HTML parser bridge — selectolax (Lexbor) → AN-Web DOM tree.
 
-Primary: selectolax (fast, C-backed)
+Primary: selectolax (fast, C-backed Lexbor)
 Fallback: html5lib (spec-accurate, slower)
 
-Mirrors Lightpanda's html5ever-based parser/Parser.zig,
-but in Python with pluggable backends.
+Mirrors Lightpanda's parser/Parser.zig: builds a navigable,
+AI-enriched DOM tree where every Element carries visibility_state
+and is_interactive already computed.
 """
 from __future__ import annotations
 
-import uuid
+import itertools
 from typing import Any
 
-from an_web.dom.nodes import Document, Element, TextNode
+from an_web.dom.nodes import Document, Element, TextNode, Node
 from an_web.layout.visibility import compute_visibility
 
 
-def parse_html(html: str, base_url: str = "about:blank") -> Document:
-    """
-    Parse HTML string into AN-Web Document tree.
+# ─── Unique node ID counter ───────────────────────────────────────────────────
 
-    Tries selectolax first; falls back to html5lib on parse error.
-    """
-    try:
-        return _parse_selectolax(html, base_url)
-    except Exception:
-        try:
-            return _parse_html5lib(html, base_url)
-        except Exception:
-            # Last resort: return minimal document
-            doc = Document(url=base_url)
-            return doc
-
-
-# ─── Counter for unique node IDs ─────────────────────────────────────────────
-
-_counter = 0
+_id_counter = itertools.count(1)
 
 
 def _new_id() -> str:
-    global _counter
-    _counter += 1
-    return f"n{_counter}"
+    return f"n{next(_id_counter)}"
 
 
-# ─── selectolax backend ──────────────────────────────────────────────────────
+# ─── Interactive tag set ──────────────────────────────────────────────────────
 
-def _parse_selectolax(html: str, base_url: str) -> Document:
-    from selectolax.lexbor import LexborHTMLParser  # type: ignore[import]
+_INTERACTIVE_TAGS = frozenset({"input", "button", "a", "select", "textarea"})
+_SKIP_TAGS = frozenset({"script", "style", "noscript", "meta", "link", "template"})
 
-    parser = LexborHTMLParser(html)
-    doc = Document(url=base_url)
 
-    # Extract <title>
-    title_node = parser.css_first("title")
-    if title_node:
-        doc.title = title_node.text(strip=True)
+# ─── Public API ───────────────────────────────────────────────────────────────
 
-    # Build DOM from selectolax tree
-    root = parser.root
-    if root:
-        _walk_selectolax(root, doc, doc)
+def parse_html(html: str, base_url: str = "about:blank") -> Document:
+    """
+    Parse HTML string into an AN-Web Document tree.
 
+    Tries selectolax/Lexbor first; falls back to html5lib on any error.
+    Returns a minimal empty Document on total parse failure.
+
+    After building the tree, propagates inherited visibility (display:none
+    from parent → children) so ClickAction can correctly reject hidden targets.
+    """
+    try:
+        doc = _parse_selectolax(html, base_url)
+    except Exception:
+        try:
+            doc = _parse_html5lib(html, base_url)
+        except Exception:
+            return Document(url=base_url)
+
+    _propagate_visibility(doc)
     return doc
 
 
-def _walk_selectolax(
-    sl_node: Any,
-    parent: Any,
-    doc: Document,
-) -> None:
-    """Recursively walk selectolax nodes into AN-Web DOM."""
-    SKIP_TAGS = {"html", "head", "script", "style", "noscript"}
+def _propagate_visibility(doc: Document) -> None:
+    """
+    Inherit visibility_state from parent to children.
 
-    for child in sl_node.iter():
-        if child == sl_node:
-            continue
+    An element is 'none' if any ancestor has visibility_state='none'.
+    This matches browser CSS cascade: display:none is inherited.
+    """
+    _propagate_node(doc, inherited_none=False)
 
-        tag = (child.tag or "").lower()
+
+def _propagate_node(node: Any, inherited_none: bool) -> None:
+    from an_web.dom.nodes import Element
+    for child in node.children:
+        if isinstance(child, Element):
+            if inherited_none:
+                child.visibility_state = "none"
+            # Recurse: pass True if this child OR its ancestor is hidden
+            _propagate_node(child, inherited_none or child.visibility_state == "none")
+        else:
+            _propagate_node(child, inherited_none)
+
+
+# ─── selectolax backend ───────────────────────────────────────────────────────
+
+def _parse_selectolax(html: str, base_url: str) -> Document:
+    try:
+        from selectolax.lexbor import LexborHTMLParser as Parser  # type: ignore[import]
+    except ImportError:
+        from selectolax.parser import HTMLParser as Parser  # type: ignore[import]
+
+    p = Parser(html)
+    doc = Document(url=base_url)
+
+    title_node = p.css_first("title")
+    if title_node:
+        doc.title = title_node.text(strip=True)
+
+    # Use mem_id (stable C-level address) as the key — Python's id() is NOT
+    # stable for selectolax nodes because each attribute access creates a new
+    # Python wrapper around the same C pointer.
+    #
+    # The selectolax root (html element) maps to our Document so that
+    # body/head become direct children of doc.
+    sl_to_dom: dict[int, Node] = {}
+    if p.root is not None:
+        sl_to_dom[p.root.mem_id] = doc
+
+    # css("*") yields elements in document order (pre-order DFS)
+    for sl_node in p.css("*"):
+        tag = (sl_node.tag or "").lower()
         if not tag:
             continue
 
-        if tag == "-text":
-            text = child.text_content or ""
-            if text.strip():
-                text_node = TextNode(node_id=_new_id(), data=text)
-                parent.append_child(text_node)
+        node_mem_id = sl_node.mem_id
+
+        # html → doc root (already mapped above, but re-register for safety)
+        if tag == "html":
+            sl_to_dom[node_mem_id] = doc
             continue
 
-        if tag in SKIP_TAGS:
+        # head → collapse to doc so its non-content children fall to doc
+        if tag == "head":
+            sl_to_dom[node_mem_id] = doc
             continue
 
-        # Build attributes dict
+        if tag in _SKIP_TAGS:
+            # Don't add to DOM, but map to parent so descendants fall correctly
+            parent_dom = _find_parent_by_mem_id(sl_node, sl_to_dom, doc)
+            sl_to_dom[node_mem_id] = parent_dom
+            continue
+
+        # Build attributes
         attrs: dict[str, str] = {}
-        try:
-            if child.attributes:
-                attrs = dict(child.attributes)
-        except Exception:
-            pass
+        if sl_node.attributes:
+            attrs = {k: (v if v is not None else "") for k, v in sl_node.attributes.items()}
 
-        element = Element(node_id=_new_id(), tag=tag, attributes=attrs)
-        element.visibility_state = compute_visibility(element)
+        el = Element(node_id=_new_id(), tag=tag, attributes=attrs)
+        el.visibility_state = compute_visibility(el)
+        el.is_interactive = tag in _INTERACTIVE_TAGS
 
-        doc.register_element(element)
-        parent.append_child(element)
+        doc.register_element(el)
+        sl_to_dom[node_mem_id] = el
 
-        # Recurse (direct children only — selectolax iter() is flat, so we stop here)
-        # Full recursive walk handled by selectolax's own tree
+        parent_dom = _find_parent_by_mem_id(sl_node, sl_to_dom, doc)
+        parent_dom.append_child(el)
 
-
-def _parse_selectolax_recursive(html: str, base_url: str) -> Document:
-    """Alternative selectolax parser using css() traversal."""
-    try:
-        from selectolax.parser import HTMLParser  # type: ignore[import]
-    except ImportError:
-        from selectolax.lexbor import LexborHTMLParser as HTMLParser  # type: ignore[import]
-
-    parser = HTMLParser(html)
-    doc = Document(url=base_url)
-
-    title_node = parser.css_first("title")
-    if title_node:
-        doc.title = title_node.text(strip=True)
-
-    body = parser.css_first("body")
-    if body:
-        _convert_selectolax_node(body, doc, doc)
+        # Capture direct (non-child) text content
+        direct_text = _direct_text(sl_node)
+        if direct_text:
+            el.append_child(TextNode(node_id=_new_id(), data=direct_text))
 
     return doc
 
 
-def _convert_selectolax_node(sl_node: Any, parent: Any, doc: Document) -> None:
-    """Convert a single selectolax node and its subtree."""
-    SKIP_TAGS = {"script", "style", "noscript", "meta", "link"}
-
-    for child in sl_node.iter():
-        if child == sl_node:
-            continue
-
-        tag = (child.tag or "").lower()
-        if not tag or tag in SKIP_TAGS:
-            continue
-
-        if tag == "-text":
-            text = child.text_content or ""
-            if text.strip():
-                parent.append_child(TextNode(node_id=_new_id(), data=text))
-            continue
-
-        attrs: dict[str, str] = {}
-        try:
-            if child.attributes:
-                attrs = {k: v or "" for k, v in child.attributes.items()}
-        except Exception:
-            pass
-
-        el = Element(node_id=_new_id(), tag=tag, attributes=attrs)
-        el.visibility_state = compute_visibility(el)
-        doc.register_element(el)
-        parent.append_child(el)
+def _find_parent_by_mem_id(sl_node: Any, sl_to_dom: dict[int, Node], doc: Document) -> Node:
+    """Walk up the selectolax parent chain using mem_id for stable identity."""
+    sl_parent = getattr(sl_node, "parent", None)
+    while sl_parent is not None:
+        mapped = sl_to_dom.get(sl_parent.mem_id)
+        if mapped is not None:
+            return mapped
+        sl_parent = getattr(sl_parent, "parent", None)
+    return doc
 
 
-# ─── html5lib backend ────────────────────────────────────────────────────────
+def _direct_text(sl_node: Any) -> str:
+    """Return direct (non-descendant) text content of a selectolax node."""
+    try:
+        return (sl_node.text(deep=False, strip=True) or "").strip()
+    except Exception:
+        return ""
+
+
+# ─── html5lib fallback ────────────────────────────────────────────────────────
 
 def _parse_html5lib(html: str, base_url: str) -> Document:
     import html5lib  # type: ignore[import]
 
-    tree_builder = html5lib.parse(html, treebuilder="etree", namespaceHTMLElements=False)
+    et_root = html5lib.parse(html, treebuilder="etree", namespaceHTMLElements=False)
     doc = Document(url=base_url)
 
-    # Walk etree
-    _walk_etree(tree_builder, doc, doc)
+    # Extract title
+    for el in et_root.iter():
+        tag = _strip_ns(el.tag)
+        if tag == "title" and el.text:
+            doc.title = el.text.strip()
+            break
 
+    _walk_etree(et_root, doc, doc)
     return doc
 
 
-def _walk_etree(etree_node: Any, parent: Any, doc: Document) -> None:
-    """Walk an ElementTree node into AN-Web DOM."""
-    import xml.etree.ElementTree as ET
+def _strip_ns(tag: str) -> str:
+    return tag.split("}", 1)[-1].lower() if "}" in tag else tag.lower()
 
-    SKIP_TAGS = {"script", "style", "noscript", "meta", "link", "head"}
 
-    for child in etree_node:
-        # Strip namespace
-        tag = child.tag
-        if isinstance(tag, str) and "}" in tag:
-            tag = tag.split("}", 1)[1]
-        tag = tag.lower()
+def _walk_etree(et_node: Any, parent: Node, doc: Document) -> None:
+    """Recursively convert an ElementTree subtree into AN-Web DOM nodes."""
+    _ETREE_SKIP = frozenset({"script", "style", "noscript", "meta", "link",
+                              "head", "template"})
 
-        if tag in SKIP_TAGS:
+    for child in et_node:
+        tag = _strip_ns(child.tag)
+
+        if not tag or tag in _ETREE_SKIP:
+            _walk_etree(child, parent, doc)  # still recurse for body under html
             continue
 
-        attrs = {k.split("}", 1)[-1] if "}" in k else k: v
-                 for k, v in (child.attrib or {}).items()}
+        if tag == "html":
+            _walk_etree(child, doc, doc)
+            continue
+
+        attrs: dict[str, str] = {
+            (_strip_ns(k) if "}" in k else k): (v or "")
+            for k, v in (child.attrib or {}).items()
+        }
 
         el = Element(node_id=_new_id(), tag=tag, attributes=attrs)
         el.visibility_state = compute_visibility(el)
+        el.is_interactive = tag in _INTERACTIVE_TAGS
+
         doc.register_element(el)
         parent.append_child(el)
 
-        # Text content
         if child.text and child.text.strip():
-            el.append_child(TextNode(node_id=_new_id(), data=child.text))
+            el.append_child(TextNode(node_id=_new_id(), data=child.text.strip()))
 
         _walk_etree(child, el, doc)
 
-        # Tail text (text after closing tag)
         if child.tail and child.tail.strip():
-            parent.append_child(TextNode(node_id=_new_id(), data=child.tail))
+            parent.append_child(TextNode(node_id=_new_id(), data=child.tail.strip()))

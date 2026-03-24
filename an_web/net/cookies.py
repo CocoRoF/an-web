@@ -16,6 +16,8 @@ class Cookie:
     secure: bool = False
     http_only: bool = False
     same_site: str = "Lax"
+    max_age: int | None = None          # seconds; takes priority over expires
+    expires_raw: str = ""               # raw Expires= string (parsed lazily)
 
     def is_expired(self) -> bool:
         if self.expires is None:

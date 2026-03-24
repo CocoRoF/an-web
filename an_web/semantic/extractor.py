@@ -3,6 +3,11 @@ Semantic extraction engine — DOM → AI world model.
 
 Corresponds to Lightpanda's SemanticTree.zig walk() function,
 extended with page-level classification and action ranking.
+
+Primary API:
+    extractor = SemanticExtractor()
+    page = extractor.extract_from_document(doc, url="https://example.com")
+    # page.semantic_tree, page.primary_actions, page.inputs, etc.
 """
 from __future__ import annotations
 
@@ -32,16 +37,72 @@ class SemanticExtractor:
         self.prune = prune
         self.interactive_only = interactive_only
 
-    async def extract(self, session: Session) -> PageSemantics:
-        from an_web.dom.semantics import PageSemantics, SemanticNode
+    def extract_from_document(
+        self,
+        doc: Document,
+        url: str = "about:blank",
+        snapshot_manager: Any = None,
+    ) -> PageSemantics:
+        """
+        Synchronous extraction from a Document object.
+
+        This is the primary entry point for all code that already has a parsed
+        Document (e.g. NavigateAction, tests, offline processing).
+        """
+        from an_web.dom.semantics import PageSemantics
         from an_web.semantic.page_type import classify_page_type
         from an_web.semantic.affordances import rank_primary_actions
+
+        # Walk DOM → SemanticNode tree
+        root_node = self._walk_document(doc)
+
+        title = getattr(doc, "title", "") or ""
+        page_type = classify_page_type(root_node, title=title, url=url)
+
+        # Collect interactive nodes
+        interactive = root_node.find_interactive()
+        interactive_dicts = [n.to_dict() for n in interactive]
+        primary_actions = rank_primary_actions(interactive_dicts)[:5]
+
+        # Collect input fields by ARIA role
+        _INPUT_ROLES = frozenset({
+            "textbox", "combobox", "searchbox", "spinbutton", "checkbox", "radio",
+        })
+        inputs = [n.to_dict() for n in interactive if n.role in _INPUT_ROLES]
+
+        # Blocking elements (modals, banners)
+        blocking = self._find_blockers(root_node)
+
+        # Snapshot
+        snap_id = f"snap-{uuid.uuid4().hex[:8]}"
+        if snapshot_manager is not None:
+            import html
+            snap = snapshot_manager.create(
+                url=url,
+                dom_content=title,  # lightweight fingerprint
+                semantic_data=root_node.to_dict(),
+            )
+            snap_id = snap.snapshot_id
+
+        return PageSemantics(
+            page_type=page_type,
+            title=title,
+            url=url,
+            primary_actions=primary_actions,
+            inputs=inputs,
+            blocking_elements=blocking,
+            semantic_tree=root_node,
+            snapshot_id=snap_id,
+        )
+
+    async def extract(self, session: Session) -> PageSemantics:
+        """Async extraction bound to a live Session."""
+        from an_web.dom.semantics import PageSemantics, SemanticNode
 
         doc = getattr(session, "_current_document", None)
         url = getattr(session, "_current_url", "about:blank")
 
         if doc is None:
-            # Return empty semantics for unloaded page
             empty_root = SemanticNode(
                 node_id="root",
                 tag="document",
@@ -63,46 +124,8 @@ class SemanticExtractor:
                 snapshot_id=f"snap-empty-{uuid.uuid4().hex[:8]}",
             )
 
-        # Walk DOM → SemanticNode tree
-        root_node = self._walk_document(doc)
-
-        # Classify page type
-        title = getattr(doc, "title", "")
-        page_type = classify_page_type(root_node, title=title, url=url)
-
-        # Find primary actions
-        interactive = root_node.find_interactive()
-        interactive_dicts = [n.to_dict() for n in interactive]
-        primary_actions = rank_primary_actions(interactive_dicts)[:5]  # top 5
-
-        # Find input fields
-        inputs = [n.to_dict() for n in interactive if n.role in (
-            "textbox", "combobox", "searchbox", "spinbutton", "checkbox", "radio"
-        )]
-
-        # Find blocking elements (modals, cookie banners)
-        blocking = self._find_blockers(root_node)
-
-        # Create snapshot
-        snap_id = f"snap-{uuid.uuid4().hex[:8]}"
-        if session.snapshots:
-            snap = session.snapshots.create(
-                url=url,
-                dom_content="",  # filled by full impl
-                semantic_data=root_node.to_dict(),
-            )
-            snap_id = snap.snapshot_id
-
-        return PageSemantics(
-            page_type=page_type,
-            title=title,
-            url=url,
-            primary_actions=primary_actions,
-            inputs=inputs,
-            blocking_elements=blocking,
-            semantic_tree=root_node,
-            snapshot_id=snap_id,
-        )
+        snap_mgr = getattr(session, "snapshots", None)
+        return self.extract_from_document(doc, url=url, snapshot_manager=snap_mgr)
 
     def _walk_document(self, doc: Document) -> SemanticNode:
         from an_web.dom.semantics import SemanticNode
@@ -203,6 +226,8 @@ class SemanticExtractor:
                 self._walk_node(child, sem_node, child_counts2, depth + 1, xpath + "/")
 
         elif isinstance(node, TextNode):
+            if self.interactive_only:
+                return
             text = node.data.strip()
             if not text:
                 return
