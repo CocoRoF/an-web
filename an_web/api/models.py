@@ -64,7 +64,7 @@ class SubmitRequest(BaseModel):
 
 class ExtractRequest(BaseModel):
     tool: Literal["extract"] = "extract"
-    query: str
+    query: Union[str, dict] = ""
     mode: Literal["css", "structured", "json", "html"] = "css"
     limit: int = 100
 
