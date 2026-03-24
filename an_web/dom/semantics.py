@@ -41,6 +41,8 @@ class SemanticNode:
     affordances: list[str] = field(default_factory=list)  # ["click","type","select"]
     stable_selector: str | None = None
     confidence: float = 1.0
+    interaction_rank: float = 0.0       # 0.0–1.0 from layout engine assessment
+    form_scope_id: str | None = None    # node_id of enclosing <form>
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -63,6 +65,10 @@ class SemanticNode:
             d["attributes"] = self.attributes
         if self.stable_selector:
             d["stableSelector"] = self.stable_selector
+        if self.interaction_rank:
+            d["interactionRank"] = round(self.interaction_rank, 3)
+        if self.form_scope_id:
+            d["formScopeId"] = self.form_scope_id
         if self.children:
             d["children"] = [c.to_dict() for c in self.children]
         return d

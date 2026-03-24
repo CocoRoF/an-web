@@ -235,12 +235,18 @@ class TestAccessibleName:
         names = [b.name for b in buttons if b.name]
         assert any("Sign In" in n for n in names)
 
-    def test_input_name_from_placeholder(self):
+    def test_input_name_from_label_or_placeholder(self):
+        """label[for] wins over placeholder; either is an acceptable name."""
         doc = parse_html(LOGIN_HTML)
         ps = make_extractor().extract_from_document(doc)
         textboxes = ps.semantic_tree.find_by_role("textbox")
         names = [t.name for t in textboxes if t.name]
-        assert any("example.com" in (n or "") for n in names)
+        # email input gets name from label[for="email"] = "Email"
+        # or from placeholder "you@example.com" if label not found
+        assert any(
+            "Email" in (n or "") or "example.com" in (n or "")
+            for n in names
+        )
 
     def test_aria_label_wins(self):
         html = '<button aria-label="Close dialog">X</button>'
@@ -328,6 +334,136 @@ class TestInteractiveOnlyMode:
                 continue
             # StaticText and headings should be excluded in interactive_only mode
             assert node.is_interactive or node.role not in ("heading", "StaticText")
+
+
+# ─── aria-labelledby ──────────────────────────────────────────────────────────
+
+class TestAriaLabelledby:
+    def test_aria_labelledby_resolved(self):
+        html = """
+        <div id="lbl">Email address</div>
+        <input type="email" aria-labelledby="lbl">
+        """
+        doc = parse_html(html)
+        ps = make_extractor().extract_from_document(doc)
+        textboxes = ps.semantic_tree.find_by_role("textbox")
+        names = [t.name for t in textboxes if t.name]
+        assert any("Email address" in n for n in names)
+
+    def test_aria_label_beats_label_for(self):
+        """aria-label should take priority over label[for]."""
+        html = """
+        <label for="inp">Label text</label>
+        <input id="inp" type="text" aria-label="ARIA wins">
+        """
+        doc = parse_html(html)
+        ps = make_extractor().extract_from_document(doc)
+        textboxes = ps.semantic_tree.find_by_role("textbox")
+        names = [t.name for t in textboxes if t.name]
+        assert any("ARIA wins" in n for n in names)
+        assert not any("Label text" in n for n in names)
+
+
+# ─── label[for] lookup ─────────────────────────────────────────────────────────
+
+class TestLabelForLookup:
+    def test_label_for_input_id_provides_name(self):
+        html = """
+        <label for="username">Username</label>
+        <input id="username" type="text">
+        """
+        doc = parse_html(html)
+        ps = make_extractor().extract_from_document(doc)
+        textboxes = ps.semantic_tree.find_by_role("textbox")
+        names = [t.name for t in textboxes if t.name]
+        assert any("Username" in n for n in names)
+
+    def test_label_for_password_input(self):
+        html = """
+        <label for="pw">Password</label>
+        <input id="pw" type="password">
+        """
+        doc = parse_html(html)
+        ps = make_extractor().extract_from_document(doc)
+        textboxes = ps.semantic_tree.find_by_role("textbox")
+        # Password input — should get name from label[for]
+        names = [t.name for t in textboxes if t.name]
+        assert any("Password" in n for n in names)
+
+
+# ─── form_scope_id ─────────────────────────────────────────────────────────────
+
+class TestFormScopeId:
+    def test_input_inside_form_has_form_scope_id(self):
+        html = """
+        <form id="login-form">
+          <input type="email" name="email">
+          <button type="submit">Login</button>
+        </form>
+        """
+        doc = parse_html(html)
+        ps = make_extractor().extract_from_document(doc)
+        interactive = ps.semantic_tree.find_interactive()
+        inputs = [n for n in interactive if n.tag == "input"]
+        # Inputs inside form should have form_scope_id set
+        form_scoped = [n for n in inputs if n.form_scope_id is not None]
+        assert len(form_scoped) >= 1
+
+    def test_input_outside_form_no_scope_id(self):
+        html = """
+        <div>
+          <input type="text" name="standalone">
+        </div>
+        """
+        doc = parse_html(html)
+        ps = make_extractor().extract_from_document(doc)
+        interactive = ps.semantic_tree.find_interactive()
+        inputs = [n for n in interactive if n.tag == "input"]
+        # Standalone input — form_scope_id should be None
+        assert all(n.form_scope_id is None for n in inputs)
+
+
+# ─── SemanticNode new fields ───────────────────────────────────────────────────
+
+class TestSemanticNodeNewFields:
+    def test_interaction_rank_present(self):
+        doc = parse_html(LOGIN_HTML)
+        ps = make_extractor().extract_from_document(doc)
+        interactive = ps.semantic_tree.find_interactive()
+        # interaction_rank field should exist (defaults to 0.0)
+        for node in interactive:
+            assert hasattr(node, "interaction_rank")
+            assert isinstance(node.interaction_rank, float)
+
+    def test_form_scope_id_field_present(self):
+        doc = parse_html(LOGIN_HTML)
+        ps = make_extractor().extract_from_document(doc)
+        interactive = ps.semantic_tree.find_interactive()
+        for node in interactive:
+            assert hasattr(node, "form_scope_id")
+
+    def test_interaction_rank_in_to_dict_when_nonzero(self):
+        from an_web.dom.semantics import SemanticNode
+        node = SemanticNode(
+            node_id="n1", tag="button", role="button",
+            name="Submit", value=None, xpath="/button[1]",
+            is_interactive=True, visible=True,
+            interaction_rank=0.75,
+        )
+        d = node.to_dict()
+        assert "interactionRank" in d
+        assert d["interactionRank"] == 0.75
+
+    def test_interaction_rank_not_in_to_dict_when_zero(self):
+        from an_web.dom.semantics import SemanticNode
+        node = SemanticNode(
+            node_id="n1", tag="button", role="button",
+            name="Submit", value=None, xpath="/button[1]",
+            is_interactive=True, visible=True,
+            interaction_rank=0.0,
+        )
+        d = node.to_dict()
+        assert "interactionRank" not in d
 
 
 # ─── to_dict / serialization ──────────────────────────────────────────────────

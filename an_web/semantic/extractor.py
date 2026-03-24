@@ -28,9 +28,11 @@ class SemanticExtractor:
     - Skip metadata tags (head, script, style, svg)
     - Skip invisible elements (display:none, hidden attr)
     - Skip pure whitespace text nodes
-    - Compute ARIA role + accessible name
+    - Compute ARIA role + accessible name (aria-labelledby, label[for], etc.)
     - Classify interactivity
     - Attach XPath + stable selector
+    - Assign form_scope_id for form controls
+    - Carry interaction_rank from element importance score
     """
 
     def __init__(self, prune: bool = True, interactive_only: bool = False) -> None:
@@ -39,10 +41,10 @@ class SemanticExtractor:
 
     def extract_from_document(
         self,
-        doc: Document,
+        doc: "Document",
         url: str = "about:blank",
         snapshot_manager: Any = None,
-    ) -> PageSemantics:
+    ) -> "PageSemantics":
         """
         Synchronous extraction from a Document object.
 
@@ -53,8 +55,12 @@ class SemanticExtractor:
         from an_web.semantic.page_type import classify_page_type
         from an_web.semantic.affordances import rank_primary_actions
 
+        # Build lookup helpers once before walking
+        label_for_map = self._build_label_for_map(doc)
+        id_element_map = self._build_id_element_map(doc)
+
         # Walk DOM → SemanticNode tree
-        root_node = self._walk_document(doc)
+        root_node = self._walk_document(doc, label_for_map, id_element_map)
 
         title = getattr(doc, "title", "") or ""
         page_type = classify_page_type(root_node, title=title, url=url)
@@ -76,7 +82,6 @@ class SemanticExtractor:
         # Snapshot
         snap_id = f"snap-{uuid.uuid4().hex[:8]}"
         if snapshot_manager is not None:
-            import html
             snap = snapshot_manager.create(
                 url=url,
                 dom_content=title,  # lightweight fingerprint
@@ -95,7 +100,7 @@ class SemanticExtractor:
             snapshot_id=snap_id,
         )
 
-    async def extract(self, session: Session) -> PageSemantics:
+    async def extract(self, session: "Session") -> "PageSemantics":
         """Async extraction bound to a live Session."""
         from an_web.dom.semantics import PageSemantics, SemanticNode
 
@@ -127,7 +132,56 @@ class SemanticExtractor:
         snap_mgr = getattr(session, "snapshots", None)
         return self.extract_from_document(doc, url=url, snapshot_manager=snap_mgr)
 
-    def _walk_document(self, doc: Document) -> SemanticNode:
+    # ── Document-level helpers ────────────────────────────────────────────────
+
+    def _build_label_for_map(self, doc: "Document") -> dict[str, str]:
+        """
+        Build {input_id: label_text} map from label[for] elements.
+
+        Scans all <label> elements in the document.
+        """
+        from an_web.dom.nodes import Element
+
+        label_map: dict[str, str] = {}
+        for node in doc.iter_descendants():
+            if isinstance(node, Element) and node.tag == "label":
+                for_id = node.get_attribute("for")
+                if for_id:
+                    text = node.text_content.strip()
+                    if text:
+                        label_map[for_id] = text
+        return label_map
+
+    def _build_id_element_map(self, doc: "Document") -> dict[str, "Element"]:
+        """
+        Build {element_id: element} map for aria-labelledby resolution.
+
+        Uses Document._id_map if populated, falls back to full scan.
+        """
+        from an_web.dom.nodes import Element
+
+        # Use the Document's built-in id_map if available
+        id_map = getattr(doc, "_id_map", {})
+        if id_map:
+            return id_map  # type: ignore[return-value]
+
+        # Fallback: build from scratch
+        result: dict[str, "Element"] = {}
+        for node in doc.iter_descendants():
+            if isinstance(node, Element):
+                el_id = node.get_id()
+                if el_id:
+                    result[el_id] = node
+        return result
+
+    # ── Tree walking ──────────────────────────────────────────────────────────
+
+    def _walk_document(
+        self,
+        doc: "Document",
+        label_for_map: dict[str, str],
+        id_element_map: dict[str, "Element"],
+    ) -> "SemanticNode":
         from an_web.dom.semantics import SemanticNode
         from an_web.dom.nodes import Element, TextNode
 
@@ -144,17 +198,24 @@ class SemanticExtractor:
 
         tag_counts: dict[str, int] = {}
         for child in doc.children:
-            self._walk_node(child, root, tag_counts, depth=0, parent_xpath="/")
+            self._walk_node(
+                child, root, tag_counts,
+                depth=0, parent_xpath="/",
+                label_for_map=label_for_map,
+                id_element_map=id_element_map,
+            )
 
         return root
 
     def _walk_node(
         self,
         node: Any,
-        parent: SemanticNode,
+        parent: "SemanticNode",
         tag_counts: dict[str, int],
         depth: int,
         parent_xpath: str,
+        label_for_map: dict[str, str],
+        id_element_map: dict[str, "Element"],
     ) -> None:
         from an_web.dom.nodes import Element, TextNode
         from an_web.dom.semantics import SemanticNode
@@ -182,8 +243,10 @@ class SemanticExtractor:
             affordances = get_affordances(role, node)
             is_interactive = bool(affordances) or node.is_interactive
 
-            # Accessible name
-            name = self._compute_accessible_name(node)
+            # Accessible name (aria-labelledby > aria-label > label[for] > ...)
+            name = self._compute_accessible_name(
+                node, label_for_map, id_element_map
+            )
 
             # Prune structural nodes without content
             structural = is_structural_role(role)
@@ -191,7 +254,11 @@ class SemanticExtractor:
                 # Still walk children (unrolled into parent)
                 child_counts: dict[str, int] = {}
                 for child in node.children:
-                    self._walk_node(child, parent, child_counts, depth + 1, xpath + "/")
+                    self._walk_node(
+                        child, parent, child_counts, depth + 1, xpath + "/",
+                        label_for_map=label_for_map,
+                        id_element_map=id_element_map,
+                    )
                 return
 
             if self.interactive_only and not is_interactive:
@@ -199,6 +266,12 @@ class SemanticExtractor:
 
             # Stable selector generation
             stable_selector = self._compute_stable_selector(node)
+
+            # form_scope_id — walk parent chain for enclosing form
+            form_scope_id = self._find_form_scope_id(node)
+
+            # interaction_rank from element's importance_score
+            interaction_rank = float(getattr(node, "importance_score", 0.0))
 
             sem_node = SemanticNode(
                 node_id=node.node_id,
@@ -212,6 +285,8 @@ class SemanticExtractor:
                 attributes=node.attributes,
                 affordances=affordances,
                 stable_selector=stable_selector,
+                interaction_rank=interaction_rank,
+                form_scope_id=form_scope_id,
             )
 
             # options for select
@@ -223,7 +298,11 @@ class SemanticExtractor:
             # Walk children
             child_counts2: dict[str, int] = {}
             for child in node.children:
-                self._walk_node(child, sem_node, child_counts2, depth + 1, xpath + "/")
+                self._walk_node(
+                    child, sem_node, child_counts2, depth + 1, xpath + "/",
+                    label_for_map=label_for_map,
+                    id_element_map=id_element_map,
+                )
 
         elif isinstance(node, TextNode):
             if self.interactive_only:
@@ -244,30 +323,69 @@ class SemanticExtractor:
             )
             parent.children.append(sem_node)
 
-    def _compute_accessible_name(self, element: Element) -> str | None:
-        """Compute accessible name following ARIA spec (simplified)."""
-        # aria-label wins
+    # ── Accessible name computation ───────────────────────────────────────────
+
+    def _compute_accessible_name(
+        self,
+        element: "Element",
+        label_for_map: dict[str, str] | None = None,
+        id_element_map: dict[str, "Element"] | None = None,
+    ) -> str | None:
+        """
+        Compute accessible name following ARIA spec priority order:
+          1. aria-labelledby (references another element by id)
+          2. aria-label (inline string)
+          3. label[for] lookup (for form controls with id)
+          4. title attribute
+          5. placeholder for inputs
+          6. alt for images
+          7. text content for buttons/links/labels
+        """
+        # 1. aria-labelledby — find referenced element(s) and concatenate their text
+        labelledby = element.get_attribute("aria-labelledby")
+        if labelledby and id_element_map:
+            parts: list[str] = []
+            for ref_id in labelledby.split():
+                ref_el = id_element_map.get(ref_id)
+                if ref_el is not None:
+                    text = ref_el.text_content.strip()
+                    if text:
+                        parts.append(text)
+            if parts:
+                return " ".join(parts)
+
+        # 2. aria-label
         aria_label = element.get_attribute("aria-label")
         if aria_label:
             return aria_label.strip()
 
-        # title attribute
+        # 3. label[for] lookup — only for form controls that have an id
+        el_id = element.get_id()
+        if el_id and label_for_map:
+            label_text = label_for_map.get(el_id)
+            if label_text:
+                return label_text
+
+        # 4. title attribute
         title = element.get_attribute("title")
         if title:
             return title.strip()
 
-        # placeholder for inputs
+        # 5. placeholder for inputs
         placeholder = element.get_attribute("placeholder")
         if placeholder:
             return placeholder.strip()
 
-        # alt for images
+        # 6. alt for images
         if element.tag == "img":
             alt = element.get_attribute("alt")
             if alt:
                 return alt.strip()
 
-        # text content for buttons/links
+        # 7. text content for interactive elements only (buttons, links, labels).
+        #    Headings are excluded: they are content containers, not interactive nodes.
+        #    Adding heading text here would cause find_by_text() to match the heading
+        #    *before* the interactive link it wraps (DFS pre-order), breaking click flows.
         if element.tag in ("button", "a", "label"):
             text = element.text_content.strip()
             if text and len(text) < 200:
@@ -275,7 +393,33 @@ class SemanticExtractor:
 
         return None
 
-    def _compute_stable_selector(self, element: Element) -> str | None:
+    # ── Form scope ────────────────────────────────────────────────────────────
+
+    def _find_form_scope_id(self, element: "Element") -> str | None:
+        """
+        Walk parent chain to find the nearest enclosing <form>.
+
+        Returns the form's node_id, or None if no form ancestor.
+        Only relevant for form control elements.
+        """
+        _FORM_CONTROLS = frozenset({
+            "input", "select", "textarea", "button",
+        })
+        if element.tag not in _FORM_CONTROLS:
+            return None
+
+        node = getattr(element, "parent", None)
+        while node is not None:
+            tag = getattr(node, "tag", "")
+            if tag == "form":
+                return getattr(node, "node_id", None)
+            node = getattr(node, "parent", None)
+
+        return None
+
+    # ── Stable selector ───────────────────────────────────────────────────────
+
+    def _compute_stable_selector(self, element: "Element") -> str | None:
         """Generate most reliable CSS selector for re-targeting."""
         el_id = element.get_id()
         if el_id:
@@ -291,7 +435,9 @@ class SemanticExtractor:
 
         return None
 
-    def _extract_select_options(self, element: Element) -> list[dict[str, Any]]:
+    # ── Select options ────────────────────────────────────────────────────────
+
+    def _extract_select_options(self, element: "Element") -> list[dict[str, Any]]:
         from an_web.dom.nodes import Element as El
         options: list[dict[str, Any]] = []
         for child in element.children:
@@ -303,13 +449,15 @@ class SemanticExtractor:
                 })
         return options
 
-    def _find_blockers(self, tree: SemanticNode) -> list[dict[str, Any]]:
+    # ── Blocker detection ─────────────────────────────────────────────────────
+
+    def _find_blockers(self, tree: "SemanticNode") -> list[dict[str, Any]]:
         """Find elements blocking interaction (modal, cookie banner)."""
         blockers: list[dict[str, Any]] = []
         BLOCKER_ROLES = {"dialog", "alertdialog"}
         BLOCKER_TEXTS = {"cookie", "consent", "accept", "privacy", "gdpr"}
 
-        def _check(node: SemanticNode) -> None:
+        def _check(node: "SemanticNode") -> None:
             if node.role in BLOCKER_ROLES:
                 blockers.append({"node_id": node.node_id, "kind": node.role})
                 return
