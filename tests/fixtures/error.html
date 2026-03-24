@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Sign In - MyApp</title>
+</head>
+<body>
+  <main>
+    <div class="alert alert-error" role="alert" id="error-banner">
+      Invalid email or password. Please try again.
+    </div>
+    <h1>Welcome back</h1>
+    <form id="login-form" action="/api/auth/login" method="post">
+      <div class="field">
+        <label for="email">Email address</label>
+        <input id="email" type="email" name="email" value="bad@test.com" required>
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" type="password" name="password" required>
+      </div>
+      <div class="actions">
+        <button type="submit" class="btn-primary" id="submit-btn">Sign In</button>
+      </div>
+    </form>
+  </main>
+</body>
+</html>

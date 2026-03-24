@@ -39,12 +39,19 @@ class ReplayStep:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ReplayStep":
+        # Accept two formats:
+        #   serialised (to_dict): has a nested "params" key
+        #   flat (raw tool call): params are top-level keys beside reserved ones
+        _reserved = {"step_id", "action", "tool", "expected_status",
+                     "expected_url", "wait_ms", "params"}
+        if "params" in d:
+            params = dict(d["params"])
+        else:
+            params = {k: v for k, v in d.items() if k not in _reserved}
         return cls(
             step_id=d.get("step_id", f"step-{uuid.uuid4().hex[:8]}"),
             action=d.get("action") or d.get("tool", ""),
-            params={k: v for k, v in d.items()
-                    if k not in ("step_id", "action", "tool", "expected_status",
-                                 "expected_url", "wait_ms")},
+            params=params,
             expected_status=d.get("expected_status"),
             expected_url=d.get("expected_url"),
             wait_ms=float(d.get("wait_ms", 0)),

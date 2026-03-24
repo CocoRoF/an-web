@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Sign In - MyApp</title>
+</head>
+<body>
+  <main>
+    <h1>Welcome back</h1>
+    <form id="login-form" action="/api/auth/login" method="post">
+      <div class="field">
+        <label for="email">Email address</label>
+        <input id="email" type="email" name="email"
+               placeholder="you@example.com" required>
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" type="password" name="password"
+               placeholder="Your password" required>
+      </div>
+      <div class="actions">
+        <button type="submit" class="btn-primary" id="submit-btn">Sign In</button>
+      </div>
+    </form>
+    <p><a href="/forgot-password" class="link">Forgot your password?</a></p>
+  </main>
+</body>
+</html>
