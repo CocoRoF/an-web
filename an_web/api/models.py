@@ -1,11 +1,12 @@
 """Pydantic request/response models for AN-Web AI Tool API."""
 from __future__ import annotations
 
+import json
 from typing import Any, Literal, Union
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
-# ─── Request models ───────────────────────────────────────────────────────────
+# ─── Target ───────────────────────────────────────────────────────────────────
 
 class SemanticTarget(BaseModel):
     """High-level semantic target specification."""
@@ -15,10 +16,21 @@ class SemanticTarget(BaseModel):
     node_id: str | None = None
     name: str | None = None  # accessible name filter
 
+    def to_dict(self) -> dict[str, Any]:
+        return {k: v for k, v in self.model_dump().items() if v is not None}
+
+
+# ─── Request models ───────────────────────────────────────────────────────────
 
 class NavigateRequest(BaseModel):
     tool: Literal["navigate"] = "navigate"
     url: str
+
+    @model_validator(mode="after")
+    def _check_url(self) -> "NavigateRequest":
+        if not self.url:
+            raise ValueError("url must not be empty")
+        return self
 
 
 class ClickRequest(BaseModel):
@@ -30,6 +42,7 @@ class TypeRequest(BaseModel):
     tool: Literal["type"] = "type"
     target: Union[str, SemanticTarget]
     text: str
+    append: bool = False
 
 
 class ClearRequest(BaseModel):
@@ -41,6 +54,7 @@ class SelectRequest(BaseModel):
     tool: Literal["select"] = "select"
     target: Union[str, SemanticTarget]
     value: str
+    by_text: bool = False
 
 
 class SubmitRequest(BaseModel):
@@ -50,7 +64,9 @@ class SubmitRequest(BaseModel):
 
 class ExtractRequest(BaseModel):
     tool: Literal["extract"] = "extract"
-    query: str  # CSS selector or semantic query
+    query: str
+    mode: Literal["css", "structured", "json", "html"] = "css"
+    limit: int = 100
 
 
 class SnapshotRequest(BaseModel):
@@ -62,6 +78,12 @@ class WaitForRequest(BaseModel):
     condition: Literal["network_idle", "dom_stable", "element_visible"]
     selector: str | None = None
     timeout_ms: int = 5000
+
+    @model_validator(mode="after")
+    def _check_element_visible(self) -> "WaitForRequest":
+        if self.condition == "element_visible" and not self.selector:
+            raise ValueError("selector is required for condition='element_visible'")
+        return self
 
 
 class ScrollRequest(BaseModel):
@@ -75,12 +97,33 @@ class EvalJSRequest(BaseModel):
     tool: Literal["eval_js"] = "eval_js"
     script: str
 
+    @model_validator(mode="after")
+    def _check_script(self) -> "EvalJSRequest":
+        if not self.script.strip():
+            raise ValueError("script must not be empty")
+        return self
+
 
 ToolRequest = Union[
     NavigateRequest, ClickRequest, TypeRequest, ClearRequest,
     SelectRequest, SubmitRequest, ExtractRequest, SnapshotRequest,
     WaitForRequest, ScrollRequest, EvalJSRequest,
 ]
+
+# Mapping tool name → request model
+TOOL_REQUEST_MAP: dict[str, type[BaseModel]] = {
+    "navigate":  NavigateRequest,
+    "click":     ClickRequest,
+    "type":      TypeRequest,
+    "clear":     ClearRequest,
+    "select":    SelectRequest,
+    "submit":    SubmitRequest,
+    "extract":   ExtractRequest,
+    "snapshot":  SnapshotRequest,
+    "wait_for":  WaitForRequest,
+    "scroll":    ScrollRequest,
+    "eval_js":   EvalJSRequest,
+}
 
 
 # ─── Response models ──────────────────────────────────────────────────────────
@@ -95,6 +138,15 @@ class ActionEffects(BaseModel):
     value_set: str | None = None
     count: int | None = None
     results: list[dict[str, Any]] | None = None
+    # JS eval
+    result: Any = None
+    raw_type: str | None = None
+    available: bool | None = None
+    # Wait-for
+    condition: str | None = None
+    satisfied: bool | None = None
+
+    model_config = {"extra": "allow"}
 
 
 class ActionResponse(BaseModel):
@@ -108,22 +160,49 @@ class ActionResponse(BaseModel):
     error_details: dict[str, Any] = Field(default_factory=dict)
     recommended_next_actions: list[dict[str, Any]] = Field(default_factory=list)
 
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+
+    @property
+    def failed(self) -> bool:
+        return self.status in ("failed", "blocked")
+
     @classmethod
-    def from_result(cls, result: dict[str, Any]) -> ActionResponse:
+    def from_result(cls, result: dict[str, Any]) -> "ActionResponse":
         effects_data = result.get("effects", {})
+        if not isinstance(effects_data, dict):
+            effects_data = {}
         return cls(
             status=result.get("status", "ok"),
             action=result.get("action", ""),
             target=result.get("target"),
             effects=ActionEffects(**{
                 k: v for k, v in effects_data.items()
-                if k in ActionEffects.model_fields
             }),
             state_delta_id=result.get("state_delta_id") or result.get("stateDeltaId"),
             error=result.get("error"),
             error_details=result.get("error_details", {}),
             recommended_next_actions=result.get("recommended_next_actions", []),
         )
+
+    def to_tool_result(self, tool_use_id: str | None = None) -> dict[str, Any]:
+        """
+        Format as an Anthropic tool_result block for use in the next message.
+
+        ``content`` is a JSON string of the relevant response fields.
+        ``is_error`` is True when status != 'ok'.
+        """
+        payload = self.model_dump(exclude_none=True)
+        content = json.dumps(payload, ensure_ascii=False, default=str)
+        result: dict[str, Any] = {
+            "type": "tool_result",
+            "content": content,
+            "is_error": self.failed,
+        }
+        if tool_use_id:
+            result["tool_use_id"] = tool_use_id
+        return result
 
 
 class SemanticNodeModel(BaseModel):
@@ -137,7 +216,7 @@ class SemanticNodeModel(BaseModel):
     is_interactive: bool
     visible: bool
     attributes: dict[str, str] = Field(default_factory=dict)
-    children: list[SemanticNodeModel] = Field(default_factory=list)
+    children: list["SemanticNodeModel"] = Field(default_factory=list)
     options: list[dict[str, Any]] | None = None
     affordances: list[str] = Field(default_factory=list)
     stable_selector: str | None = None
@@ -156,3 +235,16 @@ class PageSemanticsResponse(BaseModel):
     blocking_elements: list[dict[str, Any]] = Field(default_factory=list)
     semantic_tree: dict[str, Any] = Field(default_factory=dict)
     snapshot_id: str
+
+    @classmethod
+    def from_result(cls, result: dict[str, Any]) -> "PageSemanticsResponse":
+        return cls(
+            page_type=result.get("page_type", "unknown"),
+            title=result.get("title", ""),
+            url=result.get("url", ""),
+            primary_actions=result.get("primary_actions", []),
+            inputs=result.get("inputs", []),
+            blocking_elements=result.get("blocking_elements", []),
+            semantic_tree=result.get("semantic_tree", {}),
+            snapshot_id=result.get("snapshot_id", ""),
+        )
