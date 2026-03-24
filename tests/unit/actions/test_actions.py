@@ -142,10 +142,9 @@ class TestNavigateAction:
 
     @pytest.mark.asyncio
     async def test_navigate_blocked_by_policy(self):
-        class DenyAllPolicy:
-            def is_url_allowed(self, url: str) -> bool: return False
-
-        session = MockSession(policy=DenyAllPolicy())
+        from an_web.policy.rules import PolicyRules
+        deny_all = PolicyRules(denied_domains=["blocked.com"])
+        session = MockSession(policy=deny_all)
 
         from an_web.actions.navigate import NavigateAction
         result = await NavigateAction().execute(session, url="https://blocked.com")

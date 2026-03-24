@@ -83,13 +83,49 @@ class Action(ABC):
 
         return None
 
+    def _check_policy(
+        self,
+        session: "Session",
+        action_name: str,
+        url: str | None = None,
+        consume_resources: bool = True,
+        details: dict[str, Any] | None = None,
+    ) -> "ActionResult | None":
+        """
+        Run full policy check via PolicyChecker.
+
+        Returns:
+            None                  — check passed; action may proceed.
+            ActionResult(failed)  — blocked; return this immediately.
+        """
+        from an_web.policy.checker import PolicyChecker
+        checker = PolicyChecker.for_session(session)
+        result = checker.check_action(
+            action_name,
+            url=url,
+            consume_resources=consume_resources,
+            details=details,
+        )
+        if result.blocked:
+            error = result.reason or f"policy_violation: {result.violation_type}"
+            extra: dict[str, Any] = {}
+            if result.approval_id:
+                extra["approval_id"] = result.approval_id
+            return self._make_failure(
+                action_name,
+                error=error,
+                target=url,
+                recommended=[{"note": "check policy", **extra}],
+            )
+        return None
+
     def _make_failure(
         self,
         action: str,
         error: str,
         target: str | None = None,
         recommended: list[dict[str, Any]] | None = None,
-    ) -> ActionResult:
+    ) -> "ActionResult":
         from an_web.dom.semantics import ActionResult
         return ActionResult(
             status="failed",

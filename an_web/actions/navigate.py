@@ -49,13 +49,9 @@ class NavigateAction(Action):
         from an_web.dom.semantics import ActionResult
 
         # ── 1. Policy check ───────────────────────────────────────────
-        if session.policy and not session.policy.is_url_allowed(url):
-            return self._make_failure(
-                "navigate",
-                "url_blocked",
-                target=url,
-                recommended=[{"tool": "navigate", "note": "check policy allowlist"}],
-            )
+        policy_failure = self._check_policy(session, "navigate", url=url)
+        if policy_failure is not None:
+            return policy_failure
 
         # ── 2. Fetch document ─────────────────────────────────────────
         if not session.network:

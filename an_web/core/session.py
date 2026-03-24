@@ -51,6 +51,8 @@ if TYPE_CHECKING:
     from an_web.net.client import NetworkClient
     from an_web.net.cookies import CookieJar
     from an_web.policy.rules import PolicyRules
+    from an_web.policy.sandbox import Sandbox
+    from an_web.policy.approvals import ApprovalManager
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +85,10 @@ class Session:
         self.engine = engine
         self.policy = policy
         self._closed: bool = False
+
+        # Safety subsystems (lazy-initialised)
+        self.sandbox: "Sandbox | None" = None
+        self.approvals: "ApprovalManager | None" = None
 
         # Subsystems — populated by _init()
         self.scheduler: "EventLoopScheduler | None" = None
@@ -120,11 +126,15 @@ class Session:
         from an_web.js.runtime import JSRuntime
         from an_web.net.client import NetworkClient
         from an_web.net.cookies import CookieJar
+        from an_web.policy.sandbox import Sandbox
+        from an_web.policy.approvals import ApprovalManager
 
         self.cookies = CookieJar()
         self.network = NetworkClient(cookie_jar=self.cookies)
         self.scheduler = EventLoopScheduler()
         self.snapshots = SnapshotManager()
+        self.sandbox = Sandbox(session_id=self.session_id)
+        self.approvals = ApprovalManager()
         self.js_runtime = JSRuntime(session=self)
 
         # Register a lightweight network-settle hook: simply yield so

@@ -51,6 +51,13 @@ class SubmitAction(Action):
         from an_web.dom.semantics import ActionResult
         from an_web.actions.click import _find_enclosing_form, _submit_form
 
+        # ── 0. Policy check ───────────────────────────────────────────
+        policy_failure = self._check_policy(
+            session, "submit", consume_resources=False
+        )
+        if policy_failure is not None:
+            return policy_failure
+
         # ── 1. Resolve target ─────────────────────────────────────────
         element = await self._resolve_target(target, session)
         if element is None:
