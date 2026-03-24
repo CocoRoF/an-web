@@ -12,13 +12,13 @@ Primary exports:
 """
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from an_web.dom.nodes import Element
 
 
-def infer_affordances(element: "Element", role: str) -> list[str]:
+def infer_affordances(element: Element, role: str) -> list[str]:
     """
     Return list of AI-executable actions for an element.
 

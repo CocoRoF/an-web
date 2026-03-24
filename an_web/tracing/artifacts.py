@@ -8,13 +8,12 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
-
 
 # ── Artifact kind ─────────────────────────────────────────────────────────────
 
-class ArtifactKind(str, Enum):
+class ArtifactKind(StrEnum):
     DOM_SNAPSHOT       = "dom_snapshot"
     SEMANTIC_SNAPSHOT  = "semantic_snapshot"
     NETWORK_TRACE      = "network_trace"
@@ -67,7 +66,7 @@ class Artifact:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=2, default=str)
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "Artifact":
+    def from_dict(cls, d: dict[str, Any]) -> Artifact:
         return cls(
             artifact_id=d["artifact_id"],
             kind=d["kind"],
@@ -233,7 +232,7 @@ class ArtifactCollector:
     ) -> Artifact:
         artifact = Artifact(
             artifact_id=self._new_id(),
-            kind=kind.value if isinstance(kind, ArtifactKind) else str(kind),
+            kind=str(kind),
             timestamp=time.time(),
             session_id=self._session_id,
             data=data,
@@ -367,7 +366,7 @@ class ArtifactCollector:
         return list(self._artifacts)
 
     def get_by_kind(self, kind: str | ArtifactKind) -> list[Artifact]:
-        k = kind.value if isinstance(kind, ArtifactKind) else str(kind)
+        k = str(kind)
         return [a for a in self._artifacts if a.kind == k]
 
     def get_by_action(self, action_id: str) -> list[Artifact]:
@@ -400,7 +399,7 @@ class ArtifactCollector:
         return json.dumps(self.export(), ensure_ascii=False, indent=2, default=str)
 
     @classmethod
-    def from_export(cls, data: dict[str, Any], max_size: int = 0) -> "ArtifactCollector":
+    def from_export(cls, data: dict[str, Any], max_size: int = 0) -> ArtifactCollector:
         session_id = data.get("session_id", "")
         collector = cls(session_id=session_id, max_size=max_size)
         for d in data.get("artifacts", []):

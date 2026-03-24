@@ -12,7 +12,7 @@ snapshot creation.
 from __future__ import annotations
 
 import logging
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from an_web.actions.base import Action
 
@@ -44,11 +44,10 @@ class SubmitAction(Action):
 
     async def execute(
         self,
-        session: "Session",
+        session: Session,
         target: str | dict[str, Any] = "",
         **kwargs: Any,
-    ) -> "ActionResult":
-        from an_web.dom.semantics import ActionResult
+    ) -> ActionResult:
         from an_web.actions.click import _find_enclosing_form, _submit_form
 
         # ── 0. Policy check ───────────────────────────────────────────

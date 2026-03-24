@@ -13,11 +13,10 @@ Resource categories:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from an_web.policy.rules import PolicyCheckResult, ViolationType
-
 
 # ── Resource limits ───────────────────────────────────────────────────────────
 
@@ -35,11 +34,11 @@ class SandboxLimits:
     max_snapshots:   int = 200     # snapshot records
 
     @classmethod
-    def default(cls) -> "SandboxLimits":
+    def default(cls) -> SandboxLimits:
         return cls()
 
     @classmethod
-    def strict(cls) -> "SandboxLimits":
+    def strict(cls) -> SandboxLimits:
         return cls(
             max_requests=100,
             max_dom_nodes=20_000,
@@ -49,7 +48,7 @@ class SandboxLimits:
         )
 
     @classmethod
-    def unlimited(cls) -> "SandboxLimits":
+    def unlimited(cls) -> SandboxLimits:
         """Disable all resource limits (for testing / offline use)."""
         return cls(
             max_requests=0,

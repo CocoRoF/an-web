@@ -6,9 +6,10 @@ Focuses on interactability and semantic enrichment over full W3C compliance.
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Iterator
+from typing import Any
 
 
 class NodeType(Enum):

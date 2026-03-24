@@ -5,7 +5,7 @@ import json
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from an_web.core.session import Session
@@ -38,7 +38,7 @@ class ReplayStep:
         return d
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ReplayStep":
+    def from_dict(cls, d: dict[str, Any]) -> ReplayStep:
         # Accept two formats:
         #   serialised (to_dict): has a nested "params" key
         #   flat (raw tool call): params are top-level keys beside reserved ones
@@ -72,7 +72,7 @@ class ReplayTrace:
     # ── builder ───────────────────────────────────────────────────────────────
 
     @classmethod
-    def new(cls, session_id: str = "", **metadata: Any) -> "ReplayTrace":
+    def new(cls, session_id: str = "", **metadata: Any) -> ReplayTrace:
         return cls(
             trace_id=f"trace-{uuid.uuid4().hex[:12]}",
             session_id=session_id,
@@ -114,7 +114,7 @@ class ReplayTrace:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=2, default=str)
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ReplayTrace":
+    def from_dict(cls, d: dict[str, Any]) -> ReplayTrace:
         return cls(
             trace_id=d.get("trace_id", f"trace-{uuid.uuid4().hex[:12]}"),
             session_id=d.get("session_id", ""),
@@ -124,7 +124,7 @@ class ReplayTrace:
         )
 
     @classmethod
-    def from_json(cls, s: str) -> "ReplayTrace":
+    def from_json(cls, s: str) -> ReplayTrace:
         return cls.from_dict(json.loads(s))
 
 
@@ -190,7 +190,7 @@ class ReplayEngine:
 
     async def replay(
         self,
-        session: "Session",
+        session: Session,
         action_log: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         """Backward-compatible: replay a raw list, return list of result dicts."""
@@ -202,7 +202,7 @@ class ReplayEngine:
 
     async def replay_trace(
         self,
-        session: "Session",
+        session: Session,
         trace: ReplayTrace,
     ) -> ReplayResult:
         """Full replay with assertions. Returns ReplayResult."""
@@ -221,7 +221,7 @@ class ReplayEngine:
 
     async def _execute_step(
         self,
-        session: "Session",
+        session: Session,
         step: ReplayStep,
     ) -> StepResult:
         import asyncio

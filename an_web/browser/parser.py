@@ -13,9 +13,8 @@ from __future__ import annotations
 import itertools
 from typing import Any
 
-from an_web.dom.nodes import Document, Element, TextNode, Node
+from an_web.dom.nodes import Document, Element, Node, TextNode
 from an_web.layout.visibility import compute_visibility
-
 
 # ─── Unique node ID counter ───────────────────────────────────────────────────
 

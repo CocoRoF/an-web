@@ -21,39 +21,39 @@ Quick access:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from an_web.layout.visibility import (
-    VisibilityResult,
-    compute_visibility,
-    compute_visibility_result,
-    compute_visibility_cascaded,
-    is_visible,
-    is_offscreen,
-    get_style_props,
-    _parse_inline_style,
-)
-from an_web.layout.flow import (
-    LayoutInfo,
-    FlowContext,
-    get_display_type,
-    compute_z_order,
-    creates_stacking_context,
-    infer_bbox_hint,
-    compute_layout_info,
-    compute_document_layout,
+from an_web.layout.flow import (  # noqa: F401
     BLOCK_TAGS,
     INLINE_TAGS,
+    FlowContext,
+    LayoutInfo,
+    compute_document_layout,
+    compute_layout_info,
+    compute_z_order,
+    creates_stacking_context,
+    get_display_type,
+    infer_bbox_hint,
 )
-from an_web.layout.hit_test import (
+from an_web.layout.hit_test import (  # noqa: F401
     HitTestResult,
+    _BlockerInfo,
+    _collect_blockers,
     compute_hit_test,
     compute_hit_testable,
     compute_interaction_rank,
     find_click_target,
     rank_elements_for_interaction,
-    _collect_blockers,
-    _BlockerInfo,
+)
+from an_web.layout.visibility import (  # noqa: F401
+    VisibilityResult,
+    _parse_inline_style,
+    compute_visibility,
+    compute_visibility_cascaded,
+    compute_visibility_result,
+    get_style_props,
+    is_offscreen,
+    is_visible,
 )
 
 if TYPE_CHECKING:
@@ -133,8 +133,8 @@ class LayoutEngine:
 
     def assess(
         self,
-        element: "Element",
-        doc: "Document",
+        element: Element,
+        doc: Document,
         flow_ctx: FlowContext | None = None,
         blockers: list[_BlockerInfo] | None = None,
     ) -> ElementAssessment:
@@ -194,7 +194,7 @@ class LayoutEngine:
 
     def assess_document(
         self,
-        doc: "Document",
+        doc: Document,
     ) -> dict[str, ElementAssessment]:
         """
         Assess all elements in the document in a single pass.
@@ -225,19 +225,17 @@ class LayoutEngine:
 
     def find_interactive_elements(
         self,
-        doc: "Document",
+        doc: Document,
         min_rank: float = 0.3,
         max_results: int = 20,
-    ) -> list[tuple["Element", ElementAssessment]]:
+    ) -> list[tuple[Element, ElementAssessment]]:
         """
         Find the most actionable elements in the document.
 
         Returns elements with interaction_rank >= min_rank, sorted descending.
         """
-        from an_web.dom.nodes import Element
-
         assessments = self.assess_document(doc)
-        scored: list[tuple[Element, ElementAssessment]] = []
+        scored: list[tuple[Any, ElementAssessment]] = []
 
         for el in doc.iter_elements():
             a = assessments.get(el.node_id)

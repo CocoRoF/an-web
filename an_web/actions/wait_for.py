@@ -1,7 +1,9 @@
 """Wait-for action — wait until a condition is satisfied."""
 from __future__ import annotations
+
 import asyncio
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
 from an_web.actions.base import Action
 
 if TYPE_CHECKING:

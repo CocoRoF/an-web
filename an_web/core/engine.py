@@ -55,9 +55,9 @@ class ANWebEngine:
     ) -> None:
         self._max_concurrent_sessions = max_concurrent_sessions
         # Ordered list keeps creation order for iteration.
-        self._sessions: list["Session"] = []
+        self._sessions: list[Session] = []
         # Registry for O(1) look-up by session_id.
-        self._session_map: dict[str, "Session"] = {}
+        self._session_map: dict[str, Session] = {}
 
     # ------------------------------------------------------------------
     # Session creation
@@ -65,9 +65,9 @@ class ANWebEngine:
 
     async def create_session(
         self,
-        policy: "PolicyRules | None" = None,
+        policy: PolicyRules | None = None,
         session_id: str | None = None,
-    ) -> "Session":
+    ) -> Session:
         """
         Create a new isolated browser session.
 
@@ -112,7 +112,7 @@ class ANWebEngine:
     # Session registry
     # ------------------------------------------------------------------
 
-    def get_session(self, session_id: str) -> "Session | None":
+    def get_session(self, session_id: str) -> Session | None:
         """
         Look up a session by its UUID.
 
@@ -139,7 +139,7 @@ class ANWebEngine:
     # ------------------------------------------------------------------
 
     @property
-    def active_sessions(self) -> list["Session"]:
+    def active_sessions(self) -> list[Session]:
         """Return all sessions that have not yet been closed."""
         return [s for s in self._sessions if not s._closed]
 
@@ -179,7 +179,7 @@ class ANWebEngine:
     # Context manager
     # ------------------------------------------------------------------
 
-    async def __aenter__(self) -> "ANWebEngine":
+    async def __aenter__(self) -> ANWebEngine:
         return self
 
     async def __aexit__(self, *_: object) -> None:

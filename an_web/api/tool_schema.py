@@ -17,7 +17,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 # ── Shared sub-schemas ─────────────────────────────────────────────────────────
 
 def _target_schema() -> dict[str, Any]:

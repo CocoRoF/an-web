@@ -15,7 +15,7 @@ having a loaded page state.  Mirrors Lightpanda's Navigate.zig:
 from __future__ import annotations
 
 import logging
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from an_web.actions.base import Action
 
@@ -42,10 +42,10 @@ class NavigateAction(Action):
 
     async def execute(
         self,
-        session: "Session",
+        session: Session,
         url: str = "",
         **kwargs: Any,
-    ) -> "ActionResult":
+    ) -> ActionResult:
         from an_web.dom.semantics import ActionResult
 
         # ── 1. Policy check ───────────────────────────────────────────

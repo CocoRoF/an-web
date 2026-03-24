@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from an_web.core.session import Session
@@ -85,12 +85,12 @@ class Action(ABC):
 
     def _check_policy(
         self,
-        session: "Session",
+        session: Session,
         action_name: str,
         url: str | None = None,
         consume_resources: bool = True,
         details: dict[str, Any] | None = None,
-    ) -> "ActionResult | None":
+    ) -> ActionResult | None:
         """
         Run full policy check via PolicyChecker.
 
@@ -125,7 +125,7 @@ class Action(ABC):
         error: str,
         target: str | None = None,
         recommended: list[dict[str, Any]] | None = None,
-    ) -> "ActionResult":
+    ) -> ActionResult:
         from an_web.dom.semantics import ActionResult
         return ActionResult(
             status="failed",

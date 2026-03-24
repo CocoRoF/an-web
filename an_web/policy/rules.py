@@ -10,14 +10,13 @@ from __future__ import annotations
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 from urllib.parse import urlparse
 
-
 # ── Result types ──────────────────────────────────────────────────────────────
 
-class ViolationType(str, Enum):
+class ViolationType(StrEnum):
     """Machine-readable category for a policy violation."""
     DOMAIN_DENIED        = "domain_denied"
     DOMAIN_NOT_ALLOWED   = "domain_not_allowed"
@@ -47,7 +46,7 @@ class PolicyCheckResult:
     details: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def ok(cls) -> "PolicyCheckResult":
+    def ok(cls) -> PolicyCheckResult:
         return cls(allowed=True)
 
     @classmethod
@@ -56,7 +55,7 @@ class PolicyCheckResult:
         violation: ViolationType,
         reason: str,
         **details: Any,
-    ) -> "PolicyCheckResult":
+    ) -> PolicyCheckResult:
         return cls(
             allowed=False,
             reason=reason,
@@ -65,7 +64,7 @@ class PolicyCheckResult:
         )
 
     @classmethod
-    def needs_approval(cls, approval_id: str, reason: str) -> "PolicyCheckResult":
+    def needs_approval(cls, approval_id: str, reason: str) -> PolicyCheckResult:
         return cls(
             allowed=False,
             reason=reason,
@@ -80,7 +79,7 @@ class PolicyCheckResult:
 
 # ── Navigation scope ──────────────────────────────────────────────────────────
 
-class NavigationScope(str, Enum):
+class NavigationScope(StrEnum):
     """
     Controls how far the agent is allowed to navigate from its starting point.
 
@@ -147,12 +146,12 @@ class PolicyRules:
     # ── Factories ─────────────────────────────────────────────────────────────
 
     @classmethod
-    def default(cls) -> "PolicyRules":
+    def default(cls) -> PolicyRules:
         """Permissive defaults — suitable for development / testing."""
         return cls()
 
     @classmethod
-    def strict(cls) -> "PolicyRules":
+    def strict(cls) -> PolicyRules:
         """Conservative defaults — suitable for production AI agents."""
         return cls(
             max_requests_per_minute=30,
@@ -162,7 +161,7 @@ class PolicyRules:
         )
 
     @classmethod
-    def sandboxed(cls, allowed_domains: list[str]) -> "PolicyRules":
+    def sandboxed(cls, allowed_domains: list[str]) -> PolicyRules:
         """Locked-down policy — only the given domains are reachable."""
         return cls(
             allowed_domains=allowed_domains,

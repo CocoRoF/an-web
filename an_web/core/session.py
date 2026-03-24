@@ -46,13 +46,13 @@ if TYPE_CHECKING:
     from an_web.core.scheduler import EventLoopScheduler
     from an_web.core.snapshot import SnapshotManager
     from an_web.dom.nodes import Document
-    from an_web.dom.semantics import ActionResult, PageSemantics
+    from an_web.dom.semantics import PageSemantics
     from an_web.js.runtime import JSRuntime
     from an_web.net.client import NetworkClient
     from an_web.net.cookies import CookieJar
+    from an_web.policy.approvals import ApprovalManager
     from an_web.policy.rules import PolicyRules
     from an_web.policy.sandbox import Sandbox
-    from an_web.policy.approvals import ApprovalManager
 
 log = logging.getLogger(__name__)
 
@@ -77,8 +77,8 @@ class Session:
 
     def __init__(
         self,
-        engine: "ANWebEngine",
-        policy: "PolicyRules",
+        engine: ANWebEngine,
+        policy: PolicyRules,
         session_id: str | None = None,
     ) -> None:
         self.session_id: str = session_id or str(uuid.uuid4())
@@ -87,15 +87,15 @@ class Session:
         self._closed: bool = False
 
         # Safety subsystems (lazy-initialised)
-        self.sandbox: "Sandbox | None" = None
-        self.approvals: "ApprovalManager | None" = None
+        self.sandbox: Sandbox | None = None
+        self.approvals: ApprovalManager | None = None
 
         # Subsystems — populated by _init()
-        self.scheduler: "EventLoopScheduler | None" = None
-        self.network: "NetworkClient | None" = None
-        self.cookies: "CookieJar | None" = None
-        self.snapshots: "SnapshotManager | None" = None
-        self.js_runtime: "JSRuntime | None" = None
+        self.scheduler: EventLoopScheduler | None = None
+        self.network: NetworkClient | None = None
+        self.cookies: CookieJar | None = None
+        self.snapshots: SnapshotManager | None = None
+        self.js_runtime: JSRuntime | None = None
 
         # Storage
         # localStorage: keyed by origin (netloc), persists across navigations
@@ -105,7 +105,7 @@ class Session:
 
         # Current page state
         self._current_url: str = "about:blank"
-        self._current_document: "Document | None" = None
+        self._current_document: Document | None = None
         self._page_state: PageState = PageState()
 
         # Navigation history (list of successfully visited URLs)
@@ -126,8 +126,8 @@ class Session:
         from an_web.js.runtime import JSRuntime
         from an_web.net.client import NetworkClient
         from an_web.net.cookies import CookieJar
-        from an_web.policy.sandbox import Sandbox
         from an_web.policy.approvals import ApprovalManager
+        from an_web.policy.sandbox import Sandbox
 
         self.cookies = CookieJar()
         self.network = NetworkClient(cookie_jar=self.cookies)
@@ -229,7 +229,7 @@ class Session:
     # Semantic snapshot
     # ------------------------------------------------------------------
 
-    async def snapshot(self) -> "PageSemantics":
+    async def snapshot(self) -> PageSemantics:
         """Return the current page's semantic state as a PageSemantics object."""
         from an_web.semantic.extractor import SemanticExtractor
 
@@ -396,7 +396,7 @@ class Session:
     # Context manager
     # ------------------------------------------------------------------
 
-    async def __aenter__(self) -> "Session":
+    async def __aenter__(self) -> Session:
         return self
 
     async def __aexit__(self, *_: object) -> None:

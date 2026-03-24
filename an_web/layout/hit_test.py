@@ -24,15 +24,14 @@ Overlay/modal detection algorithm:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
+from an_web.layout.flow import compute_z_order
 from an_web.layout.visibility import (
-    compute_visibility_cascaded,
-    VisibilityResult,
     _parse_inline_style,
+    compute_visibility_cascaded,
 )
-from an_web.layout.flow import compute_z_order, creates_stacking_context
 
 if TYPE_CHECKING:
     from an_web.dom.nodes import Document, Element
@@ -105,7 +104,7 @@ class _BlockerInfo:
     kind: str  # 'dialog' | 'modal' | 'overlay' | 'fixed'
 
 
-def _collect_blockers(doc: "Document") -> list[_BlockerInfo]:
+def _collect_blockers(doc: Document) -> list[_BlockerInfo]:
     """
     Collect all elements that could occlude other elements.
 
@@ -115,7 +114,6 @@ def _collect_blockers(doc: "Document") -> list[_BlockerInfo]:
     3. [aria-modal=true]
     4. Elements with position:fixed and z-index > 0 (overlays / popups)
     """
-    from an_web.dom.nodes import Element
 
     blockers: list[_BlockerInfo] = []
 
@@ -168,7 +166,7 @@ def _collect_blockers(doc: "Document") -> list[_BlockerInfo]:
 
 # ── Ancestor utilities ────────────────────────────────────────────────────────
 
-def _get_ancestor_ids(element: "Element") -> frozenset[str]:
+def _get_ancestor_ids(element: Element) -> frozenset[str]:
     """Return frozenset of node_id for all ancestors (parent chain)."""
     ids: set[str] = set()
     node = getattr(element, "parent", None)
@@ -180,7 +178,7 @@ def _get_ancestor_ids(element: "Element") -> frozenset[str]:
     return frozenset(ids)
 
 
-def _get_depth(element: "Element") -> int:
+def _get_depth(element: Element) -> int:
     """Count parent chain depth."""
     depth = 0
     node = getattr(element, "parent", None)
@@ -193,8 +191,8 @@ def _get_depth(element: "Element") -> int:
 # ── Core hit-test logic ───────────────────────────────────────────────────────
 
 def compute_hit_testable(
-    element: "Element",
-    doc: "Document",
+    element: Element,
+    doc: Document,
     blockers: list[_BlockerInfo] | None = None,
 ) -> tuple[bool, str | None]:
     """
@@ -251,10 +249,10 @@ def compute_hit_testable(
 # ── Interaction rank ──────────────────────────────────────────────────────────
 
 def compute_interaction_rank(
-    element: "Element",
+    element: Element,
     visible: bool,
     hit_testable: bool,
-    doc: "Document | None" = None,
+    doc: Document | None = None,
 ) -> float:
     """
     Compute an interaction rank score in [0.0, 1.0].
@@ -336,8 +334,8 @@ def compute_interaction_rank(
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def compute_hit_test(
-    element: "Element",
-    doc: "Document",
+    element: Element,
+    doc: Document,
     blockers: list[_BlockerInfo] | None = None,
 ) -> HitTestResult:
     """
@@ -384,10 +382,10 @@ def compute_hit_test(
 
 
 def find_click_target(
-    doc: "Document",
+    doc: Document,
     node_id: str,
     prefer_interactive: bool = True,
-) -> "Element | None":
+) -> Element | None:
     """
     Find the actual click target element for node_id.
 
@@ -399,7 +397,6 @@ def find_click_target(
     This mirrors Lightpanda's find_click_target() behavior: if a modal covers the
     viewport, clicking should interact with the modal, not the element behind it.
     """
-    from an_web.dom.nodes import Element
 
     target: Element | None = None
     for el in doc.iter_elements():
@@ -427,18 +424,17 @@ def find_click_target(
 
 
 def rank_elements_for_interaction(
-    doc: "Document",
+    doc: Document,
     max_results: int = 10,
-) -> list[tuple["Element", HitTestResult]]:
+) -> list[tuple[Element, HitTestResult]]:
     """
     Walk the document and return top N elements sorted by interaction_rank DESC.
 
     Useful for AI to find the best action candidates on the current page.
     """
-    from an_web.dom.nodes import Element
 
     blockers = _collect_blockers(doc)
-    scored: list[tuple["Element", HitTestResult]] = []
+    scored: list[tuple[Element, HitTestResult]] = []
 
     for el in doc.iter_elements():
         result = compute_hit_test(el, doc, blockers)

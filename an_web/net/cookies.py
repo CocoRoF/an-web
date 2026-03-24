@@ -1,9 +1,8 @@
 """Cookie jar management for AN-Web."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from http.cookiejar import CookieJar as StdCookieJar
 import time
+from dataclasses import dataclass
 
 
 @dataclass

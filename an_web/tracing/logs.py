@@ -6,13 +6,12 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
-
 
 # ── Log level ─────────────────────────────────────────────────────────────────
 
-class LogLevel(str, Enum):
+class LogLevel(StrEnum):
     DEBUG   = "debug"
     INFO    = "info"
     WARNING = "warning"
@@ -86,7 +85,7 @@ class StructuredLogger:
         action_id: str | None = None,
         data: dict[str, Any] | None = None,
     ) -> LogRecord:
-        lvl = level.value if isinstance(level, LogLevel) else str(level)
+        lvl = str(level)
         rec = LogRecord(
             record_id=f"log-{uuid.uuid4().hex[:8]}",
             level=lvl,
@@ -132,7 +131,7 @@ class StructuredLogger:
 
     # ── action context manager ────────────────────────────────────────────────
 
-    def action_context(self, action_id: str) -> "_ActionContext":
+    def action_context(self, action_id: str) -> _ActionContext:
         return _ActionContext(self, action_id)
 
     def _set_action_id(self, action_id: str | None) -> None:
@@ -144,7 +143,7 @@ class StructuredLogger:
         return list(self._records)
 
     def get_by_level(self, level: str | LogLevel) -> list[LogRecord]:
-        lvl = level.value if isinstance(level, LogLevel) else str(level)
+        lvl = str(level)
         return [r for r in self._records if r.level == lvl]
 
     def get_by_action(self, action_id: str) -> list[LogRecord]:

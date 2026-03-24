@@ -13,13 +13,12 @@ Pattern from Lightpanda actions.zig click():
 from __future__ import annotations
 
 import logging
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from an_web.actions.base import Action
 
 if TYPE_CHECKING:
     from an_web.core.session import Session
-    from an_web.dom.nodes import Element
     from an_web.dom.semantics import ActionResult
 
 log = logging.getLogger(__name__)
@@ -45,10 +44,10 @@ class ClickAction(Action):
 
     async def execute(
         self,
-        session: "Session",
+        session: Session,
         target: str | dict[str, Any] = "",
         **kwargs: Any,
-    ) -> "ActionResult":
+    ) -> ActionResult:
         from an_web.dom.semantics import ActionResult
 
         # ── 1. Resolve target ─────────────────────────────────────────
@@ -155,10 +154,10 @@ class ClickAction(Action):
     async def _handle_link_click(
         self,
         element: Any,
-        session: "Session",
+        session: Session,
         pre_url: str,
         original_target: Any,
-    ) -> "ActionResult | None":
+    ) -> ActionResult | None:
         """Navigate for <a href> clicks. Returns None if no href or same-page anchor."""
         href = element.get_attribute("href")
         if not href or href.startswith("#"):
@@ -233,15 +232,15 @@ async def _submit_form(
     session: Any,
     submitter: Any = None,
     action_name: str = "submit",
-) -> "ActionResult":
+) -> ActionResult:
     """
     Collect form fields and dispatch a network submission.
 
     Handles both GET (query string) and POST (form-encoded body).
     Follows redirects via the session's NetworkClient.
     """
-    from an_web.dom.semantics import ActionResult
     from an_web.dom.nodes import Element
+    from an_web.dom.semantics import ActionResult
 
     # ── Collect fields ────────────────────────────────────────────────
     fields: dict[str, str] = {}
@@ -355,7 +354,6 @@ def _dispatch_mouse_events(element: Any, session: Any) -> list[str]:
 
     Returns list of event names dispatched.
     """
-    node_id = getattr(element, "node_id", "")
     js_runtime = getattr(session, "js_runtime", None)
 
     if js_runtime is not None and js_runtime.is_available():

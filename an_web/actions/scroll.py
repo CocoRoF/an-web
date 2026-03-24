@@ -12,7 +12,7 @@ Mirrors Lightpanda scroll behavior:
 from __future__ import annotations
 
 import logging
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from an_web.actions.base import Action
 
@@ -51,7 +51,7 @@ class ScrollAction(Action):
 
     async def execute(
         self,
-        session: "Session",
+        session: Session,
         target: Any = None,
         delta_x: int = 0,
         delta_y: int = 300,
@@ -59,7 +59,7 @@ class ScrollAction(Action):
         to_bottom: bool = False,
         absolute: bool = False,
         **kwargs: Any,
-    ) -> "ActionResult":
+    ) -> ActionResult:
         from an_web.dom.semantics import ActionResult
 
         # ── 1. Resolve optional element target ────────────────────────

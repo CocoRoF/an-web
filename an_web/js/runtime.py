@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from an_web.js.bridge import EvalResult, JSError, js_to_py, py_to_js
 
@@ -48,7 +48,7 @@ class JSRuntime:
     to cooperate with the asyncio event loop without blocking it.
     """
 
-    def __init__(self, session: "Session") -> None:
+    def __init__(self, session: Session) -> None:
         self.session = session
         self._ctx: Any = None
         self._available: bool = False
@@ -355,7 +355,7 @@ class JSRuntime:
         self._ctx = None
         self._available = False
 
-    def __enter__(self) -> "JSRuntime":
+    def __enter__(self) -> JSRuntime:
         return self
 
     def __exit__(self, *args: Any) -> None:

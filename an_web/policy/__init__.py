@@ -10,15 +10,15 @@ Modules:
     approvals  - Destructive action confirmation flags
     checker    - Unified PolicyChecker combining all three modules
 """
-from an_web.policy.rules import (
-    PolicyRules,
-    PolicyCheckResult,
-    NavigationScope,
-    ViolationType,
-)
-from an_web.policy.sandbox import Sandbox, SandboxLimits, Resource
 from an_web.policy.approvals import ApprovalManager, PendingApproval
 from an_web.policy.checker import PolicyChecker
+from an_web.policy.rules import (
+    NavigationScope,
+    PolicyCheckResult,
+    PolicyRules,
+    ViolationType,
+)
+from an_web.policy.sandbox import Resource, Sandbox, SandboxLimits
 
 __all__ = [
     "PolicyRules",

@@ -334,7 +334,7 @@ class EventLoopScheduler:
                 ),
                 timeout=timeout,
             )
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             log.debug("settle_network timed out after %.1fs", timeout)
 
     # ------------------------------------------------------------------

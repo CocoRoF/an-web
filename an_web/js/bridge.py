@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ class JSError(Exception):
         return f"{self.js_type}: {self.message}"
 
     @classmethod
-    def from_quickjs_exception(cls, exc: Exception) -> "JSError":
+    def from_quickjs_exception(cls, exc: Exception) -> JSError:
         """Convert a quickjs.JSException into a structured JSError."""
         raw_msg = str(exc)
         lines = raw_msg.splitlines()
@@ -64,11 +65,11 @@ class EvalResult:
     ok: bool = True
 
     @classmethod
-    def success(cls, value: Any) -> "EvalResult":
+    def success(cls, value: Any) -> EvalResult:
         return cls(value=value, ok=True)
 
     @classmethod
-    def failure(cls, error: JSError) -> "EvalResult":
+    def failure(cls, error: JSError) -> EvalResult:
         return cls(error=error, ok=False)
 
     def unwrap(self) -> Any:
@@ -234,7 +235,7 @@ def _inner_html(element: Any) -> str:
     """Very lightweight innerHTML approximation."""
     parts: list[str] = []
     for child in getattr(element, "children", []):
-        from an_web.dom.nodes import TextNode, Element
+        from an_web.dom.nodes import Element, TextNode
         if isinstance(child, TextNode):
             parts.append(child.data)
         elif isinstance(child, Element):

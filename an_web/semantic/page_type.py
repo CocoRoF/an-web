@@ -33,7 +33,7 @@ matched signals for traceability.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from an_web.dom.semantics import SemanticNode
@@ -98,7 +98,7 @@ class PageTypeResult:
 # ── Main classifier ────────────────────────────────────────────────────────────
 
 def classify_page_type(
-    tree: "SemanticNode",
+    tree: SemanticNode,
     title: str = "",
     url: str = "",
 ) -> str:
@@ -111,7 +111,7 @@ def classify_page_type(
 
 
 def classify_page_type_full(
-    tree: "SemanticNode",
+    tree: SemanticNode,
     title: str = "",
     url: str = "",
 ) -> PageTypeResult:
@@ -179,7 +179,7 @@ def classify_page_type_full(
 
 
 def _classify_from_tree(
-    tree: "SemanticNode",
+    tree: SemanticNode,
     votes: dict[str, float],
     signals: list[str],
 ) -> None:

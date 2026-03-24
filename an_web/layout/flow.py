@@ -17,13 +17,13 @@ These are hints for AI interaction targeting, not for rendering.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from an_web.layout.visibility import _parse_inline_style, _parse_px
 
 if TYPE_CHECKING:
-    from an_web.dom.nodes import Element, Document
+    from an_web.dom.nodes import Document, Element
 
 # ── Tag classification ────────────────────────────────────────────────────────
 
@@ -180,7 +180,7 @@ class FlowContext:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def get_display_type(element: "Element") -> str:
+def get_display_type(element: Element) -> str:
     """
     Return display type: 'block' | 'inline' | 'inline-block' | 'flex' | 'grid' |
                          'table' | 'none' | 'unknown'
@@ -219,7 +219,7 @@ def get_display_type(element: "Element") -> str:
     return "unknown"
 
 
-def compute_z_order(element: "Element") -> int:
+def compute_z_order(element: Element) -> int:
     """
     Estimate z-index / stacking order of an element.
 
@@ -262,7 +262,7 @@ def compute_z_order(element: "Element") -> int:
     return pos_bonus + role_bonus
 
 
-def creates_stacking_context(element: "Element") -> bool:
+def creates_stacking_context(element: Element) -> bool:
     """
     Detect if an element creates a CSS stacking context.
 
@@ -308,7 +308,7 @@ def creates_stacking_context(element: "Element") -> bool:
 
 
 def infer_bbox_hint(
-    element: "Element",
+    element: Element,
     flow_ctx: FlowContext | None = None,
 ) -> tuple[int, int, int, int]:
     """
@@ -385,7 +385,7 @@ def infer_bbox_hint(
 
 
 def compute_layout_info(
-    element: "Element",
+    element: Element,
     flow_ctx: FlowContext | None = None,
 ) -> LayoutInfo:
     """
@@ -410,7 +410,7 @@ def compute_layout_info(
     )
 
 
-def compute_document_layout(doc: "Document") -> dict[str, LayoutInfo]:
+def compute_document_layout(doc: Document) -> dict[str, LayoutInfo]:
     """
     Walk the entire document and compute LayoutInfo for every element.
 

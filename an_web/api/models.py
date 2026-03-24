@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Literal, Union
-from pydantic import BaseModel, Field, model_validator
+from typing import Any, Literal
 
+from pydantic import BaseModel, Field, model_validator
 
 # ─── Target ───────────────────────────────────────────────────────────────────
 
@@ -27,7 +27,7 @@ class NavigateRequest(BaseModel):
     url: str
 
     @model_validator(mode="after")
-    def _check_url(self) -> "NavigateRequest":
+    def _check_url(self) -> NavigateRequest:
         if not self.url:
             raise ValueError("url must not be empty")
         return self
@@ -35,36 +35,36 @@ class NavigateRequest(BaseModel):
 
 class ClickRequest(BaseModel):
     tool: Literal["click"] = "click"
-    target: Union[str, SemanticTarget]
+    target: str | SemanticTarget
 
 
 class TypeRequest(BaseModel):
     tool: Literal["type"] = "type"
-    target: Union[str, SemanticTarget]
+    target: str | SemanticTarget
     text: str
     append: bool = False
 
 
 class ClearRequest(BaseModel):
     tool: Literal["clear"] = "clear"
-    target: Union[str, SemanticTarget]
+    target: str | SemanticTarget
 
 
 class SelectRequest(BaseModel):
     tool: Literal["select"] = "select"
-    target: Union[str, SemanticTarget]
+    target: str | SemanticTarget
     value: str
     by_text: bool = False
 
 
 class SubmitRequest(BaseModel):
     tool: Literal["submit"] = "submit"
-    target: Union[str, SemanticTarget]
+    target: str | SemanticTarget
 
 
 class ExtractRequest(BaseModel):
     tool: Literal["extract"] = "extract"
-    query: Union[str, dict] = ""
+    query: str | dict = ""
     mode: Literal["css", "structured", "json", "html"] = "css"
     limit: int = 100
 
@@ -80,7 +80,7 @@ class WaitForRequest(BaseModel):
     timeout_ms: int = 5000
 
     @model_validator(mode="after")
-    def _check_element_visible(self) -> "WaitForRequest":
+    def _check_element_visible(self) -> WaitForRequest:
         if self.condition == "element_visible" and not self.selector:
             raise ValueError("selector is required for condition='element_visible'")
         return self
@@ -88,7 +88,7 @@ class WaitForRequest(BaseModel):
 
 class ScrollRequest(BaseModel):
     tool: Literal["scroll"] = "scroll"
-    target: Union[str, SemanticTarget, None] = None
+    target: str | SemanticTarget | None = None
     delta_x: int = 0
     delta_y: int = 300
 
@@ -98,17 +98,17 @@ class EvalJSRequest(BaseModel):
     script: str
 
     @model_validator(mode="after")
-    def _check_script(self) -> "EvalJSRequest":
+    def _check_script(self) -> EvalJSRequest:
         if not self.script.strip():
             raise ValueError("script must not be empty")
         return self
 
 
-ToolRequest = Union[
-    NavigateRequest, ClickRequest, TypeRequest, ClearRequest,
-    SelectRequest, SubmitRequest, ExtractRequest, SnapshotRequest,
-    WaitForRequest, ScrollRequest, EvalJSRequest,
-]
+ToolRequest = (
+    NavigateRequest | ClickRequest | TypeRequest | ClearRequest
+    | SelectRequest | SubmitRequest | ExtractRequest | SnapshotRequest
+    | WaitForRequest | ScrollRequest | EvalJSRequest
+)
 
 # Mapping tool name → request model
 TOOL_REQUEST_MAP: dict[str, type[BaseModel]] = {
@@ -169,7 +169,7 @@ class ActionResponse(BaseModel):
         return self.status in ("failed", "blocked")
 
     @classmethod
-    def from_result(cls, result: dict[str, Any]) -> "ActionResponse":
+    def from_result(cls, result: dict[str, Any]) -> ActionResponse:
         effects_data = result.get("effects", {})
         if not isinstance(effects_data, dict):
             effects_data = {}
@@ -216,7 +216,7 @@ class SemanticNodeModel(BaseModel):
     is_interactive: bool
     visible: bool
     attributes: dict[str, str] = Field(default_factory=dict)
-    children: list["SemanticNodeModel"] = Field(default_factory=list)
+    children: list[SemanticNodeModel] = Field(default_factory=list)
     options: list[dict[str, Any]] | None = None
     affordances: list[str] = Field(default_factory=list)
     stable_selector: str | None = None
@@ -237,7 +237,7 @@ class PageSemanticsResponse(BaseModel):
     snapshot_id: str
 
     @classmethod
-    def from_result(cls, result: dict[str, Any]) -> "PageSemanticsResponse":
+    def from_result(cls, result: dict[str, Any]) -> PageSemanticsResponse:
         return cls(
             page_type=result.get("page_type", "unknown"),
             title=result.get("title", ""),

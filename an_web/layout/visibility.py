@@ -13,7 +13,7 @@ Two levels:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from an_web.dom.nodes import Element
@@ -62,7 +62,7 @@ class VisibilityResult:
 
 # ── Single-element visibility ─────────────────────────────────────────────────
 
-def compute_visibility(element: "Element") -> str:
+def compute_visibility(element: Element) -> str:
     """
     Compute single-element visibility: 'visible' | 'hidden' | 'none'.
 
@@ -77,7 +77,7 @@ def compute_visibility(element: "Element") -> str:
     return result.state
 
 
-def compute_visibility_result(element: "Element") -> VisibilityResult:
+def compute_visibility_result(element: Element) -> VisibilityResult:
     """
     Like compute_visibility() but returns a VisibilityResult with reason.
     """
@@ -142,7 +142,7 @@ def compute_visibility_result(element: "Element") -> VisibilityResult:
 
 # ── Cascaded visibility ────────────────────────────────────────────────────────
 
-def compute_visibility_cascaded(element: "Element") -> VisibilityResult:
+def compute_visibility_cascaded(element: Element) -> VisibilityResult:
     """
     Compute visibility by walking the element's ancestor chain.
 
@@ -198,7 +198,7 @@ def compute_visibility_cascaded(element: "Element") -> VisibilityResult:
     return own
 
 
-def is_visible(element: "Element") -> bool:
+def is_visible(element: Element) -> bool:
     """
     Quick True/False check — uses cascaded visibility.
 
@@ -209,7 +209,7 @@ def is_visible(element: "Element") -> bool:
 
 # ── is_offscreen ──────────────────────────────────────────────────────────────
 
-def is_offscreen(element: "Element") -> bool:
+def is_offscreen(element: Element) -> bool:
     """
     Check if element is positioned far off-screen (SR-only / accessibility hack).
 

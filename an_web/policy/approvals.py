@@ -21,7 +21,6 @@ from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from typing import Any
 
-
 # ── Pending approval record ───────────────────────────────────────────────────
 
 @dataclass

@@ -206,7 +206,7 @@ WIDGET_ROLES: frozenset[str] = frozenset({
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def infer_role(element: "Element") -> str:
+def infer_role(element: Element) -> str:
     """
     Infer ARIA role for a DOM element.
 
@@ -252,7 +252,7 @@ def is_landmark_role(role: str) -> bool:
     return role in LANDMARK_ROLES
 
 
-def get_heading_level(element: "Element") -> int | None:
+def get_heading_level(element: Element) -> int | None:
     """
     Return heading level 1-6 for heading elements.
 
@@ -277,7 +277,7 @@ def get_heading_level(element: "Element") -> int | None:
     return None
 
 
-def get_affordances(role: str, element: "Element") -> list[str]:
+def get_affordances(role: str, element: Element) -> list[str]:
     """
     Return list of AI-executable actions for a role+element combination.
 

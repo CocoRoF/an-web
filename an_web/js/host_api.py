@@ -25,9 +25,9 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from an_web.js.bridge import make_json_callable, marshal_element, marshal_document
+from an_web.js.bridge import marshal_document, marshal_element
 
 if TYPE_CHECKING:
     from an_web.core.session import Session
@@ -40,7 +40,7 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def install_host_api(ctx: Any, session: "Session") -> None:
+def install_host_api(ctx: Any, session: Session) -> None:
     """
     Install the complete host Web API into a QuickJS context.
 
@@ -61,7 +61,7 @@ def install_host_api(ctx: Any, session: "Session") -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _register_py_callbacks(ctx: Any, session: "Session") -> None:
+def _register_py_callbacks(ctx: Any, session: Session) -> None:
     """Register all _py_* Python functions into the QuickJS context."""
 
     # ── Console ──────────────────────────────────────────────────────────────
@@ -234,8 +234,8 @@ def _register_py_callbacks(ctx: Any, session: "Session") -> None:
         doc = getattr(session, "_current_document", None)
         if doc is None:
             return "null"
-        from an_web.dom.selectors import SelectorEngine
         from an_web.dom.nodes import Element
+        from an_web.dom.selectors import SelectorEngine
         root = _find_element_by_id(session, node_id)
         if root is None:
             return "null"
@@ -254,8 +254,8 @@ def _register_py_callbacks(ctx: Any, session: "Session") -> None:
         doc = getattr(session, "_current_document", None)
         if doc is None:
             return "[]"
-        from an_web.dom.selectors import SelectorEngine
         from an_web.dom.nodes import Element
+        from an_web.dom.selectors import SelectorEngine
         root = _find_element_by_id(session, node_id)
         if root is None:
             return "[]"
@@ -284,10 +284,10 @@ def _register_py_callbacks(ctx: Any, session: "Session") -> None:
             return "[]"
         from an_web.dom.nodes import Element
         links = [
-            e for e in doc.iter_descendants()
-            if isinstance(e, Element) and e.tag == "a" and "href" in e.attributes
+            el for el in doc.iter_descendants()
+            if isinstance(el, Element) and el.tag == "a" and "href" in el.attributes
         ]
-        return json.dumps([marshal_element(l) for l in links])
+        return json.dumps([marshal_element(el) for el in links])
 
     def _py_get_images() -> str:
         """Return all <img> elements."""
@@ -1407,7 +1407,7 @@ try { window.dispatchEvent(new window.Event('load')); } catch(e) {}
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def build_host_globals(session: "Session") -> dict[str, Any]:
+def build_host_globals(session: Session) -> dict[str, Any]:
     """
     Legacy helper — returns an empty dict since install_host_api() now
     handles everything directly on the ctx. Kept for API compatibility.

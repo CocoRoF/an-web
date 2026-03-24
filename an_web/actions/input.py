@@ -12,7 +12,7 @@ Pattern from Lightpanda actions.zig:
 from __future__ import annotations
 
 import logging
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from an_web.actions.base import Action
 
@@ -44,12 +44,12 @@ class TypeAction(Action):
 
     async def execute(
         self,
-        session: "Session",
+        session: Session,
         target: str | dict[str, Any] = "",
         text: str = "",
         append: bool = False,
         **kwargs: Any,
-    ) -> "ActionResult":
+    ) -> ActionResult:
         from an_web.dom.semantics import ActionResult
 
         # ── 1. Resolve target ─────────────────────────────────────────
@@ -145,10 +145,10 @@ class ClearAction(Action):
 
     async def execute(
         self,
-        session: "Session",
+        session: Session,
         target: str | dict[str, Any] = "",
         **kwargs: Any,
-    ) -> "ActionResult":
+    ) -> ActionResult:
         from an_web.dom.semantics import ActionResult
 
         element = await self._resolve_target(target, session)
@@ -202,12 +202,12 @@ class SelectAction(Action):
 
     async def execute(
         self,
-        session: "Session",
+        session: Session,
         target: str | dict[str, Any] = "",
         value: str = "",
         by_text: bool = False,
         **kwargs: Any,
-    ) -> "ActionResult":
+    ) -> ActionResult:
         from an_web.dom.semantics import ActionResult
 
         element = await self._resolve_target(target, session)

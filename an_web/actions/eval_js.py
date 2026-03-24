@@ -1,7 +1,7 @@
 """eval_js action — execute JavaScript in the current page context."""
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from an_web.actions.base import Action
 
@@ -26,10 +26,10 @@ class EvalJSAction(Action):
 
     async def execute(
         self,
-        session: "Session",
+        session: Session,
         script: str = "",
         **kwargs: Any,
-    ) -> "ActionResult":
+    ) -> ActionResult:
         from an_web.dom.semantics import ActionResult
 
         if not script:

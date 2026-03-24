@@ -15,14 +15,13 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
-from urllib.parse import urlparse, urljoin
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
 if TYPE_CHECKING:
     from an_web.net.cookies import CookieJar
-    from an_web.net.resources import ResourceType
 
 
 # ─── Domain errors ────────────────────────────────────────────────────────────
@@ -268,8 +267,6 @@ class NetworkClient:
         self._pending += 1
         self._request_count += 1
         t0 = time.monotonic()
-        error_msg: str | None = None
-
         try:
             httpx_resp = await self._client.request(
                 method,

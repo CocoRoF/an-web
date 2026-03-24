@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from an_web.core.session import Session
-    from an_web.dom.nodes import Document, Element, Node
+    from an_web.dom.nodes import Document, Element
     from an_web.dom.semantics import PageSemantics, SemanticNode
 
 
@@ -41,10 +41,10 @@ class SemanticExtractor:
 
     def extract_from_document(
         self,
-        doc: "Document",
+        doc: Document,
         url: str = "about:blank",
         snapshot_manager: Any = None,
-    ) -> "PageSemantics":
+    ) -> PageSemantics:
         """
         Synchronous extraction from a Document object.
 
@@ -52,8 +52,8 @@ class SemanticExtractor:
         Document (e.g. NavigateAction, tests, offline processing).
         """
         from an_web.dom.semantics import PageSemantics
-        from an_web.semantic.page_type import classify_page_type
         from an_web.semantic.affordances import rank_primary_actions
+        from an_web.semantic.page_type import classify_page_type
 
         # Build lookup helpers once before walking
         label_for_map = self._build_label_for_map(doc)
@@ -100,7 +100,7 @@ class SemanticExtractor:
             snapshot_id=snap_id,
         )
 
-    async def extract(self, session: "Session") -> "PageSemantics":
+    async def extract(self, session: Session) -> PageSemantics:
         """Async extraction bound to a live Session."""
         from an_web.dom.semantics import PageSemantics, SemanticNode
 
@@ -134,7 +134,7 @@ class SemanticExtractor:
 
     # ── Document-level helpers ────────────────────────────────────────────────
 
-    def _build_label_for_map(self, doc: "Document") -> dict[str, str]:
+    def _build_label_for_map(self, doc: Document) -> dict[str, str]:
         """
         Build {input_id: label_text} map from label[for] elements.
 
@@ -152,7 +152,7 @@ class SemanticExtractor:
                         label_map[for_id] = text
         return label_map
 
-    def _build_id_element_map(self, doc: "Document") -> dict[str, "Element"]:
+    def _build_id_element_map(self, doc: Document) -> dict[str, Element]:
         """
         Build {element_id: element} map for aria-labelledby resolution.
 
@@ -166,7 +166,7 @@ class SemanticExtractor:
             return id_map  # type: ignore[return-value]
 
         # Fallback: build from scratch
-        result: dict[str, "Element"] = {}
+        result: dict[str, Element] = {}
         for node in doc.iter_descendants():
             if isinstance(node, Element):
                 el_id = node.get_id()
@@ -178,12 +178,11 @@ class SemanticExtractor:
 
     def _walk_document(
         self,
-        doc: "Document",
+        doc: Document,
         label_for_map: dict[str, str],
-        id_element_map: dict[str, "Element"],
-    ) -> "SemanticNode":
+        id_element_map: dict[str, Element],
+    ) -> SemanticNode:
         from an_web.dom.semantics import SemanticNode
-        from an_web.dom.nodes import Element, TextNode
 
         root = SemanticNode(
             node_id="__document__",
@@ -210,16 +209,16 @@ class SemanticExtractor:
     def _walk_node(
         self,
         node: Any,
-        parent: "SemanticNode",
+        parent: SemanticNode,
         tag_counts: dict[str, int],
         depth: int,
         parent_xpath: str,
         label_for_map: dict[str, str],
-        id_element_map: dict[str, "Element"],
+        id_element_map: dict[str, Element],
     ) -> None:
         from an_web.dom.nodes import Element, TextNode
         from an_web.dom.semantics import SemanticNode
-        from an_web.semantic.roles import infer_role, get_affordances, is_structural_role
+        from an_web.semantic.roles import get_affordances, infer_role, is_structural_role
 
         MAX_DEPTH = 100
         if depth > MAX_DEPTH:
@@ -327,9 +326,9 @@ class SemanticExtractor:
 
     def _compute_accessible_name(
         self,
-        element: "Element",
+        element: Element,
         label_for_map: dict[str, str] | None = None,
-        id_element_map: dict[str, "Element"] | None = None,
+        id_element_map: dict[str, Element] | None = None,
     ) -> str | None:
         """
         Compute accessible name following ARIA spec priority order:
@@ -395,7 +394,7 @@ class SemanticExtractor:
 
     # ── Form scope ────────────────────────────────────────────────────────────
 
-    def _find_form_scope_id(self, element: "Element") -> str | None:
+    def _find_form_scope_id(self, element: Element) -> str | None:
         """
         Walk parent chain to find the nearest enclosing <form>.
 
@@ -419,7 +418,7 @@ class SemanticExtractor:
 
     # ── Stable selector ───────────────────────────────────────────────────────
 
-    def _compute_stable_selector(self, element: "Element") -> str | None:
+    def _compute_stable_selector(self, element: Element) -> str | None:
         """Generate most reliable CSS selector for re-targeting."""
         el_id = element.get_id()
         if el_id:
@@ -437,7 +436,7 @@ class SemanticExtractor:
 
     # ── Select options ────────────────────────────────────────────────────────
 
-    def _extract_select_options(self, element: "Element") -> list[dict[str, Any]]:
+    def _extract_select_options(self, element: Element) -> list[dict[str, Any]]:
         from an_web.dom.nodes import Element as El
         options: list[dict[str, Any]] = []
         for child in element.children:
@@ -451,13 +450,13 @@ class SemanticExtractor:
 
     # ── Blocker detection ─────────────────────────────────────────────────────
 
-    def _find_blockers(self, tree: "SemanticNode") -> list[dict[str, Any]]:
+    def _find_blockers(self, tree: SemanticNode) -> list[dict[str, Any]]:
         """Find elements blocking interaction (modal, cookie banner)."""
         blockers: list[dict[str, Any]] = []
         BLOCKER_ROLES = {"dialog", "alertdialog"}
         BLOCKER_TEXTS = {"cookie", "consent", "accept", "privacy", "gdpr"}
 
-        def _check(node: "SemanticNode") -> None:
+        def _check(node: SemanticNode) -> None:
             if node.role in BLOCKER_ROLES:
                 blockers.append({"node_id": node.node_id, "kind": node.role})
                 return

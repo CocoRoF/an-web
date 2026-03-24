@@ -219,7 +219,6 @@ def _matches_complex(element: Element, sel: ComplexSelector) -> bool:
     node: Node = element
     for idx in range(len(sel.parts) - 2, -1, -1):
         combinator, simple = sel.parts[idx + 1]
-        prev_combinator, prev_simple = sel.parts[idx], (None, None)
         # combinator stored in the NEXT part
         if idx + 1 < len(sel.parts):
             combinator = sel.parts[idx + 1][0]

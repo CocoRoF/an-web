@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from an_web.actions.base import Action
 
@@ -61,10 +61,10 @@ class ExtractAction(Action):
 
     async def execute(
         self,
-        session: "Session",
+        session: Session,
         query: str | dict[str, Any] = "",
         **kwargs: Any,
-    ) -> "ActionResult":
+    ) -> ActionResult:
         from an_web.dom.semantics import ActionResult
 
         doc = getattr(session, "_current_document", None)
@@ -159,9 +159,8 @@ def _extract_structured(doc: Any, query: dict[str, Any]) -> list[dict[str, Any]]
             }
         }
     """
-    from an_web.dom.document import query_selector_all, query_selector
+    from an_web.dom.document import query_selector_all
 
-    container_sel = query_selector.func if hasattr(query_selector, "func") else query_selector
     root_sel = query.get("selector", "*")
     fields: dict[str, Any] = query.get("fields", {})
 
@@ -207,7 +206,6 @@ def _query_in(element: Any, selector: str) -> Any:
         return None
     # Try exact tag match first for performance
     for desc in element.iter_descendants():
-        tag = getattr(desc, "tag", "")
         # Minimal matching: support simple "tag", ".class", "#id", "tag.class"
         if _matches_simple_selector(desc, selector):
             return desc

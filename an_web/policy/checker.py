@@ -22,11 +22,11 @@ Usage::
 """
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from an_web.policy.rules import PolicyCheckResult, PolicyRules, ViolationType
-from an_web.policy.sandbox import Sandbox, SandboxLimits, Resource
 from an_web.policy.approvals import ApprovalManager
+from an_web.policy.rules import PolicyCheckResult, PolicyRules
+from an_web.policy.sandbox import Resource, Sandbox, SandboxLimits
 
 if TYPE_CHECKING:
     from an_web.core.session import Session
@@ -59,7 +59,7 @@ class PolicyChecker:
     # ── Factory ───────────────────────────────────────────────────────────────
 
     @classmethod
-    def for_session(cls, session: "Session") -> "PolicyChecker":
+    def for_session(cls, session: Session) -> PolicyChecker:
         """
         Build a PolicyChecker wired to the session's policy + sandbox.
 
@@ -77,7 +77,7 @@ class PolicyChecker:
         return cls(rules=rules, sandbox=sandbox, approvals=approvals)
 
     @classmethod
-    def noop(cls) -> "PolicyChecker":
+    def noop(cls) -> PolicyChecker:
         """
         A no-op checker that allows everything.
 

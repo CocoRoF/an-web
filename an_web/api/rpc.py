@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from an_web.core.session import Session
@@ -84,9 +84,17 @@ def _validate_request(tool_name: str, params: dict[str, Any]) -> dict[str, Any]:
     Raises ValueError with a descriptive message on schema mismatch.
     """
     from an_web.api.models import (
-        NavigateRequest, ClickRequest, TypeRequest, ClearRequest,
-        SelectRequest, SubmitRequest, ExtractRequest, SnapshotRequest,
-        WaitForRequest, ScrollRequest, EvalJSRequest,
+        ClearRequest,
+        ClickRequest,
+        EvalJSRequest,
+        ExtractRequest,
+        NavigateRequest,
+        ScrollRequest,
+        SelectRequest,
+        SnapshotRequest,
+        SubmitRequest,
+        TypeRequest,
+        WaitForRequest,
     )
 
     _MODEL_MAP: dict[str, type] = {
@@ -124,7 +132,7 @@ def _validate_request(tool_name: str, params: dict[str, Any]) -> dict[str, Any]:
 async def _dispatch(
     tool_name: str,
     params: dict[str, Any],
-    session: "Session",
+    session: Session,
 ) -> Any:
     """Route validated params to the appropriate action class."""
 
@@ -185,7 +193,7 @@ async def _dispatch(
 
 async def dispatch_tool(
     tool_call: dict[str, Any],
-    session: "Session",
+    session: Session,
     *,
     validate: bool = True,
     collect_artifacts: bool = True,
@@ -279,7 +287,7 @@ async def dispatch_tool(
 # ── Policy helper ─────────────────────────────────────────────────────────────
 
 def _policy_check(
-    session: "Session",
+    session: Session,
     tool_name: str,
     url: str | None,
 ) -> dict[str, Any] | None:
@@ -316,7 +324,7 @@ def _policy_check(
 # ── Artifact helper ───────────────────────────────────────────────────────────
 
 def _maybe_collect_artifact(
-    session: "Session",
+    session: Session,
     tool_name: str,
     result_dict: dict[str, Any],
     duration_ms: float,
@@ -362,7 +370,7 @@ class ANWebToolInterface:
         tool_history: List of (tool_name, result_dict) tuples in call order.
     """
 
-    def __init__(self, session: "Session") -> None:
+    def __init__(self, session: Session) -> None:
         self.session = session
         self.tool_history: list[tuple[str, dict[str, Any]]] = []
         self._logger = _get_struct_logger(session)
@@ -463,7 +471,7 @@ class ANWebToolInterface:
 
 # ── Logger helper ─────────────────────────────────────────────────────────────
 
-def _get_struct_logger(session: "Session") -> Any:
+def _get_struct_logger(session: Session) -> Any:
     """Return StructuredLogger if available on session, else None."""
     # sessions don't currently carry a StructuredLogger — return None
     # (callers can attach one via session.struct_logger = get_logger(...))
