@@ -407,22 +407,22 @@ jobs:
             echo "\`\`\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # ── Job 5: PyPI 배포 ─────────────────────────────────────────────────────
+  # ── Job 5: PyPI / TestPyPI 배포 ─────────────────────────────────────────
   publish-pypi:
-    name: Publish to PyPI
+    name: Publish to ${{ needs.check-version.outputs.environment == 'staging' && 'TestPyPI' || 'PyPI' }}
     runs-on: ubuntu-latest
     needs: [check-version, build]
-    # 조건: 빌드 성공 + dry_run 아님 + production 환경
-    # staging은 TestPyPI 별도 등록 필요 → production만 실제 PyPI에 배포
+    # 조건: 빌드 성공 + dry_run 아님
+    # production → pypi.org (OIDC 환경: pypi)
+    # staging    → test.pypi.org (OIDC 환경: testpypi, TestPyPI Trusted Publisher 등록 필요)
     if: |
       needs.build.result == 'success' &&
-      needs.check-version.outputs.is_dry_run != 'true' &&
-      needs.check-version.outputs.environment == 'production'
+      needs.check-version.outputs.is_dry_run != 'true'
 
-    # OIDC Trusted Publisher 인증에 필요한 GitHub Actions 환경
+    # OIDC Trusted Publisher 환경: production=pypi, staging=testpypi
     environment:
-      name: pypi
-      url: https://pypi.org/project/an-web/${{ needs.check-version.outputs.version }}/
+      name: ${{ needs.check-version.outputs.environment == 'staging' && 'testpypi' || 'pypi' }}
+      url: ${{ needs.check-version.outputs.environment == 'staging' && format('https://test.pypi.org/project/an-web/{0}/', needs.check-version.outputs.version) || format('https://pypi.org/project/an-web/{0}/', needs.check-version.outputs.version) }}
 
     steps:
       - name: Download build artifacts
@@ -433,24 +433,49 @@ jobs:
 
       - name: Verify dist files
         run: |
-          echo "=== PyPI 업로드 파일 ==="
+          ENV="${{ needs.check-version.outputs.environment }}"
+          echo "=== 업로드 대상 파일 ==="
           ls -lh dist/
+          if [ "${ENV}" == "staging" ]; then
+            echo "📦 TestPyPI (test.pypi.org) 에 업로드합니다"
+          else
+            echo "📦 PyPI (pypi.org) 에 업로드합니다"
+          fi
 
-      - name: Publish to PyPI
-        # OIDC Trusted Publisher 방식 — API 토큰 불필요
-        # PyPI에서 CocoRoF/an-web의 deploy.yml + pypi 환경으로 등록된 Trusted Publisher 사용
+      - name: Publish to PyPI (production)
+        # production: pypi.org — OIDC Trusted Publisher (environment: pypi)
+        if: needs.check-version.outputs.environment != 'staging'
         uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Publish to TestPyPI (staging)
+        # staging: test.pypi.org — OIDC Trusted Publisher (environment: testpypi)
+        # TestPyPI에서 별도 Trusted Publisher 등록 필요:
+        #   https://test.pypi.org/manage/account/publishing/
+        #   owner=CocoRoF, repo=an-web, workflow=deploy.yml, env=testpypi
+        if: needs.check-version.outputs.environment == 'staging'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
 
       - name: Job summary
         run: |
           VERSION="${{ needs.check-version.outputs.version }}"
+          ENV="${{ needs.check-version.outputs.environment }}"
+          if [ "${ENV}" == "staging" ]; then
+            PYPI_NAME="TestPyPI"
+            PYPI_URL="https://test.pypi.org/project/an-web/${VERSION}/"
+          else
+            PYPI_NAME="PyPI"
+            PYPI_URL="https://pypi.org/project/an-web/${VERSION}/"
+          fi
           {
-            echo "## 📦 PyPI 배포 완료"
+            echo "## 📦 ${PYPI_NAME} 배포 완료"
             echo ""
             echo "| 항목 | 값 |"
             echo "|------|-----|"
             echo "| 버전 | \`${VERSION}\` |"
-            echo "| PyPI | https://pypi.org/project/an-web/${VERSION}/ |"
+            echo "| 환경 | ${ENV} |"
+            echo "| URL | ${PYPI_URL} |"
             echo "| 트리거 | ${{ github.event_name }} |"
             echo "| 배포자 | @${{ github.actor }} |"
           } >> "$GITHUB_STEP_SUMMARY"
