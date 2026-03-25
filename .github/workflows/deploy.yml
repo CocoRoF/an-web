@@ -8,80 +8,130 @@ on:
     paths:
       - "pyproject.toml"
 
-  # Trigger 2: GitHub UI에서 수동으로 Run workflow 실행
+  # Trigger 2: GitHub UI 또는 API에서 수동으로 Run workflow 실행
   workflow_dispatch:
     inputs:
+      # ── 버전 ───────────────────────────────────────────────────────────────
       version_override:
-        description: "배포 버전 (비워두면 pyproject.toml에서 자동 감지)"
+        description: |
+          배포 버전 태그 (예: 0.2.0)
+          비워두면 pyproject.toml의 version을 자동으로 사용합니다.
         required: false
         type: string
+
+      # ── 배포 환경 ──────────────────────────────────────────────────────────
       environment:
-        description: "배포 환경"
+        description: |
+          배포 환경
+          • production — 정식 릴리스 (latest 태그 부여)
+          • staging    — 프리릴리스 (pre-release 표시)
         required: true
         type: choice
         default: "production"
         options:
           - production
           - staging
+
+      # ── 테스트 ────────────────────────────────────────────────────────────
       skip_tests:
-        description: "테스트 건너뛰기 (긴급 배포 시)"
+        description: |
+          테스트 건너뛰기
+          ⚠️ 긴급 배포 시에만 사용하세요. 기본값은 false(테스트 실행)입니다.
         required: false
         type: boolean
         default: false
+
+      # ── GitHub Release ─────────────────────────────────────────────────────
       create_release:
-        description: "GitHub Release 생성"
+        description: |
+          GitHub Release 생성
+          true  → 빌드 성공 시 GitHub Release 및 Git 태그를 자동 생성합니다.
+          false → 빌드만 수행하고 Release는 생성하지 않습니다.
         required: false
         type: boolean
         default: true
 
+      # ── 드라이런 ──────────────────────────────────────────────────────────
+      dry_run:
+        description: |
+          드라이런 모드 (Dry Run)
+          true  → 테스트·빌드까지만 실행하고 GitHub Release는 생성하지 않습니다.
+                  배포 파이프라인 점검 시 활용하세요.
+          false → 정상 배포 (기본값)
+        required: false
+        type: boolean
+        default: false
+
 permissions:
-  contents: write  # GitHub Release 생성 및 태그 push 권한
+  contents: write  # GitHub Release 생성 및 Git 태그 push 권한
 
 jobs:
-  # ── Job 1: 버전 변경 감지 ────────────────────────────────────────────────────
+  # ── Job 1: 입력값 검증 + 버전 변경 감지 ──────────────────────────────────
   check-version:
-    name: Check Version Change
+    name: Check Version & Validate Inputs
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.get-version.outputs.version }}
       version_changed: ${{ steps.detect-change.outputs.changed }}
       should_deploy: ${{ steps.decide.outputs.should_deploy }}
+      is_dry_run: ${{ steps.decide.outputs.is_dry_run }}
+      environment: ${{ steps.decide.outputs.environment }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          # 전체 히스토리 fetch: 멀티 커밋 push 시 github.event.before 참조에 필요
+          # fetch-depth: 0 — 전체 히스토리 (멀티 커밋 push 시 github.event.before 참조에 필요)
           fetch-depth: 0
+
+      - name: Validate inputs (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "=== workflow_dispatch 입력값 검증 ==="
+          echo "  version_override : '${{ inputs.version_override }}'"
+          echo "  environment      : '${{ inputs.environment }}'"
+          echo "  skip_tests       : '${{ inputs.skip_tests }}'"
+          echo "  create_release   : '${{ inputs.create_release }}'"
+          echo "  dry_run          : '${{ inputs.dry_run }}'"
+
+          # version_override 형식 검증 (semver: x.y.z)
+          if [ -n "${{ inputs.version_override }}" ]; then
+            if ! echo "${{ inputs.version_override }}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+              echo "❌ version_override 형식 오류: semver(x.y.z) 형식이어야 합니다."
+              echo "   입력값: '${{ inputs.version_override }}'"
+              exit 1
+            fi
+            echo "✅ version_override 형식 유효: ${{ inputs.version_override }}"
+          fi
 
       - name: Get current version
         id: get-version
         run: |
           if [ -n "${{ inputs.version_override }}" ]; then
             VERSION="${{ inputs.version_override }}"
+            echo "버전 출처: workflow_dispatch 입력값"
           else
             VERSION=$(grep '^version' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+            echo "버전 출처: pyproject.toml"
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Current version: ${VERSION}"
+          echo "현재 버전: ${VERSION}"
 
       - name: Detect version change (push trigger)
         id: detect-change
         if: github.event_name == 'push'
         run: |
           CURR=$(grep '^version' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
-
-          # github.event.before: push 이전의 SHA (멀티 커밋 push도 정확히 처리)
           BEFORE_SHA="${{ github.event.before }}"
 
-          # 00000... 은 브랜치 최초 push (이전 커밋 없음)
+          # 00000... → 브랜치 최초 push
           if echo "${BEFORE_SHA}" | grep -q '^0\{40\}$'; then
             echo "📦 첫 번째 push — 배포 진행"
             echo "prev_version=(none)" >> "$GITHUB_OUTPUT"
             echo "curr_version=${CURR}" >> "$GITHUB_OUTPUT"
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
-            # git diff로 version 라인만 정밀 감지 (다른 라인 변경에 오탐 없음)
+            # git diff로 version 라인만 정밀 감지
             VERSION_DIFF=$(git diff "${BEFORE_SHA}" HEAD -- pyproject.toml \
               | grep '^[+-]version = ' \
               | grep -v '^---\|^+++' || true)
@@ -89,33 +139,58 @@ jobs:
             if [ -n "${VERSION_DIFF}" ]; then
               PREV=$(git show "${BEFORE_SHA}":pyproject.toml 2>/dev/null \
                 | grep '^version' | sed 's/version = "\(.*\)"/\1/' || echo "(unknown)")
-              echo "✅ Version changed: ${PREV} → ${CURR}"
+              echo "✅ 버전 변경 감지: ${PREV} → ${CURR}"
               echo "prev_version=${PREV}" >> "$GITHUB_OUTPUT"
               echo "curr_version=${CURR}" >> "$GITHUB_OUTPUT"
               echo "changed=true" >> "$GITHUB_OUTPUT"
             else
-              echo "⏭️  Version unchanged (${CURR}) — skipping deploy"
+              echo "⏭️  버전 변경 없음 (${CURR}) — 배포 건너뜀"
               echo "prev_version=${CURR}" >> "$GITHUB_OUTPUT"
               echo "curr_version=${CURR}" >> "$GITHUB_OUTPUT"
               echo "changed=false" >> "$GITHUB_OUTPUT"
             fi
           fi
 
-      - name: Decide whether to deploy
+      - name: Decide deployment mode
         id: decide
         run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
-            echo "수동 실행 — 배포 진행"
-          elif [ "${{ steps.detect-change.outputs.changed }}" == "true" ]; then
-            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
-            echo "버전 변경 감지 — 배포 진행"
+          # 배포 환경 결정
+          ENV="${{ inputs.environment || 'production' }}"
+          echo "environment=${ENV}" >> "$GITHUB_OUTPUT"
+
+          # 드라이런 여부
+          DRY_RUN="${{ inputs.dry_run }}"
+          if [ "${DRY_RUN}" == "true" ]; then
+            echo "is_dry_run=true" >> "$GITHUB_OUTPUT"
+            echo "🧪 드라이런 모드 — 빌드까지만 실행, Release 생성 안 함"
           else
-            echo "should_deploy=false" >> "$GITHUB_OUTPUT"
-            echo "변경 없음 — 배포 건너뜀"
+            echo "is_dry_run=false" >> "$GITHUB_OUTPUT"
           fi
 
-  # ── Job 2: 테스트 ────────────────────────────────────────────────────────────
+          # 배포 실행 여부 결정
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
+            echo "▶ 수동 실행 (workflow_dispatch) — 배포 진행"
+          elif [ "${{ steps.detect-change.outputs.changed }}" == "true" ]; then
+            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
+            echo "▶ 버전 변경 감지 — 배포 진행"
+          else
+            echo "should_deploy=false" >> "$GITHUB_OUTPUT"
+            echo "⏹ 버전 변경 없음 — 배포 건너뜀"
+          fi
+
+      - name: Print deploy decision summary
+        run: |
+          echo "=== 배포 결정 요약 ==="
+          echo "  버전          : ${{ steps.get-version.outputs.version }}"
+          echo "  환경          : ${{ steps.decide.outputs.environment }}"
+          echo "  배포 실행     : ${{ steps.decide.outputs.should_deploy }}"
+          echo "  드라이런      : ${{ steps.decide.outputs.is_dry_run }}"
+          echo "  테스트 스킵   : ${{ inputs.skip_tests }}"
+          echo "  Release 생성  : ${{ inputs.create_release }}"
+          echo "  트리거        : ${{ github.event_name }}"
+
+  # ── Job 2: 테스트 ────────────────────────────────────────────────────────
   test:
     name: Run Tests
     runs-on: ubuntu-latest
@@ -141,7 +216,7 @@ jobs:
         run: |
           python -m pytest tests/ -q --tb=short
 
-  # ── Job 3: 빌드 ──────────────────────────────────────────────────────────────
+  # ── Job 3: 빌드 ──────────────────────────────────────────────────────────
   build:
     name: Build Package
     runs-on: ubuntu-latest
@@ -168,6 +243,7 @@ jobs:
       - name: Build wheel and sdist
         run: |
           python -m build
+          echo "=== 빌드 결과물 ==="
           ls -lh dist/
 
       - name: Upload build artifacts
@@ -177,20 +253,26 @@ jobs:
           path: dist/
           retention-days: 30
 
-  # ── Job 4: GitHub Release 생성 ───────────────────────────────────────────────
+      - name: Dry-run notice
+        if: needs.check-version.outputs.is_dry_run == 'true'
+        run: |
+          echo "🧪 드라이런 모드: 빌드 완료. GitHub Release는 생성하지 않습니다."
+
+  # ── Job 4: GitHub Release 생성 ───────────────────────────────────────────
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
     needs: [check-version, build]
     if: |
       needs.build.result == 'success' &&
+      needs.check-version.outputs.is_dry_run != 'true' &&
       (github.event_name == 'push' || inputs.create_release == true)
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # 전체 히스토리 (태그 생성 등에 필요)
+          fetch-depth: 0
 
       - name: Download build artifacts
         uses: actions/download-artifact@v4
@@ -203,10 +285,15 @@ jobs:
         run: |
           VERSION="${{ needs.check-version.outputs.version }}"
           TAG="v${VERSION}"
-          ENV="${{ inputs.environment || 'production' }}"
+          ENV="${{ needs.check-version.outputs.environment }}"
+          PRERELEASE="false"
+          if [ "${ENV}" == "staging" ]; then
+            PRERELEASE="true"
+          fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "environment=${ENV}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
 
       - name: Generate release notes
         id: release-notes
@@ -214,15 +301,26 @@ jobs:
           VERSION="${{ steps.release-vars.outputs.version }}"
           TAG="${{ steps.release-vars.outputs.tag }}"
           ENV="${{ steps.release-vars.outputs.environment }}"
+          TRIGGER="${{ github.event_name }}"
+          ACTOR="${{ github.actor }}"
+
+          # 이전 태그부터 현재까지의 커밋 로그
+          LAST_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || git rev-list --max-parents=0 HEAD)
+          COMMITS=$(git log "${LAST_TAG}..HEAD" --pretty=format:"- %s (%h)" -- . 2>/dev/null | head -30 || echo "- 초기 릴리스")
 
           cat > release_notes.md << EOF
           ## AN-Web ${TAG}
 
-          **Environment:** ${ENV}
-          **Python:** 3.12+
+          | 항목 | 값 |
+          |---|---|
+          | 환경 | ${ENV} |
+          | Python | 3.12+ |
+          | 트리거 | ${TRIGGER} |
+          | 배포자 | @${ACTOR} |
 
           ### 변경 내용
-          $(git log $(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || git rev-list --max-parents=0 HEAD)..HEAD --pretty=format:"- %s" -- . 2>/dev/null | head -30 || echo "- 초기 릴리스")
+
+          ${COMMITS}
 
           ### 설치
 
@@ -230,14 +328,15 @@ jobs:
           pip install an-web==${VERSION}
           \`\`\`
 
-          ### 파일
+          ### 빌드 파일
+
           | 파일 | 설명 |
           |------|------|
-          | \`an_web-${VERSION}-py3-none-any.whl\` | Wheel 패키지 |
+          | \`an_web-${VERSION}-py3-none-any.whl\` | Wheel 패키지 (권장) |
           | \`an_web-${VERSION}.tar.gz\` | 소스 배포본 |
           EOF
 
-          echo "Generated release notes:"
+          echo "릴리스 노트 생성 완료"
           cat release_notes.md
 
       - name: Create Git tag
@@ -245,13 +344,12 @@ jobs:
           TAG="${{ steps.release-vars.outputs.tag }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # 태그가 이미 존재하면 건너뜀
           if git rev-parse "${TAG}" >/dev/null 2>&1; then
-            echo "Tag ${TAG} already exists — skipping tag creation"
+            echo "태그 ${TAG} 이미 존재 — 건너뜀"
           else
             git tag -a "${TAG}" -m "Release ${TAG}"
             git push origin "${TAG}"
-            echo "Created and pushed tag: ${TAG}"
+            echo "태그 생성 및 push: ${TAG}"
           fi
 
       - name: Create GitHub Release
@@ -262,18 +360,30 @@ jobs:
           body_path: release_notes.md
           files: dist/*
           draft: false
-          prerelease: ${{ steps.release-vars.outputs.environment == 'staging' }}
+          prerelease: ${{ steps.release-vars.outputs.prerelease }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Summary
+      - name: Job summary
         run: |
-          echo "## 🚀 배포 완료" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| 항목 | 값 |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
-          echo "| 버전 | ${{ steps.release-vars.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 태그 | ${{ steps.release-vars.outputs.tag }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 환경 | ${{ steps.release-vars.outputs.environment }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 트리거 | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
-          ls dist/ >> $GITHUB_STEP_SUMMARY
+          VERSION="${{ steps.release-vars.outputs.version }}"
+          TAG="${{ steps.release-vars.outputs.tag }}"
+          ENV="${{ steps.release-vars.outputs.environment }}"
+
+          {
+            echo "## 🚀 배포 완료"
+            echo ""
+            echo "| 항목 | 값 |"
+            echo "|------|-----|"
+            echo "| 버전 | ${VERSION} |"
+            echo "| 태그 | ${TAG} |"
+            echo "| 환경 | ${ENV} |"
+            echo "| 프리릴리스 | ${{ steps.release-vars.outputs.prerelease }} |"
+            echo "| 트리거 | ${{ github.event_name }} |"
+            echo "| 배포자 | ${{ github.actor }} |"
+            echo ""
+            echo "### 빌드 파일"
+            echo "\`\`\`"
+            ls dist/
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
