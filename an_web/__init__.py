@@ -11,5 +11,11 @@ Architecture:
     Semantic Layer  → SemanticExtractor, ActionRuntime, ArtifactCollector
 """
 
-__version__ = "0.1.2"
+from importlib.metadata import version, PackageNotFoundError
+
+try:
+    __version__ = version("an-web")
+except PackageNotFoundError:
+    __version__ = "0.0.0"
+
 __author__ = "AN-Web Team"
