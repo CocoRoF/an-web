@@ -83,7 +83,8 @@ class ExtractAction(Action):
 
         try:
             if mode == "css":
-                results = _extract_css(doc, str(query))
+                selector = query.get("selector", "") if isinstance(query, dict) else str(query)
+                results = _extract_css(doc, selector)
             elif mode == "structured":
                 results = _extract_structured(doc, query)  # type: ignore[arg-type]
             elif mode == "json":
