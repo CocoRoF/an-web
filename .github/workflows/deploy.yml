@@ -51,7 +51,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2  # 이전 커밋과 비교하기 위해 2개 커밋 필요
+          # 전체 히스토리 fetch: 멀티 커밋 push 시 github.event.before 참조에 필요
+          fetch-depth: 0
 
       - name: Get current version
         id: get-version
@@ -68,16 +69,36 @@ jobs:
         id: detect-change
         if: github.event_name == 'push'
         run: |
-          PREV=$(git show HEAD~1:pyproject.toml 2>/dev/null | grep '^version' | sed 's/version = "\(.*\)"/\1/' || echo "")
           CURR=$(grep '^version' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
-          echo "Previous version: ${PREV}"
-          echo "Current version:  ${CURR}"
-          if [ "$PREV" != "$CURR" ]; then
+
+          # github.event.before: push 이전의 SHA (멀티 커밋 push도 정확히 처리)
+          BEFORE_SHA="${{ github.event.before }}"
+
+          # 00000... 은 브랜치 최초 push (이전 커밋 없음)
+          if echo "${BEFORE_SHA}" | grep -q '^0\{40\}$'; then
+            echo "📦 첫 번째 push — 배포 진행"
+            echo "prev_version=(none)" >> "$GITHUB_OUTPUT"
+            echo "curr_version=${CURR}" >> "$GITHUB_OUTPUT"
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "✅ Version changed: ${PREV} → ${CURR}"
           else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "⏭️  Version unchanged — skipping deploy"
+            # git diff로 version 라인만 정밀 감지 (다른 라인 변경에 오탐 없음)
+            VERSION_DIFF=$(git diff "${BEFORE_SHA}" HEAD -- pyproject.toml \
+              | grep '^[+-]version = ' \
+              | grep -v '^---\|^+++' || true)
+
+            if [ -n "${VERSION_DIFF}" ]; then
+              PREV=$(git show "${BEFORE_SHA}":pyproject.toml 2>/dev/null \
+                | grep '^version' | sed 's/version = "\(.*\)"/\1/' || echo "(unknown)")
+              echo "✅ Version changed: ${PREV} → ${CURR}"
+              echo "prev_version=${PREV}" >> "$GITHUB_OUTPUT"
+              echo "curr_version=${CURR}" >> "$GITHUB_OUTPUT"
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "⏭️  Version unchanged (${CURR}) — skipping deploy"
+              echo "prev_version=${CURR}" >> "$GITHUB_OUTPUT"
+              echo "curr_version=${CURR}" >> "$GITHUB_OUTPUT"
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
       - name: Decide whether to deploy
