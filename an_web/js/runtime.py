@@ -224,6 +224,8 @@ class JSRuntime:
         Errors are logged but not raised (mirrors browser behaviour where
         a broken third-party script shouldn't crash the page).
         """
+        # QuickJS rejects embedded null bytes — strip them.
+        source = source.replace("\x00", "")
         result = self.eval_safe(source)
         self._scripts_loaded.append(src_hint)
         if not result.ok:
@@ -244,7 +246,8 @@ class JSRuntime:
 
     async def drain_microtasks(self, max_jobs: int = _MAX_MICROTASK_JOBS) -> int:
         """
-        Drain all pending JS microtasks (Promise callbacks, queueMicrotask).
+        Drain all pending JS microtasks (Promise callbacks, queueMicrotask)
+        and fire ready timers.
 
         Mirrors Lightpanda's ``env.runMicrotasks()``. Yields to asyncio
         between batches so network I/O can proceed.
@@ -267,6 +270,21 @@ class JSRuntime:
                     await asyncio.sleep(0)
         except Exception as exc:
             log.debug("drain_microtasks error after %d jobs: %s", total, exc)
+
+        # Fire any ready timers and drain resulting microtasks
+        try:
+            timers_fired = self.eval_safe("typeof _fireReadyTimers === 'function' ? _fireReadyTimers() : 0")
+            if timers_fired.ok and timers_fired.value and int(timers_fired.value) > 0:
+                # Drain microtasks queued by timer callbacks
+                extra = 0
+                while extra < max_jobs:
+                    ran = self._ctx.execute_pending_job()
+                    if not ran:
+                        break
+                    extra += 1
+                    total += 1
+        except Exception as exc:
+            log.debug("timer fire error: %s", exc)
 
         return total
 

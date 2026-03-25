@@ -28,7 +28,10 @@ def _new_id() -> str:
 # ─── Interactive tag set ──────────────────────────────────────────────────────
 
 _INTERACTIVE_TAGS = frozenset({"input", "button", "a", "select", "textarea"})
-_SKIP_TAGS = frozenset({"script", "style", "noscript", "meta", "link", "template"})
+_SKIP_TAGS = frozenset({"style", "noscript", "meta", "template"})
+# script and link tags are preserved in the DOM so that the navigate action
+# can discover external <script src="..."> and <link rel="stylesheet"> later.
+_INVISIBLE_TAGS = frozenset({"script", "link"})
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
@@ -115,9 +118,16 @@ def _parse_selectolax(html: str, base_url: str) -> Document:
             sl_to_dom[node_mem_id] = doc
             continue
 
-        # head → collapse to doc so its non-content children fall to doc
+        # head → keep as element in DOM tree so script/link tags are discoverable
         if tag == "head":
-            sl_to_dom[node_mem_id] = doc
+            attrs_h: dict[str, str] = {}
+            if sl_node.attributes:
+                attrs_h = {k: (v if v is not None else "") for k, v in sl_node.attributes.items()}
+            head_el = Element(node_id=_new_id(), tag="head", attributes=attrs_h)
+            head_el.visibility_state = "none"
+            doc.register_element(head_el)
+            doc.append_child(head_el)
+            sl_to_dom[node_mem_id] = head_el
             continue
 
         if tag in _SKIP_TAGS:
@@ -135,6 +145,10 @@ def _parse_selectolax(html: str, base_url: str) -> Document:
         el.visibility_state = compute_visibility(el)
         el.is_interactive = tag in _INTERACTIVE_TAGS
 
+        # script/link tags are invisible but kept in DOM for execution
+        if tag in _INVISIBLE_TAGS:
+            el.visibility_state = "none"
+
         doc.register_element(el)
         sl_to_dom[node_mem_id] = el
 
@@ -142,9 +156,18 @@ def _parse_selectolax(html: str, base_url: str) -> Document:
         parent_dom.append_child(el)
 
         # Capture direct (non-child) text content
-        direct_text = _direct_text(sl_node)
-        if direct_text:
-            el.append_child(TextNode(node_id=_new_id(), data=direct_text))
+        # For script tags, capture the full text (inline JS code)
+        if tag == "script":
+            try:
+                full_text = sl_node.text(deep=True, strip=False) or ""
+                if full_text.strip():
+                    el.append_child(TextNode(node_id=_new_id(), data=full_text))
+            except Exception:
+                pass
+        else:
+            direct_text = _direct_text(sl_node)
+            if direct_text:
+                el.append_child(TextNode(node_id=_new_id(), data=direct_text))
 
     return doc
 
@@ -193,7 +216,7 @@ def _strip_ns(tag: str) -> str:
 
 def _walk_etree(et_node: Any, parent: Node, doc: Document) -> None:
     """Recursively convert an ElementTree subtree into AN-Web DOM nodes."""
-    _ETREE_SKIP = frozenset({"script", "style", "noscript", "meta", "link",
+    _ETREE_SKIP = frozenset({"style", "noscript", "meta",
                               "head", "template"})
 
     for child in et_node:

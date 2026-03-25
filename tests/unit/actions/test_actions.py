@@ -19,6 +19,7 @@ class MockScheduler:
     async def drain_microtasks(self) -> None: pass
     async def settle_network(self, timeout: float = 3.0) -> None: pass
     async def flush_dom_mutations(self) -> None: pass
+    async def run_macrotasks(self, max_wait_ms: int = 100) -> int: return 0
 
 
 class MockSession:

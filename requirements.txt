@@ -1,6 +1,7 @@
 # AN-Web runtime dependencies
 # Python 3.12+ required
 httpx>=0.27.0
+brotli>=1.1.0
 selectolax>=0.3.21
 html5lib>=1.1
 pydantic>=2.7.0

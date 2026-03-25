@@ -358,7 +358,7 @@ class TestWindowGlobals:
 
     def test_navigator_user_agent(self, rt):
         r = rt.eval_safe("navigator.userAgent")
-        assert "AN-Web" in r.value
+        assert "Mozilla" in r.value
 
     def test_navigator_online(self, rt):
         r = rt.eval_safe("navigator.onLine")

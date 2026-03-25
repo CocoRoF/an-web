@@ -996,11 +996,11 @@ class TestWindowLocationNavigator:
     def test_navigator_user_agent(self, rt):
         runtime, _ = rt
         ua = ev(runtime, "navigator.userAgent")
-        assert "AN-Web" in ua
+        assert "Mozilla" in ua
 
     def test_navigator_language(self, rt):
         runtime, _ = rt
-        assert ev(runtime, "navigator.language") == "en-US"
+        assert ev(runtime, "navigator.language") == "ko-KR"
 
     def test_navigator_online(self, rt):
         runtime, _ = rt
