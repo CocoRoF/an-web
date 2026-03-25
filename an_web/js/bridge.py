@@ -90,11 +90,11 @@ def py_to_js(value: Any) -> Any:
     Everything else must be serialised; the caller is responsible for
     JSON.parse() on the JS side when needed.
     """
-    if value is None or isinstance(value, (bool, int, float, str)):
+    if value is None or isinstance(value, bool | int | float | str):
         return value
     if isinstance(value, dict):
         return {str(k): py_to_js(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [py_to_js(v) for v in value]
     try:
         return json.dumps(value, default=str)

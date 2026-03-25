@@ -166,7 +166,7 @@ class JSRuntime:
                 self._ctx.add_callable(name, value)
             else:
                 js_val = py_to_js(value)
-                if isinstance(js_val, (bool, int, float, str)) or js_val is None:
+                if isinstance(js_val, bool | int | float | str) or js_val is None:
                     # Can set directly
                     self._ctx.set(name, js_val)
                 else:

@@ -391,8 +391,9 @@ def _register_py_callbacks(ctx: Any, session: Session) -> None:
         url = getattr(session, "_current_url", "about:blank")
         if cookies is None:
             return
-        from an_web.net.cookies import Cookie
         from urllib.parse import urlparse
+
+        from an_web.net.cookies import Cookie
         parts = [p.strip() for p in cookie_str.split(";")]
         if not parts or not parts[0]:
             return
@@ -713,7 +714,7 @@ def _register_py_callbacks(ctx: Any, session: Session) -> None:
 
     def _py_clone_node(node_id: str, deep: bool) -> str:
         """Clone a node (optionally deep) and return its JSON."""
-        from an_web.dom.nodes import Element, TextNode
+        from an_web.dom.nodes import Element
         source = _find_node(session, node_id)
         if source is None:
             return "null"
