@@ -64,6 +64,7 @@ on:
 
 permissions:
   contents: write  # GitHub Release 생성 및 Git 태그 push 권한
+  id-token: write  # PyPI OIDC Trusted Publisher 인증 필수
 
 jobs:
   # ── Job 1: 입력값 검증 + 버전 변경 감지 ──────────────────────────────────
@@ -386,4 +387,52 @@ jobs:
             echo "\`\`\`"
             ls dist/
             echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Job 5: PyPI 배포 ─────────────────────────────────────────────────────
+  publish-pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: [check-version, build]
+    # 조건: 빌드 성공 + dry_run 아님 + production 환경
+    # staging은 TestPyPI 별도 등록 필요 → production만 실제 PyPI에 배포
+    if: |
+      needs.build.result == 'success' &&
+      needs.check-version.outputs.is_dry_run != 'true' &&
+      needs.check-version.outputs.environment == 'production'
+
+    # OIDC Trusted Publisher 인증에 필요한 GitHub Actions 환경
+    environment:
+      name: pypi
+      url: https://pypi.org/project/an-web/${{ needs.check-version.outputs.version }}/
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ needs.check-version.outputs.version }}
+          path: dist/
+
+      - name: Verify dist files
+        run: |
+          echo "=== PyPI 업로드 파일 ==="
+          ls -lh dist/
+
+      - name: Publish to PyPI
+        # OIDC Trusted Publisher 방식 — API 토큰 불필요
+        # PyPI에서 CocoRoF/an-web의 deploy.yml + pypi 환경으로 등록된 Trusted Publisher 사용
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Job summary
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          {
+            echo "## 📦 PyPI 배포 완료"
+            echo ""
+            echo "| 항목 | 값 |"
+            echo "|------|-----|"
+            echo "| 버전 | \`${VERSION}\` |"
+            echo "| PyPI | https://pypi.org/project/an-web/${VERSION}/ |"
+            echo "| 트리거 | ${{ github.event_name }} |"
+            echo "| 배포자 | @${{ github.actor }} |"
           } >> "$GITHUB_STEP_SUMMARY"
