@@ -409,7 +409,7 @@ jobs:
 
   # ── Job 5: PyPI / TestPyPI 배포 ─────────────────────────────────────────
   publish-pypi:
-    name: Publish to ${{ needs.check-version.outputs.environment == 'staging' && 'TestPyPI' || 'PyPI' }}
+    name: Publish to PyPI / TestPyPI
     runs-on: ubuntu-latest
     needs: [check-version, build]
     # 조건: 빌드 성공 + dry_run 아님
