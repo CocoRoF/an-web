@@ -44,16 +44,17 @@ class CookieJar:
         self._cookies[domain].append(cookie)
 
     def get_for_url(self, url: str) -> list[Cookie]:
-        """Return non-expired cookies matching the URL's domain."""
+        """Return non-expired cookies matching the URL's domain and path."""
         from urllib.parse import urlparse
         parsed = urlparse(url)
         host = parsed.hostname or ""
+        url_path = parsed.path or "/"
 
         matching: list[Cookie] = []
         for domain, cookies in self._cookies.items():
             if host.endswith(domain) or domain.endswith(host):
                 for c in cookies:
-                    if not c.is_expired():
+                    if not c.is_expired() and url_path.startswith(c.path):
                         matching.append(c)
         return matching
 

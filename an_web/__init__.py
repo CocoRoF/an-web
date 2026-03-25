@@ -11,5 +11,5 @@ Architecture:
     Semantic Layer  → SemanticExtractor, ActionRuntime, ArtifactCollector
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.2"
 __author__ = "AN-Web Team"
