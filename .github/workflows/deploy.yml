@@ -62,6 +62,17 @@ on:
         type: boolean
         default: false
 
+      # ── 버전 체크 무시 ─────────────────────────────────────────────────────
+      ignore_version:
+        description: |
+          버전 변경 감지 건너뛰기
+          true  → pyproject.toml 버전 변경 여부와 관계없이 강제로 배포를 실행합니다.
+                  이미 배포된 버전을 재배포하거나, 버전 변경 없이 배포가 필요할 때 사용합니다.
+          false → 정상 동작 (기본값) — 버전이 변경된 경우에만 배포
+        required: false
+        type: boolean
+        default: false
+
 permissions:
   contents: write  # GitHub Release 생성 및 Git 태그 push 권한
   id-token: write  # PyPI OIDC Trusted Publisher 인증 필수
@@ -170,8 +181,14 @@ jobs:
 
           # 배포 실행 여부 결정
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
-            echo "▶ 수동 실행 (workflow_dispatch) — 배포 진행"
+            IGNORE_VER="${{ inputs.ignore_version }}"
+            if [ "${IGNORE_VER}" == "true" ]; then
+              echo "should_deploy=true" >> "$GITHUB_OUTPUT"
+              echo "▶ 수동 실행 + ignore_version=true — 버전 체크 건너뛰고 강제 배포"
+            else
+              echo "should_deploy=true" >> "$GITHUB_OUTPUT"
+              echo "▶ 수동 실행 (workflow_dispatch) — 배포 진행"
+            fi
           elif [ "${{ steps.detect-change.outputs.changed }}" == "true" ]; then
             echo "should_deploy=true" >> "$GITHUB_OUTPUT"
             echo "▶ 버전 변경 감지 — 배포 진행"
@@ -189,6 +206,7 @@ jobs:
           echo "  드라이런      : ${{ steps.decide.outputs.is_dry_run }}"
           echo "  테스트 스킵   : ${{ inputs.skip_tests }}"
           echo "  Release 생성  : ${{ inputs.create_release }}"
+          echo "  버전 체크 무시: ${{ inputs.ignore_version }}"
           echo "  트리거        : ${{ github.event_name }}"
 
   # ── Job 2: 테스트 ────────────────────────────────────────────────────────
