@@ -113,6 +113,8 @@ class NavigateAction(Action):
         js_runtime = getattr(session, "js_runtime", None)
 
         if js_runtime is not None and js_runtime.is_available():
+            # Clear dynamic script queue before initial execution
+            session._pending_dynamic_scripts = []  # type: ignore[attr-defined]
             scripts_found, scripts_executed, external_loaded = (
                 await _execute_scripts_full(
                     document, js_runtime, session, response.url
@@ -126,10 +128,16 @@ class NavigateAction(Action):
             js_runtime.dispatch_load()
             await js_runtime.drain_microtasks()
 
-        # ── 6. Settle event loop (microtasks + macrotasks) ────────────
+        # ── 6. Settle event loop (microtasks + macrotasks + dynamic scripts)
         await _settle_page(session, rounds=_SETTLE_ROUNDS)
 
+        # Count dynamic scripts that were loaded during settle
+        dynamic_loaded = len(js_runtime._scripts_loaded) - scripts_found \
+            if js_runtime and js_runtime.is_available() else 0
+        dynamic_loaded = max(0, dynamic_loaded)
+
         # ── 7. Return ActionResult ────────────────────────────────────
+        total_scripts = scripts_found + dynamic_loaded
         return ActionResult(
             status="ok",
             action="navigate",
@@ -140,9 +148,10 @@ class NavigateAction(Action):
                 "status_code": response.status,
                 "dom_ready": True,
                 "redirect_count": response.redirect_count,
-                "scripts_found": scripts_found,
+                "scripts_found": total_scripts,
                 "scripts_executed": scripts_executed,
                 "external_loaded": external_loaded,
+                "dynamic_loaded": dynamic_loaded,
             },
             state_delta_id=snapshot_id,
             recommended_next_actions=[{"tool": "snapshot"}],
@@ -286,7 +295,7 @@ async def _execute_scripts_full(
 async def _settle_page(session: Any, rounds: int = 5) -> None:
     """
     Full page settle: drain microtasks, fire timers, process fetches,
-    settle network.
+    load dynamic scripts, settle network.
 
     Runs multiple rounds to handle timer-triggered scripts that enqueue
     more microtasks, timers, or fetch requests.
@@ -314,17 +323,22 @@ async def _settle_page(session: Any, rounds: int = 5) -> None:
         if fetched > 0:
             activity = True
 
-        # 4. Drain microtasks again (macrotask/fetch callbacks may have queued promises)
+        # 4. Load dynamically inserted <script> elements
+        loaded = await _process_dynamic_scripts(session)
+        if loaded > 0:
+            activity = True
+
+        # 5. Drain microtasks again (macrotask/fetch callbacks may have queued promises)
         if js_runtime and js_runtime.is_available():
             drained = await js_runtime.drain_microtasks()
             if drained > 0:
                 activity = True
 
-        # 5. Network settle
+        # 6. Network settle
         if scheduler:
             await scheduler.settle_network(timeout=1.0)
 
-        # 6. DOM mutation flush
+        # 7. DOM mutation flush
         if scheduler:
             await scheduler.flush_dom_mutations()
 
@@ -395,3 +409,51 @@ async def _process_pending_fetches(session: Any) -> int:
             processed += 1
 
     return processed
+
+
+async def _process_dynamic_scripts(session: Any) -> int:
+    """
+    Fetch and execute dynamically inserted <script src> elements.
+
+    When JS code does ``document.createElement('script')`` +
+    ``el.src = '...'`` + ``parent.appendChild(el)``, the script URL
+    is queued in ``session._pending_dynamic_scripts``.  This function
+    fetches and evaluates those scripts, mirroring real browser behaviour.
+
+    Returns the number of scripts loaded.
+    """
+    pending = getattr(session, "_pending_dynamic_scripts", None)
+    if not pending:
+        return 0
+
+    network = getattr(session, "network", None)
+    js_runtime = getattr(session, "js_runtime", None)
+    if not network or not js_runtime or not js_runtime.is_available():
+        return 0
+
+    base_url = getattr(session, "_current_url", "about:blank") or "about:blank"
+    loaded = 0
+    # Drain the queue (scripts may enqueue more during execution)
+    while pending:
+        entry = pending.pop(0)
+        src = entry["src"]
+        resolved_url = urljoin(base_url, src)
+        try:
+            resp = await network.get(
+                resolved_url,
+                headers={
+                    "Sec-Fetch-Dest": "script",
+                    "Sec-Fetch-Mode": "no-cors",
+                    "Sec-Fetch-Site": "same-origin",
+                    "Referer": base_url,
+                },
+                resource_type="script",
+            )
+            if resp.ok and resp.text.strip():
+                js_runtime.load_script(resp.text, src_hint=resolved_url)
+                await js_runtime.drain_microtasks()
+                loaded += 1
+        except Exception as exc:
+            log.debug("Dynamic script load failed (%s): %s", resolved_url[:60], exc)
+
+    return loaded

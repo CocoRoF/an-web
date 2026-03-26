@@ -616,6 +616,8 @@ def _register_py_callbacks(ctx: Any, session: Session) -> None:
         doc = getattr(session, "_current_document", None)
         if doc and isinstance(child, Element):
             doc.register_element(child)
+        # Queue dynamic <script src="..."> for async loading
+        _maybe_queue_dynamic_script(session, child)
         return True
 
     def _py_remove_child(parent_id: str, child_id: str) -> bool:
@@ -638,10 +640,12 @@ def _register_py_callbacks(ctx: Any, session: Session) -> None:
             return False
         if not ref_id or ref_id == "null":
             parent.append_child(new_node)
+            _maybe_queue_dynamic_script(session, new_node)
             return True
         ref_node = _find_node(session, ref_id)
         if ref_node is None:
             parent.append_child(new_node)
+            _maybe_queue_dynamic_script(session, new_node)
             return True
         # Remove from old parent
         if new_node.parent is not None:
@@ -656,6 +660,8 @@ def _register_py_callbacks(ctx: Any, session: Session) -> None:
             parent.children.insert(idx, new_node)
         except ValueError:
             parent.append_child(new_node)
+        # Queue dynamic <script src="..."> for async loading
+        _maybe_queue_dynamic_script(session, new_node)
         return True
 
     def _py_set_inner_html(node_id: str, html_str: str) -> bool:
@@ -898,6 +904,25 @@ def _deep_clone_node(node: Any, deep: bool, counter: list[int], session: Any) ->
                     clone.append_child(child_clone)
         return clone
     return None
+
+
+def _maybe_queue_dynamic_script(session: Any, node: Any) -> None:
+    """Queue a dynamically inserted <script> element for async loading."""
+    from an_web.dom.nodes import Element
+    if not isinstance(node, Element) or node.tag != "script":
+        return
+    src = node.get_attribute("src")
+    if not src:
+        return
+    # Check type attribute — only queue executable JS
+    stype = (node.get_attribute("type") or "").lower()
+    if stype and stype not in ("text/javascript", "application/javascript", "module", ""):
+        return
+    if not hasattr(session, "_pending_dynamic_scripts"):
+        session._pending_dynamic_scripts = []
+    # Avoid duplicates
+    if src not in [s["src"] for s in session._pending_dynamic_scripts]:
+        session._pending_dynamic_scripts.append({"src": src, "node_id": node.node_id})
 
 
 def _get_storage(session: Any, store_name: str) -> dict[str, str]:
