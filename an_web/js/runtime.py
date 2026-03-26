@@ -5,10 +5,6 @@ Uses quickjs-py (pip install quickjs) to embed QuickJS engine.
 Falls back to a no-op stub if the package is absent, allowing all
 DOM/semantic/network functionality to work without JS support.
 
-Key insight from Lightpanda: the JS *engine* matters less than
-the *host Web API* implementation. QuickJS with a good host layer
-beats V8 with a poor host for AI automation tasks.
-
 Lifecycle::
 
     runtime = JSRuntime(session)          # initialises QuickJS + host API
@@ -367,8 +363,7 @@ class JSRuntime:
         Drain all pending JS microtasks (Promise callbacks, queueMicrotask)
         and fire ready timers.
 
-        Mirrors Lightpanda's ``env.runMicrotasks()``. Yields to asyncio
-        between batches so network I/O can proceed.
+        Yields to asyncio between batches so network I/O can proceed.
 
         Returns:
             Number of microtask jobs executed.
@@ -415,8 +410,7 @@ class JSRuntime:
         Full event-loop settle: drain microtasks across multiple rounds.
 
         Runs *microtask_rounds* drain passes with optional asyncio yields
-        between them. This mirrors the Lightpanda pattern of:
-            runMicrotasks() → settle_network() → flush_dom_mutations()
+        between them.
         """
         for _ in range(microtask_rounds):
             drained = await self.drain_microtasks()

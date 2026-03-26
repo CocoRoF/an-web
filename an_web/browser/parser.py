@@ -3,10 +3,6 @@ HTML parser bridge — selectolax (Lexbor) → AN-Web DOM tree.
 
 Primary: selectolax (fast, C-backed Lexbor)
 Fallback: html5lib (spec-accurate, slower)
-
-Mirrors Lightpanda's parser/Parser.zig: builds a navigable,
-AI-enriched DOM tree where every Element carries visibility_state
-and is_interactive already computed.
 """
 from __future__ import annotations
 

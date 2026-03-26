@@ -1,8 +1,6 @@
 """
 Network client for AN-Web.
 
-httpx.AsyncClient-based HTTP layer (vs Lightpanda's libcurl/HttpClient.zig).
-
 Key features:
 - Async GET/POST with automatic redirect following
 - Cookie jar integration (inject + harvest Set-Cookie)
@@ -168,8 +166,6 @@ class NetworkTrace:
 class NetworkClient:
     """
     Async HTTP client with cookie jar, redirect handling, and resource policy.
-
-    Mirrors Lightpanda's HttpClient.zig but using httpx instead of libcurl.
     """
 
     DEFAULT_HEADERS = {

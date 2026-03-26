@@ -1,11 +1,6 @@
 """
 asyncio-based event loop scheduler for AN-Web.
 
-Mirrors Lightpanda's Browser.zig event loop:
-    runMicrotasks()   -> drain_microtasks()
-    runMacrotasks()   -> run_macrotasks()
-    pumpMessageLoop() -> settle_network()
-
 Lifecycle::
 
     scheduler = EventLoopScheduler()
@@ -62,8 +57,6 @@ class EventLoopScheduler:
         precondition -> execute -> drain_microtasks -> settle_network
                     -> flush_dom_mutations -> postcondition
 
-    This matches Lightpanda's deterministic action boundary semantics.
-
     Thread-safety: NOT thread-safe. Use one scheduler per async session.
     """
 
@@ -97,10 +90,6 @@ class EventLoopScheduler:
     ) -> Any:
         """
         Execute an action as an atomic transaction with full event loop drain.
-
-        Pattern from Lightpanda actions.zig::
-
-            execute -> event_flush -> postcondition -> artifact_collection
 
         Args:
             action_coro:     The action coroutine to await.

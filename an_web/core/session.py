@@ -70,9 +70,6 @@ class Session:
     - Event-loop scheduler (microtasks, timers, network settle)
     - PageState tracking
     - SnapshotManager for deterministic replay
-
-    Inspired by Lightpanda's Session.zig which manages:
-    browser, history, navigation, storage_shed, cookie_jar per session.
     """
 
     def __init__(

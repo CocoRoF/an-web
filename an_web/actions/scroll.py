@@ -1,7 +1,7 @@
 """
 Scroll action — scroll the viewport or a specific element.
 
-Mirrors Lightpanda scroll behavior:
+Scroll behavior:
     1. Resolve target (optional — None = window/document scroll)
     2. Compute new scroll position (absolute or relative delta)
     3. Apply to session scroll state

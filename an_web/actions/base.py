@@ -13,7 +13,7 @@ class Action(ABC):
     """
     Base class for all AN-Web actions.
 
-    Pattern (from Lightpanda actions.zig):
+    Pattern:
         1. precondition  — verify action can be performed
         2. execute       — perform the DOM/event operation
         3. event_flush   — drain microtasks + network

@@ -1,7 +1,7 @@
 """
 Click action — MouseEvent dispatch with full event loop flush.
 
-Pattern from Lightpanda actions.zig click():
+Pattern:
     1. Resolve element (CSS selector / node_id / semantic query)
     2. Precondition: check visibility + disabled state
     3. Dispatch mousedown → mouseup → click (real JS events or attribute markers)
