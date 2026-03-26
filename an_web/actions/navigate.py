@@ -357,13 +357,11 @@ async def _process_pending_fetches(session: Any) -> int:
 
         url = info.get("url", "")
         method = info.get("method", "GET")
-        body_json = info.get("body_json", "null")
         headers_json = info.get("headers_json", "null")
 
         try:
             import json
             headers = json.loads(headers_json) if headers_json and headers_json != "null" else {}
-            body = json.loads(body_json) if body_json and body_json != "null" else None
 
             if "Referer" not in headers:
                 headers["Referer"] = getattr(session, "_current_url", "") or ""
@@ -387,9 +385,7 @@ async def _process_pending_fetches(session: Any) -> int:
             # Resolve the JS promise via eval
             js_runtime = getattr(session, "js_runtime", None)
             if js_runtime and js_runtime.is_available():
-                result_json = json.dumps(result)
-                # the _py_fetch_poll will now return resolved=True
-                # but we also need to trigger any waiting code
+                # Trigger any waiting code / resolve promises
                 await js_runtime.drain_microtasks()
 
         except Exception as exc:
