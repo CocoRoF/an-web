@@ -138,11 +138,20 @@ class TestParseHtmlVisibility:
 
 
 class TestParseHtmlSkippedTags:
-    def test_script_not_in_dom(self):
+    def test_script_preserved_in_dom(self):
+        """Script tags are kept in DOM for external script discovery."""
         html = "<html><body><script>alert(1)</script><p>text</p></body></html>"
         doc = parse_html(html)
         tags = {el.tag for el in doc.iter_elements()}
-        assert "script" not in tags
+        assert "script" in tags
+
+    def test_script_invisible(self):
+        """Script tags should be invisible."""
+        html = "<html><body><script>alert(1)</script><p>text</p></body></html>"
+        doc = parse_html(html)
+        script = next((el for el in doc.iter_elements() if el.tag == "script"), None)
+        assert script is not None
+        assert script.visibility_state == "none"
 
     def test_style_not_in_dom(self):
         html = "<html><head><style>body{color:red}</style></head><body><p>hi</p></body></html>"

@@ -13,9 +13,13 @@ Architecture:
 
 from importlib.metadata import PackageNotFoundError, version
 
+from an_web.core.engine import ANWebEngine
+
 try:
     __version__ = version("an-web")
 except PackageNotFoundError:
     __version__ = "0.0.0"
 
-__author__ = "AN-Web Team"
+__author__ = "CocoRoF"
+
+__all__ = ["ANWebEngine", "__version__"]

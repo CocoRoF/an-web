@@ -155,14 +155,11 @@ class Session:
         Load a URL, build the DOM, and settle the page.
 
         Steps:
-        1. Policy check (domain allow/deny list)
-        2. HTTP fetch via NetworkClient
-        3. HTML parse -> Document
-        4. Create snapshot
-        5. Reset JS runtime for new page (discards old scripts)
-        6. Clear sessionStorage
-        7. Dispatch DOMContentLoaded + load events
-        8. Return ActionResult dict
+        1. Reset JS runtime for new page (discard old scripts)
+        2. Clear sessionStorage
+        3. Run NavigateAction (policy check, fetch, parse, execute scripts, settle)
+        4. Dispatch DOMContentLoaded + load events
+        5. Return ActionResult dict
 
         Returns:
             ActionResult as a dict with ``status`` (``"ok"`` | ``"failed"``).
@@ -170,6 +167,12 @@ class Session:
         from an_web.actions.navigate import NavigateAction
 
         self._page_state.status = EngineStatus.LOADING
+
+        # Reset JS runtime BEFORE executing the new page's scripts
+        # so the new page starts with a clean context.
+        if self.js_runtime is not None:
+            self.js_runtime.on_page_load()
+
         result = await NavigateAction().execute(session=self, url=url)
 
         if result.is_ok():
@@ -177,12 +180,7 @@ class Session:
             # sessionStorage is scoped to the page — clear on navigation
             self._session_storage.clear()
 
-            # Reset JS runtime for the new document
-            if self.js_runtime is not None:
-                self.js_runtime.on_page_load()
-                # Fire page lifecycle events into the freshly-reset context
-                self.js_runtime.dispatch_dom_content_loaded()
-                self.js_runtime.dispatch_load()
+            # DOMContentLoaded + load already fired by NavigateAction
 
             self._page_state.status = EngineStatus.IDLE
             self._page_state.dom_ready = True

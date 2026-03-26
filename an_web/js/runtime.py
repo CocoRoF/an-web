@@ -38,6 +38,97 @@ _MAX_MICROTASK_JOBS = 1000
 _MEMORY_LIMIT_BYTES = 64 * 1024 * 1024   # 64 MiB
 _STACK_SIZE_BYTES   = 512 * 1024          # 512 KiB
 
+# Minimum script size (bytes) to consider for polyfill detection.
+# Small scripts are never polyfills and checking them would be wasteful.
+_POLYFILL_MIN_SIZE = 50_000
+
+
+def _is_corejs_polyfill(source: str) -> bool:
+    """Detect core-js / polyfill.io bundles that cause infinite loops in QuickJS.
+
+    QuickJS already supports ES2020+ natively, so these bundles are
+    unnecessary and their aggressive patching of RegExp, Array, Symbol etc.
+    can create infinite loops when interacting with Python-backed DOM objects.
+
+    Heuristic: large script with many core-js module IDs and prototype patches.
+    """
+    if len(source) < _POLYFILL_MIN_SIZE:
+        return False
+    # Quick check: core-js webpack modules have numbered IDs and `.prototype`
+    # A 200KB+ bundle with 100+ `.prototype` and webpack-style `function(t,r,e)`
+    # is almost certainly a core-js polyfill.
+    head = source[:5000]
+    if "polyfill" in head.lower():
+        return True
+    # Count core-js signatures in first 1000 chars
+    sample = source[:2000]
+    if (
+        sample.count(".prototype") > 3
+        and "function(t,r,e)" in sample
+        and len(source) > 100_000
+    ):
+        return True
+    return False
+
+
+def _extract_webpack_runtime(source: str) -> str | None:
+    """Extract the webpack 5 runtime from a polyfill bundle.
+
+    Core-js polyfill bundles on sites like naver.com often embed the
+    webpack runtime (``__webpack_require__``, push interceptor, chunk
+    loading) alongside the polyfill modules.  Skipping the entire bundle
+    kills webpack's module system.
+
+    Strategy: keep the entire IIFE (modules + runtime) but:
+    1. Remove entry module calls that trigger polyfill patching
+    2. Make chunk callback errors non-fatal so entry modules that
+       depend on not-yet-available data don't crash chunk registration
+
+    Returns ``None`` if no webpack runtime is found.
+    """
+    import re
+
+    # Verify the bundle has a webpack runtime (push interceptor)
+    if 'self.webpackChunkpc' not in source[-3000:]:
+        return None
+
+    push_match = re.search(
+        r'self\.webpackChunkpc\s*=\s*self\.webpackChunkpc\s*\|\|\s*\[\]',
+        source[-3000:],
+    )
+    if not push_match:
+        return None
+
+    # 1) Strip polyfill entry module calls at the tail.
+    #    Pattern: }(),n(XXXXX);var X=n(XXXXX);X=n.O(X)}();
+    cleaned = re.sub(
+        r'\}\s*\(\s*\)\s*,\s*\w\(\d+\)[^}]*\}\s*\(\s*\)\s*;?\s*$',
+        '}()}();',
+        source,
+    )
+
+    if cleaned == source:
+        cleaned = re.sub(
+            r',\s*\w\(\d+\)\s*;\s*var\s+\w\s*=\s*\w\(\d+\)\s*;\s*\w\s*=\s*\w\.O\(\w\)\s*\}\s*\(\s*\)\s*;?\s*$',
+            '}();',
+            source,
+        )
+
+    if cleaned == source:
+        return None
+
+    # 2) Make the chunk callback error-tolerant.
+    #    The interceptor has: if(a)var f=a(n)
+    #    Wrap in try/catch: if(a)try{var f=a(n)}catch(_e){}
+    #    This ensures chunks are still marked as installed even when
+    #    entry modules throw (e.g. accessing data not yet available).
+    cleaned = cleaned.replace(
+        'if(a)var f=a(n)',
+        'if(a)try{var f=a(n)}catch(_e){}'
+    )
+
+    return cleaned
+
 
 class JSRuntime:
     """
@@ -166,7 +257,7 @@ class JSRuntime:
                 self._ctx.add_callable(name, value)
             else:
                 js_val = py_to_js(value)
-                if isinstance(js_val, (bool, int, float, str)) or js_val is None:
+                if isinstance(js_val, bool | int | float | str) or js_val is None:
                     # Can set directly
                     self._ctx.set(name, js_val)
                 else:
@@ -223,7 +314,36 @@ class JSRuntime:
         Records the script in _scripts_loaded for debugging/replaying.
         Errors are logged but not raised (mirrors browser behaviour where
         a broken third-party script shouldn't crash the page).
+
+        Core-js style polyfill bundles are auto-skipped because they can
+        cause infinite loops in QuickJS (which already supports ES2020+).
         """
+        # QuickJS rejects embedded null bytes — strip them.
+        source = source.replace("\x00", "")
+
+        if _is_corejs_polyfill(source):
+            # The polyfill modules cause infinite loops, but the bundle may
+            # also contain the webpack 5 runtime (module system, push
+            # interceptor). Extract and run only the runtime portion.
+            runtime = _extract_webpack_runtime(source)
+            if runtime:
+                log.info(
+                    "Polyfill '%s': skipping modules, injecting webpack runtime",
+                    src_hint[:60],
+                )
+                result = self.eval_safe(runtime)
+                self._scripts_loaded.append(src_hint)
+                if not result.ok:
+                    log.debug("Webpack runtime from '%s' threw: %s", src_hint[:60], result.error)
+                return result
+            else:
+                log.info(
+                    "Skipping core-js polyfill '%s' (no webpack runtime found)",
+                    src_hint[:60],
+                )
+                self._scripts_loaded.append(src_hint)
+                return EvalResult.success(None)
+
         result = self.eval_safe(source)
         self._scripts_loaded.append(src_hint)
         if not result.ok:
@@ -244,7 +364,8 @@ class JSRuntime:
 
     async def drain_microtasks(self, max_jobs: int = _MAX_MICROTASK_JOBS) -> int:
         """
-        Drain all pending JS microtasks (Promise callbacks, queueMicrotask).
+        Drain all pending JS microtasks (Promise callbacks, queueMicrotask)
+        and fire ready timers.
 
         Mirrors Lightpanda's ``env.runMicrotasks()``. Yields to asyncio
         between batches so network I/O can proceed.
@@ -267,6 +388,21 @@ class JSRuntime:
                     await asyncio.sleep(0)
         except Exception as exc:
             log.debug("drain_microtasks error after %d jobs: %s", total, exc)
+
+        # Fire any ready timers and drain resulting microtasks
+        try:
+            timers_fired = self.eval_safe("typeof _fireReadyTimers === 'function' ? _fireReadyTimers() : 0")
+            if timers_fired.ok and timers_fired.value and int(timers_fired.value) > 0:
+                # Drain microtasks queued by timer callbacks
+                extra = 0
+                while extra < max_jobs:
+                    ran = self._ctx.execute_pending_job()
+                    if not ran:
+                        break
+                    extra += 1
+                    total += 1
+        except Exception as exc:
+            log.debug("timer fire error: %s", exc)
 
         return total
 

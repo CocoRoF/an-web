@@ -229,6 +229,30 @@ def _register_py_callbacks(ctx: Any, session: Session) -> None:
                         return json.dumps({"prev": prev, "next": next_})
         return json.dumps({"prev": None, "next": None})
 
+    def _py_get_children(node_id: str) -> str:
+        """Return the direct children of a node as a JSON array."""
+        el = _find_element_by_id(session, node_id)
+        if el is None:
+            return "[]"
+        from an_web.dom.nodes import Element, TextNode
+        result = []
+        for child in getattr(el, "children", []):
+            if isinstance(child, Element):
+                result.append(marshal_element(child))
+            elif isinstance(child, TextNode):
+                result.append({
+                    "nodeId": child.node_id,
+                    "nodeType": 3,
+                    "tag": "#text",
+                    "tagName": "#text",
+                    "id": "",
+                    "className": "",
+                    "attributes": {},
+                    "textContent": child.data,
+                    "children": [],
+                })
+        return json.dumps(result)
+
     def _py_query_selector_in(node_id: str, selector: str) -> str:
         """querySelector scoped to the subtree of node with node_id."""
         doc = getattr(session, "_current_document", None)
@@ -318,6 +342,7 @@ def _register_py_callbacks(ctx: Any, session: Session) -> None:
     ctx.add_callable("_py_get_text_content", _py_get_text_content)
     ctx.add_callable("_py_get_parent", _py_get_parent)
     ctx.add_callable("_py_get_siblings", _py_get_siblings)
+    ctx.add_callable("_py_get_children", _py_get_children)
     ctx.add_callable("_py_query_selector_in", _py_query_selector_in)
     ctx.add_callable("_py_query_selector_all_in", _py_query_selector_all_in)
     ctx.add_callable("_py_get_forms", _py_get_forms)
@@ -375,6 +400,47 @@ def _register_py_callbacks(ctx: Any, session: Session) -> None:
     ctx.add_callable("_py_storage_key", _py_storage_key)
     ctx.add_callable("_py_storage_length", _py_storage_length)
 
+    # ── document.cookie ───────────────────────────────────────────────────────
+
+    def _py_get_cookies() -> str:
+        """Return cookie string for current URL."""
+        cookies = getattr(session, "cookies", None)
+        url = getattr(session, "_current_url", "about:blank")
+        if cookies is None:
+            return ""
+        return cookies.cookie_header(url) or ""
+
+    def _py_set_cookie(cookie_str: str) -> None:
+        """Set a cookie from JS (document.cookie = ...)."""
+        cookies = getattr(session, "cookies", None)
+        url = getattr(session, "_current_url", "about:blank")
+        if cookies is None:
+            return
+        from urllib.parse import urlparse
+
+        from an_web.net.cookies import Cookie
+        parts = [p.strip() for p in cookie_str.split(";")]
+        if not parts or not parts[0]:
+            return
+        name, _, value = parts[0].partition("=")
+        name = name.strip()
+        value = value.strip()
+        if not name:
+            return
+        domain = urlparse(url).hostname or ""
+        cookie = Cookie(name=name, value=value, domain=domain)
+        for part in parts[1:]:
+            key, _, val = part.partition("=")
+            key = key.strip().lower()
+            if key == "path":
+                cookie.path = val.strip() or "/"
+            elif key == "domain":
+                cookie.domain = val.strip().lstrip(".")
+        cookies.set(cookie)
+
+    ctx.add_callable("_py_get_cookies", _py_get_cookies)
+    ctx.add_callable("_py_set_cookie", _py_set_cookie)
+
     # ── Timers ────────────────────────────────────────────────────────────────
     # JS timers are stored in session._pending_timers for the scheduler
     # to drain. We use a cooperative model: setTimeout stores the callback
@@ -424,8 +490,7 @@ def _register_py_callbacks(ctx: Any, session: Session) -> None:
     def _py_fetch_sync(url: str, method: str, body_json: str, headers_json: str) -> str:
         """
         Synchronous network request from JS. Returns JSON response dict.
-        This is a best-effort sync bridge — real async requests go through
-        the session's NetworkClient outside of JS eval.
+        Supports both sync (loop not running) and async (enqueue for later) modes.
         """
         import asyncio
         network = getattr(session, "network", None)
@@ -435,31 +500,45 @@ def _register_py_callbacks(ctx: Any, session: Session) -> None:
             headers = json.loads(headers_json) if headers_json else {}
             body = json.loads(body_json) if body_json else None
 
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Can't use run_until_complete inside running loop
-                # Return a placeholder — the real fetch is async
-                return json.dumps({
-                    "ok": False, "status": 0, "text": "",
-                    "error": "async_context_fetch_not_supported",
-                })
+            # Add browser-like headers for fetch requests
+            if "Referer" not in headers:
+                headers["Referer"] = getattr(session, "_current_url", "") or ""
+            if "Sec-Fetch-Dest" not in headers:
+                headers["Sec-Fetch-Dest"] = "empty"
+            if "Sec-Fetch-Mode" not in headers:
+                headers["Sec-Fetch-Mode"] = "cors"
 
-            if method.upper() == "GET":
-                response = loop.run_until_complete(
-                    network.get(url, headers=headers)
-                )
+            # Try to run synchronously
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop is not None and loop.is_running():
+                # In async context: use thread to avoid blocking
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        asyncio.run,
+                        _do_fetch(network, url, method, headers, body)
+                    )
+                    try:
+                        result = future.result(timeout=10.0)
+                        return result
+                    except Exception as exc:
+                        log.debug("_py_fetch_sync thread error: %s", exc)
+                        return json.dumps({"ok": False, "status": 0, "text": "",
+                                          "error": str(exc)})
             else:
-                response = loop.run_until_complete(
-                    network.post(url, json=body, headers=headers)
-                )
+                loop = asyncio.new_event_loop()
+                try:
+                    result = loop.run_until_complete(
+                        _do_fetch(network, url, method, headers, body)
+                    )
+                    return result
+                finally:
+                    loop.close()
 
-            return json.dumps({
-                "ok": response.ok,
-                "status": response.status,
-                "text": response.text,
-                "headers": response.headers,
-                "url": response.url,
-            })
         except Exception as exc:
             log.debug("_py_fetch_sync error: %s", exc)
             return json.dumps({"ok": False, "status": 0, "text": "", "error": str(exc)})
@@ -477,6 +556,268 @@ def _register_py_callbacks(ctx: Any, session: Session) -> None:
 
     ctx.add_callable("_py_perf_now", _py_perf_now)
 
+    # ── DOM Mutation callbacks ────────────────────────────────────────────────
+    # These callbacks allow JS to actually modify the Python DOM tree.
+
+    _node_id_counter = [1000000]  # Start high to avoid collision with parser IDs
+
+    def _py_create_element(tag: str) -> str:
+        """Create a new Element in the Python DOM and return its JSON."""
+        from an_web.dom.nodes import Element
+        _node_id_counter[0] += 1
+        node_id = f"js_{_node_id_counter[0]}"
+        el = Element(node_id=node_id, tag=tag.lower(), attributes={})
+        # Store in a registry on the session for later lookup
+        if not hasattr(session, "_js_created_nodes"):
+            session._js_created_nodes = {}
+        session._js_created_nodes[node_id] = el
+        return json.dumps(marshal_element(el))
+
+    def _py_create_text_node(text: str) -> str:
+        """Create a TextNode in the Python DOM."""
+        from an_web.dom.nodes import TextNode
+        _node_id_counter[0] += 1
+        node_id = f"js_{_node_id_counter[0]}"
+        tn = TextNode(node_id=node_id, data=text)
+        if not hasattr(session, "_js_created_nodes"):
+            session._js_created_nodes = {}
+        session._js_created_nodes[node_id] = tn
+        return json.dumps({"nodeId": node_id, "nodeType": 3, "data": text,
+                          "textContent": text, "tag": "#text"})
+
+    def _py_create_document_fragment() -> str:
+        """Create a DocumentFragment node backed by Python."""
+        from an_web.dom.nodes import Element
+        _node_id_counter[0] += 1
+        node_id = f"js_{_node_id_counter[0]}"
+        # Use Element as backing container — fragments act as element collections
+        frag = Element(node_id=node_id, tag="#document-fragment", attributes={})
+        if not hasattr(session, "_js_created_nodes"):
+            session._js_created_nodes = {}
+        session._js_created_nodes[node_id] = frag
+        return json.dumps({"nodeId": node_id, "nodeType": 11, "tag": "",
+                          "tagName": "", "attributes": {}, "children": []})
+
+    def _py_append_child(parent_id: str, child_id: str) -> bool:
+        """Append child node to parent in the Python DOM tree."""
+        parent = _find_node(session, parent_id)
+        child = _find_node(session, child_id)
+        if parent is None or child is None:
+            return False
+        # Remove from old parent if already in tree
+        if child.parent is not None:
+            try:
+                child.parent.children.remove(child)
+            except ValueError:
+                pass
+        parent.append_child(child)
+        # Register in document's id map
+        from an_web.dom.nodes import Element
+        doc = getattr(session, "_current_document", None)
+        if doc and isinstance(child, Element):
+            doc.register_element(child)
+        return True
+
+    def _py_remove_child(parent_id: str, child_id: str) -> bool:
+        """Remove child node from parent in the Python DOM tree."""
+        parent = _find_node(session, parent_id)
+        child = _find_node(session, child_id)
+        if parent is None or child is None:
+            return False
+        try:
+            parent.remove_child(child)
+            return True
+        except (ValueError, Exception):
+            return False
+
+    def _py_insert_before(parent_id: str, new_id: str, ref_id: str) -> bool:
+        """Insert new_node before ref_node under parent."""
+        parent = _find_node(session, parent_id)
+        new_node = _find_node(session, new_id)
+        if parent is None or new_node is None:
+            return False
+        if not ref_id or ref_id == "null":
+            parent.append_child(new_node)
+            return True
+        ref_node = _find_node(session, ref_id)
+        if ref_node is None:
+            parent.append_child(new_node)
+            return True
+        # Remove from old parent
+        if new_node.parent is not None:
+            try:
+                new_node.parent.children.remove(new_node)
+            except ValueError:
+                pass
+        # Insert at the correct position
+        try:
+            idx = parent.children.index(ref_node)
+            new_node.parent = parent
+            parent.children.insert(idx, new_node)
+        except ValueError:
+            parent.append_child(new_node)
+        return True
+
+    def _py_set_inner_html(node_id: str, html_str: str) -> bool:
+        """Parse HTML string and replace node's children."""
+        from an_web.dom.nodes import Element
+        target = _find_node(session, node_id)
+        if target is None:
+            return False
+        # Clear existing children
+        target.children.clear()
+        # Parse the HTML fragment
+        if not html_str.strip():
+            return True
+        try:
+            from an_web.browser.parser import parse_html
+            doc = getattr(session, "_current_document", None)
+            base_url = getattr(session, "_current_url", "about:blank")
+            frag_doc = parse_html(f"<div>{html_str}</div>", base_url=base_url)
+            # Find the wrapper div and steal its children
+            for node in frag_doc.iter_descendants():
+                if isinstance(node, Element) and node.tag == "div":
+                    for child in list(node.children):
+                        child.parent = target
+                        target.children.append(child)
+                        if isinstance(child, Element) and doc:
+                            doc.register_element(child)
+                            # Register all descendants too
+                            for desc in child.iter_descendants():
+                                if isinstance(desc, Element):
+                                    doc.register_element(desc)
+                    break
+        except Exception as exc:
+            log.debug("_py_set_inner_html error: %s", exc)
+            return False
+        return True
+
+    def _py_set_text_content(node_id: str, text: str) -> bool:
+        """Replace node's children with a single text node."""
+        from an_web.dom.nodes import TextNode
+        target = _find_node(session, node_id)
+        if target is None:
+            return False
+        target.children.clear()
+        if text:
+            _node_id_counter[0] += 1
+            tn = TextNode(node_id=f"js_{_node_id_counter[0]}", data=text)
+            target.append_child(tn)
+        return True
+
+    def _py_insert_adjacent_html(node_id: str, position: str, html_str: str) -> bool:
+        """Insert HTML relative to a node (beforebegin/afterbegin/beforeend/afterend)."""
+        from an_web.dom.nodes import Element
+        target = _find_node(session, node_id)
+        if target is None or not html_str.strip():
+            return False
+        try:
+            from an_web.browser.parser import parse_html
+            base_url = getattr(session, "_current_url", "about:blank")
+            frag_doc = parse_html(f"<div>{html_str}</div>", base_url=base_url)
+            doc = getattr(session, "_current_document", None)
+            new_nodes = []
+            for node in frag_doc.iter_descendants():
+                if isinstance(node, Element) and node.tag == "div":
+                    new_nodes = list(node.children)
+                    break
+
+            pos = position.lower()
+            parent = target.parent
+            if pos == "beforeend":
+                for n in new_nodes:
+                    target.append_child(n)
+                    _register_deep(n, doc)
+            elif pos == "afterbegin":
+                for i, n in enumerate(new_nodes):
+                    n.parent = target
+                    target.children.insert(i, n)
+                    _register_deep(n, doc)
+            elif pos == "beforebegin" and parent:
+                idx = parent.children.index(target)
+                for i, n in enumerate(new_nodes):
+                    n.parent = parent
+                    parent.children.insert(idx + i, n)
+                    _register_deep(n, doc)
+            elif pos == "afterend" and parent:
+                idx = parent.children.index(target) + 1
+                for i, n in enumerate(new_nodes):
+                    n.parent = parent
+                    parent.children.insert(idx + i, n)
+                    _register_deep(n, doc)
+        except Exception as exc:
+            log.debug("_py_insert_adjacent_html error: %s", exc)
+            return False
+        return True
+
+    def _py_clone_node(node_id: str, deep: bool) -> str:
+        """Clone a node (optionally deep) and return its JSON."""
+        from an_web.dom.nodes import Element
+        source = _find_node(session, node_id)
+        if source is None:
+            return "null"
+        clone = _deep_clone_node(source, deep, _node_id_counter, session)
+        if clone is None:
+            return "null"
+        return json.dumps(marshal_element(clone) if isinstance(clone, Element)
+                         else {"nodeId": clone.node_id, "nodeType": 3,
+                               "data": getattr(clone, "data", ""),
+                               "textContent": getattr(clone, "data", ""),
+                               "tag": "#text"})
+
+    def _py_remove_node(node_id: str) -> bool:
+        """Remove a node from the tree."""
+        target = _find_node(session, node_id)
+        if target is None or target.parent is None:
+            return False
+        try:
+            target.parent.children.remove(target)
+            target.parent = None
+            return True
+        except ValueError:
+            return False
+
+    ctx.add_callable("_py_create_element", _py_create_element)
+    ctx.add_callable("_py_create_text_node", _py_create_text_node)
+    ctx.add_callable("_py_create_document_fragment", _py_create_document_fragment)
+    ctx.add_callable("_py_append_child", _py_append_child)
+    ctx.add_callable("_py_remove_child", _py_remove_child)
+    ctx.add_callable("_py_insert_before", _py_insert_before)
+    ctx.add_callable("_py_set_inner_html", _py_set_inner_html)
+    ctx.add_callable("_py_set_text_content", _py_set_text_content)
+    ctx.add_callable("_py_insert_adjacent_html", _py_insert_adjacent_html)
+    ctx.add_callable("_py_clone_node", _py_clone_node)
+    ctx.add_callable("_py_remove_node", _py_remove_node)
+
+    # ── Async fetch bridge ────────────────────────────────────────────────────
+    # Store pending fetch requests that will be resolved by the event loop
+
+    def _py_fetch_async(request_id: str, url: str, method: str, body_json: str, headers_json: str) -> None:
+        """Queue an async fetch request to be resolved by the event loop."""
+        if not hasattr(session, "_pending_fetches"):
+            session._pending_fetches = {}
+        session._pending_fetches[request_id] = {
+            "url": url,
+            "method": method,
+            "body_json": body_json,
+            "headers_json": headers_json,
+            "resolved": False,
+            "result": None,
+        }
+
+    def _py_fetch_poll(request_id: str) -> str:
+        """Check if an async fetch has been resolved."""
+        fetches = getattr(session, "_pending_fetches", {})
+        entry = fetches.get(request_id)
+        if entry is None:
+            return json.dumps({"resolved": False, "error": "not_found"})
+        if entry.get("resolved"):
+            return json.dumps({"resolved": True, "result": entry["result"]})
+        return json.dumps({"resolved": False})
+
+    ctx.add_callable("_py_fetch_async", _py_fetch_async)
+    ctx.add_callable("_py_fetch_poll", _py_fetch_poll)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -485,6 +826,13 @@ def _register_py_callbacks(ctx: Any, session: Session) -> None:
 
 def _find_element_by_id(session: Any, node_id: str) -> Any:
     """Locate a DOM Element by its internal node_id."""
+    # Check JS-created nodes first (not yet in tree)
+    js_nodes = getattr(session, "_js_created_nodes", {})
+    if node_id in js_nodes:
+        from an_web.dom.nodes import Element
+        node = js_nodes[node_id]
+        if isinstance(node, Element):
+            return node
     doc = getattr(session, "_current_document", None)
     if doc is None:
         return None
@@ -495,12 +843,109 @@ def _find_element_by_id(session: Any, node_id: str) -> Any:
     return None
 
 
+def _find_node(session: Any, node_id: str) -> Any:
+    """Locate any DOM Node (Element or TextNode) by node_id."""
+    if not node_id or node_id == "null" or node_id == "__document__":
+        doc = getattr(session, "_current_document", None)
+        if node_id == "__document__":
+            return doc
+        return None
+    # Check JS-created nodes first
+    js_nodes = getattr(session, "_js_created_nodes", {})
+    if node_id in js_nodes:
+        return js_nodes[node_id]
+    doc = getattr(session, "_current_document", None)
+    if doc is None:
+        return None
+    for node in doc.iter_descendants():
+        if getattr(node, "node_id", None) == node_id:
+            return node
+    return None
+
+
+def _register_deep(node: Any, doc: Any) -> None:
+    """Register a node and all descendants in the document's id map."""
+    from an_web.dom.nodes import Element
+    if doc and isinstance(node, Element):
+        doc.register_element(node)
+        for desc in node.iter_descendants():
+            if isinstance(desc, Element):
+                doc.register_element(desc)
+
+
+def _deep_clone_node(node: Any, deep: bool, counter: list[int], session: Any) -> Any:
+    """Deep or shallow clone a DOM node."""
+    from an_web.dom.nodes import Element, TextNode
+    counter[0] += 1
+    new_id = f"js_{counter[0]}"
+
+    if isinstance(node, TextNode):
+        clone = TextNode(node_id=new_id, data=node.data)
+        if not hasattr(session, "_js_created_nodes"):
+            session._js_created_nodes = {}
+        session._js_created_nodes[new_id] = clone
+        return clone
+    elif isinstance(node, Element):
+        clone = Element(node_id=new_id, tag=node.tag,
+                       attributes=dict(node.attributes))
+        if not hasattr(session, "_js_created_nodes"):
+            session._js_created_nodes = {}
+        session._js_created_nodes[new_id] = clone
+        if deep:
+            for child in node.children:
+                child_clone = _deep_clone_node(child, True, counter, session)
+                if child_clone:
+                    clone.append_child(child_clone)
+        return clone
+    return None
+
+
 def _get_storage(session: Any, store_name: str) -> dict[str, str]:
     """Return the appropriate storage dict from the session."""
     attr = "_local_storage" if store_name == "local" else "_session_storage"
     if not hasattr(session, attr):
         setattr(session, attr, {})
     return getattr(session, attr)
+
+
+async def _do_fetch(network: Any, url: str, method: str,
+                    headers: dict, body: Any) -> str:
+    """Perform an actual HTTP fetch and return JSON result string."""
+    import httpx
+
+    # Create a fresh client for thread-based fetch to avoid sharing connections
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=10.0,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept": "*/*",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding": "gzip, deflate, br",
+        },
+    ) as client:
+        try:
+            if method.upper() == "GET":
+                resp = await client.get(url, headers=headers)
+            elif method.upper() == "POST":
+                resp = await client.post(url, json=body, headers=headers)
+            else:
+                resp = await client.request(method.upper(), url, headers=headers,
+                                           content=json.dumps(body).encode() if body else None)
+
+            return json.dumps({
+                "ok": 200 <= resp.status_code < 400,
+                "status": resp.status_code,
+                "text": resp.text,
+                "headers": dict(resp.headers),
+                "url": str(resp.url),
+            })
+        except Exception as exc:
+            return json.dumps({"ok": False, "status": 0, "text": "", "error": str(exc)})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -573,9 +1018,14 @@ EventTarget.prototype.dispatchEvent = function(event) {
 
 // ── Element proxy ─────────────────────────────────────────────────────────────
 
+var _elementIndex = 0;
+
 function _makeElement(data) {
     if (!data) return null;
-    var el = Object.create(EventTarget.prototype);
+    var proto = (typeof HTMLElement !== 'undefined') ? HTMLElement.prototype : EventTarget.prototype;
+    if (data.nodeType === 3 && typeof Text !== 'undefined') proto = Text.prototype;
+    if (data.nodeType === 8 && typeof Comment !== 'undefined') proto = Comment.prototype;
+    var el = Object.create(proto);
     el._listeners = {};
     el.nodeId       = data.nodeId || '';
     el.nodeType     = data.nodeType !== undefined ? data.nodeType : 1;
@@ -583,10 +1033,60 @@ function _makeElement(data) {
     el.localName    = (data.tag || data.tagName || '').toLowerCase();
     el.id           = data.id || '';
     el.className    = data.className || '';
-    el.textContent  = data.textContent || '';
-    el.innerHTML    = data.innerHTML || '';
+    el._textContent = data.textContent || '';
+    el._innerHTML   = data.innerHTML || '';
     el._attributes  = data.attributes || {};
     el._children    = (data.children || []).map(_makeElement);
+    el.ownerDocument = (typeof document !== 'undefined') ? document : null;
+    el.sourceIndex  = _elementIndex++;
+    el.nodeName     = el.tagName || (el.nodeType === 3 ? '#text' : '');
+    el.nodeValue    = el.nodeType === 3 ? el._textContent : null;
+
+    // textContent — getter reads from Python, setter writes back
+    Object.defineProperty(el, 'textContent', {
+        get: function() {
+            if (el.nodeId && el.nodeId.indexOf('_new_') < 0) {
+                var tc = _py_get_text_content(el.nodeId);
+                return tc || el._textContent;
+            }
+            return el._textContent;
+        },
+        set: function(v) {
+            el._textContent = String(v);
+            if (el.nodeId) _py_set_text_content(el.nodeId, String(v));
+        },
+        configurable: true
+    });
+
+    // innerHTML — getter reads from Python, setter parses HTML and updates DOM
+    Object.defineProperty(el, 'innerHTML', {
+        get: function() {
+            if (el.nodeId && el.nodeId.indexOf('_new_') < 0) {
+                return _py_get_inner_html(el.nodeId) || el._innerHTML;
+            }
+            return el._innerHTML;
+        },
+        set: function(v) {
+            el._innerHTML = String(v);
+            if (el.nodeId) {
+                _py_set_inner_html(el.nodeId, String(v));
+                el._childrenDirty = true;
+            }
+        },
+        configurable: true
+    });
+
+    // outerHTML getter
+    Object.defineProperty(el, 'outerHTML', {
+        get: function() {
+            var attrs = '';
+            for (var k in el._attributes) {
+                attrs += ' ' + k + '="' + el._attributes[k] + '"';
+            }
+            return '<' + el.localName + attrs + '>' + el.innerHTML + '</' + el.localName + '>';
+        },
+        configurable: true
+    });
 
     el.getAttribute = function(name) {
         return el._attributes[name] !== undefined ? el._attributes[name] : null;
@@ -732,6 +1232,52 @@ function _makeElement(data) {
         set: function(v) { el.setAttribute('placeholder', v); },
     });
 
+    // URL-derived properties for <a> and <area> elements (protocol, host, etc.)
+    // Many libraries use document.createElement('a') as a URL parser.
+    (function() {
+        function _parseURL(href) {
+            if (!href) return {protocol:'',host:'',hostname:'',port:'',pathname:'/',search:'',hash:''};
+            var m = /^([a-z][a-z0-9+.-]*:)?\/\/([^/?#]*)?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i.exec(href);
+            if (!m) {
+                // Relative or malformed — just set pathname
+                var qIdx = href.indexOf('?'), hIdx = href.indexOf('#');
+                var p = href, s = '', h = '';
+                if (qIdx >= 0) { p = href.substring(0, qIdx); s = href.substring(qIdx); }
+                if (hIdx >= 0) { h = href.substring(hIdx); if (qIdx < 0 || hIdx < qIdx) p = href.substring(0, hIdx); s = ''; }
+                return {protocol:'',host:'',hostname:'',port:'',pathname:p||'/',search:s,hash:h};
+            }
+            var proto = m[1] || '';
+            var fullHost = m[2] || '';
+            var portSep = fullHost.lastIndexOf(':');
+            var hostname = portSep >= 0 ? fullHost.substring(0, portSep) : fullHost;
+            var port = portSep >= 0 ? fullHost.substring(portSep + 1) : '';
+            return {
+                protocol: proto,
+                host: fullHost,
+                hostname: hostname,
+                port: port,
+                pathname: m[3] || '/',
+                search: m[4] || '',
+                hash: m[5] || ''
+            };
+        }
+        var urlProps = ['protocol','host','hostname','port','pathname','search','hash'];
+        for (var i = 0; i < urlProps.length; i++) {
+            (function(prop) {
+                Object.defineProperty(el, prop, {
+                    get: function() { return _parseURL(el._attributes['href'] || '')[prop]; },
+                    set: function(v) {
+                        var parts = _parseURL(el._attributes['href'] || '');
+                        parts[prop] = v;
+                        var url = parts.protocol + '//' + parts.host + parts.pathname + parts.search + parts.hash;
+                        el.setAttribute('href', url);
+                    },
+                    configurable: true
+                });
+            })(urlProps[i]);
+        }
+    })();
+
     // parentElement — lazy Python lookup
     Object.defineProperty(el, 'parentElement', {
         get: function() {
@@ -798,21 +1344,69 @@ function _makeElement(data) {
         return el.querySelectorAll('.' + cls);
     };
 
-    // children array access
+    // children array access — dynamically fetched from Python DOM
+    // _children is used as a cache; refreshed from Python when needed
+    el._childrenDirty = true;
+    function _refreshChildren() {
+        if (el._childrenDirty && el.nodeId && el.nodeId.indexOf('_new_') < 0 && el.nodeId.indexOf('_frag_') < 0) {
+            var raw = _safeParse(_py_get_children(el.nodeId));
+            if (raw && raw.length !== undefined) {
+                el._children = raw.map(_makeElement);
+                el._childrenDirty = false;
+            }
+        }
+        return el._children;
+    }
     Object.defineProperty(el, 'children', {
-        get: function() { return el._children; }
+        get: function() { return _refreshChildren(); },
+        configurable: true
     });
     Object.defineProperty(el, 'childNodes', {
-        get: function() { return el._children; }
+        get: function() { return _refreshChildren(); },
+        configurable: true
     });
     Object.defineProperty(el, 'firstChild', {
-        get: function() { return el._children[0] || null; }
+        get: function() { var ch = _refreshChildren(); return ch[0] || null; },
+        configurable: true
     });
     Object.defineProperty(el, 'lastChild', {
-        get: function() { return el._children[el._children.length - 1] || null; }
+        get: function() { var ch = _refreshChildren(); return ch[ch.length - 1] || null; },
+        configurable: true
+    });
+    Object.defineProperty(el, 'firstElementChild', {
+        get: function() {
+            var ch = _refreshChildren();
+            for (var i = 0; i < ch.length; i++) {
+                if (ch[i] && ch[i].nodeType === 1) return ch[i];
+            }
+            return null;
+        },
+        configurable: true
+    });
+    Object.defineProperty(el, 'lastElementChild', {
+        get: function() {
+            var ch = _refreshChildren();
+            for (var i = ch.length - 1; i >= 0; i--) {
+                if (ch[i] && ch[i].nodeType === 1) return ch[i];
+            }
+            return null;
+        },
+        configurable: true
     });
     Object.defineProperty(el, 'childElementCount', {
-        get: function() { return el._children.length; }
+        get: function() {
+            var ch = _refreshChildren();
+            var count = 0;
+            for (var i = 0; i < ch.length; i++) {
+                if (ch[i] && ch[i].nodeType === 1) count++;
+            }
+            return count;
+        },
+        configurable: true
+    });
+    Object.defineProperty(el, 'hasChildNodes', {
+        value: function() { return _refreshChildren().length > 0; },
+        configurable: true
     });
 
     // Style stub
@@ -830,22 +1424,123 @@ function _makeElement(data) {
     el.reset  = function() {};
     el.select = function() {};
 
-    // DOM mutation stubs (no live DOM rewrite in AN-Web)
-    el.appendChild  = function(child) { return child; };
-    el.removeChild  = function(child) { return child; };
-    el.insertBefore = function(newNode, ref) { return newNode; };
-    el.replaceChild = function(newNode, old) { return old; };
-    el.cloneNode    = function(deep) { return _makeElement(data); };
-    el.remove       = function() {};
-    el.before       = function() {};
-    el.after        = function() {};
-    el.prepend      = function() {};
-    el.append       = function() {};
-    el.replaceWith  = function() {};
+    // DOM mutation — backed by Python callbacks to modify the real DOM tree
+    el.appendChild  = function(child) {
+        if (child && child.nodeId && el.nodeId) {
+            _py_append_child(el.nodeId, child.nodeId);
+            el._childrenDirty = true;
+        }
+        return child;
+    };
+    el.removeChild  = function(child) {
+        if (child && child.nodeId && el.nodeId) {
+            _py_remove_child(el.nodeId, child.nodeId);
+            el._childrenDirty = true;
+        }
+        return child;
+    };
+    el.insertBefore = function(newNode, ref) {
+        if (newNode && newNode.nodeId && el.nodeId) {
+            var refId = (ref && ref.nodeId) ? ref.nodeId : 'null';
+            _py_insert_before(el.nodeId, newNode.nodeId, refId);
+            el._childrenDirty = true;
+        }
+        return newNode;
+    };
+    el.replaceChild = function(newNode, old) {
+        if (old && newNode && el.nodeId) {
+            _py_remove_child(el.nodeId, old.nodeId);
+            _py_append_child(el.nodeId, newNode.nodeId);
+            el._childrenDirty = true;
+        }
+        return old;
+    };
+    el.cloneNode    = function(deep) {
+        var raw = _safeParse(_py_clone_node(el.nodeId, !!deep));
+        return raw ? _makeElement(raw) : _makeElement(data);
+    };
+    el.remove       = function() {
+        _py_remove_node(el.nodeId);
+    };
+    el.before       = function() {
+        var parent = el.parentElement;
+        if (!parent) return;
+        for (var i = 0; i < arguments.length; i++) {
+            var node = arguments[i];
+            if (typeof node === 'string') {
+                node = document.createTextNode(node);
+            }
+            parent.insertBefore(node, el);
+        }
+    };
+    el.after        = function() {
+        var parent = el.parentElement;
+        if (!parent) return;
+        var next = el.nextElementSibling;
+        for (var i = 0; i < arguments.length; i++) {
+            var node = arguments[i];
+            if (typeof node === 'string') {
+                node = document.createTextNode(node);
+            }
+            if (next) parent.insertBefore(node, next);
+            else parent.appendChild(node);
+        }
+    };
+    el.prepend      = function() {
+        var first = el._children[0] || null;
+        for (var i = arguments.length - 1; i >= 0; i--) {
+            var node = arguments[i];
+            if (typeof node === 'string') {
+                node = document.createTextNode(node);
+            }
+            el.insertBefore(node, first);
+        }
+    };
+    el.append       = function() {
+        for (var i = 0; i < arguments.length; i++) {
+            var node = arguments[i];
+            if (typeof node === 'string') {
+                node = document.createTextNode(node);
+            }
+            el.appendChild(node);
+        }
+    };
+    el.replaceWith  = function() {
+        var parent = el.parentElement;
+        if (!parent) return;
+        for (var i = 0; i < arguments.length; i++) {
+            var node = arguments[i];
+            if (typeof node === 'string') {
+                node = document.createTextNode(node);
+            }
+            parent.insertBefore(node, el);
+        }
+        el.remove();
+    };
 
-    el.insertAdjacentHTML = function(pos, html) {};
-    el.insertAdjacentText = function(pos, text) {};
-    el.insertAdjacentElement = function(pos, el2) { return el2; };
+    el.insertAdjacentHTML = function(pos, html) {
+        if (el.nodeId && html) {
+            _py_insert_adjacent_html(el.nodeId, pos, html);
+            el._childrenDirty = true;
+        }
+    };
+    el.insertAdjacentText = function(pos, text) {
+        el.insertAdjacentHTML(pos, text);
+    };
+    el.insertAdjacentElement = function(pos, el2) {
+        if (el2) {
+            var parent = el.parentElement;
+            if (pos === 'beforebegin' && parent) parent.insertBefore(el2, el);
+            else if (pos === 'afterbegin') el.prepend(el2);
+            else if (pos === 'beforeend') el.appendChild(el2);
+            else if (pos === 'afterend' && parent) {
+                var next = el.nextElementSibling;
+                if (next) parent.insertBefore(el2, next);
+                else parent.appendChild(el2);
+            }
+        }
+        return el2;
+    };
 
     el.contains = function(other) {
         if (!other) return false;
@@ -871,6 +1566,21 @@ function _makeElement(data) {
     el.scrollTop = 0; el.scrollLeft = 0;
     el.clientWidth = 0; el.clientHeight = 0;
 
+    // compareDocumentPosition — required by Sizzle/jQuery
+    el.compareDocumentPosition = function(other) {
+        if (!other) return 1; // DISCONNECTED
+        if (el === other) return 0;
+        // Use sourceIndex for ordering when available
+        if (typeof other.sourceIndex === 'number') {
+            if (el.sourceIndex < other.sourceIndex) return 4; // FOLLOWING
+            if (el.sourceIndex > other.sourceIndex) return 2; // PRECEDING
+        }
+        // Check containment
+        if (el.contains && el.contains(other)) return 20; // CONTAINED_BY | FOLLOWING
+        if (other.contains && other.contains(el)) return 10; // CONTAINS | PRECEDING
+        return 4; // FOLLOWING (default)
+    };
+
     return el;
 }
 
@@ -880,7 +1590,39 @@ var document = (function() {
     var doc = Object.create(EventTarget.prototype);
     doc._listeners = {};
     doc.nodeType = 9;
+    doc.nodeName = '#document';
     doc.readyState = 'complete';
+    doc.compatMode = 'CSS1Compat';
+    doc.characterSet = 'UTF-8';
+    doc.charset = 'UTF-8';
+    doc.inputEncoding = 'UTF-8';
+    doc.contentType = 'text/html';
+    doc.defaultView = window;
+    doc.ownerDocument = null;
+    doc.parentNode = null;
+    doc.parentElement = null;
+    doc.implementation = {
+        createDocument: function() { return doc; },
+        createHTMLDocument: function(title) { return doc; },
+        createDocumentType: function(name, publicId, systemId) {
+            var dt = new DocumentType();
+            dt.name = name;
+            dt.publicId = publicId || '';
+            dt.systemId = systemId || '';
+            return dt;
+        },
+        hasFeature: function() { return true; }
+    };
+    // DOCTYPE node
+    doc.doctype = (function() {
+        var dt = Object.create(DocumentType.prototype);
+        dt.nodeType = 10;
+        dt.name = 'html';
+        dt.publicId = '';
+        dt.systemId = '';
+        dt.nodeName = 'html';
+        return dt;
+    })();
 
     Object.defineProperty(doc, 'title', {
         get: function() { return _py_doc_get_title(); },
@@ -901,8 +1643,8 @@ var document = (function() {
         },
     });
     Object.defineProperty(doc, 'cookie', {
-        get: function() { return ''; },   // TODO: hook into CookieJar
-        set: function(v) {},
+        get: function() { return _py_get_cookies(); },
+        set: function(v) { _py_set_cookie(String(v)); },
     });
     Object.defineProperty(doc, 'body', {
         get: function() { return doc.querySelector('body'); },
@@ -911,8 +1653,42 @@ var document = (function() {
         get: function() { return doc.querySelector('head'); },
     });
     Object.defineProperty(doc, 'documentElement', {
-        get: function() { return doc.querySelector('html') || doc.querySelector('body'); },
+        get: function() { return doc.querySelector('html'); },
     });
+    Object.defineProperty(doc, 'childNodes', {
+        get: function() {
+            var de = doc.documentElement;
+            return de ? [doc.doctype, de] : [doc.doctype];
+        },
+    });
+    Object.defineProperty(doc, 'children', {
+        get: function() {
+            var de = doc.documentElement;
+            return de ? [de] : [];
+        },
+    });
+    Object.defineProperty(doc, 'firstChild', {
+        get: function() { return doc.doctype || doc.documentElement; },
+    });
+    Object.defineProperty(doc, 'lastChild', {
+        get: function() { return doc.documentElement || doc.doctype; },
+    });
+    Object.defineProperty(doc, 'firstElementChild', {
+        get: function() { return doc.documentElement; },
+    });
+    Object.defineProperty(doc, 'lastElementChild', {
+        get: function() { return doc.documentElement; },
+    });
+    Object.defineProperty(doc, 'childElementCount', {
+        get: function() { return doc.documentElement ? 1 : 0; },
+    });
+    doc.hasChildNodes = function() { return true; };
+    doc.compareDocumentPosition = function(other) {
+        if (!other) return 1;
+        if (other === doc) return 0;
+        return 20; // CONTAINED_BY | FOLLOWING
+    };
+    doc.contains = function(node) { return node !== null && node !== undefined; };
 
     doc.querySelector = function(sel) {
         var raw = _safeParse(_py_query_selector(sel));
@@ -935,8 +1711,10 @@ var document = (function() {
         return doc.querySelectorAll('[name="' + name + '"]');
     };
 
-    // createElement returns a lightweight stub (not in DOM)
+    // createElement — creates a real node in the Python DOM
     doc.createElement = function(tag) {
+        var raw = _safeParse(_py_create_element(tag));
+        if (raw) return _makeElement(raw);
         return _makeElement({
             nodeId: '_new_' + tag + '_' + Date.now(),
             tag: tag,
@@ -947,9 +1725,19 @@ var document = (function() {
         });
     };
     doc.createTextNode = function(text) {
-        return { nodeType: 3, data: text, textContent: text, nodeValue: text };
+        var raw = _safeParse(_py_create_text_node(text));
+        if (raw) {
+            var tn = _makeElement(raw);
+            tn.nodeType = 3;
+            tn.data = text;
+            tn.nodeValue = text;
+            return tn;
+        }
+        return { nodeType: 3, nodeId: '', data: text, textContent: text, nodeValue: text };
     };
     doc.createDocumentFragment = function() {
+        var raw = _safeParse(_py_create_document_fragment());
+        if (raw) return _makeElement(raw);
         return _makeElement({ nodeId: '_frag_' + Date.now(), tag: '', tagName: '', nodeType: 11, attributes: {}, children: [] });
     };
 
@@ -958,11 +1746,33 @@ var document = (function() {
         return { type: '', bubbles: false, cancelable: false, initEvent: function(t) { this.type = t; } };
     };
 
-    // Write stub — AN-Web ignores document.write
-    doc.write = function(html) {};
-    doc.writeln = function(html) {};
+    // Write — appends parsed HTML to body for basic document.write support
+    doc.write = function(html) {
+        if (html && doc.body) {
+            doc.body.innerHTML = doc.body.innerHTML + html;
+        }
+    };
+    doc.writeln = function(html) { doc.write((html || '') + '\n'); };
     doc.open = function() {};
     doc.close = function() {};
+    doc.createRange = function() { return new Range(); };
+    doc.createTreeWalker = function(root, whatToShow, filter) {
+        var tw = new TreeWalker();
+        tw.root = root;
+        tw.currentNode = root;
+        return tw;
+    };
+    doc.createNodeIterator = function(root, whatToShow, filter) {
+        var ni = new NodeIterator();
+        ni.root = root;
+        return ni;
+    };
+    doc.adoptNode = function(node) { return node; };
+    doc.importNode = function(node, deep) { return node; };
+    // Node filter constants
+    doc.ELEMENT_NODE = 1;
+    doc.TEXT_NODE = 3;
+    doc.DOCUMENT_NODE = 9;
 
     // Convenience collections
     Object.defineProperty(doc, 'forms', {
@@ -988,13 +1798,6 @@ var document = (function() {
 
     // hasFocus
     doc.hasFocus = function() { return true; };
-
-    // contains
-    doc.contains = function(node) { return node !== null && node !== undefined; };
-
-    // importNode / adoptNode stubs
-    doc.importNode = function(node, deep) { return node; };
-    doc.adoptNode   = function(node) { return node; };
 
     return doc;
 })();
@@ -1048,8 +1851,8 @@ var history = (function() {
     Object.defineProperty(h, 'length', {
         get: function() { return _py_history_length(); }
     });
-    h.pushState    = function(state, title, url) { if (url) _py_win_navigate(url); };
-    h.replaceState = function(state, title, url) { if (url) _py_win_navigate(url); };
+    h.pushState    = function(state, title, url) {};
+    h.replaceState = function(state, title, url) {};
     h.back         = function() {};
     h.forward      = function() {};
     h.go           = function() {};
@@ -1059,29 +1862,38 @@ var history = (function() {
 // ── navigator ─────────────────────────────────────────────────────────────────
 
 var navigator = {
-    userAgent:   'Mozilla/5.0 (AN-Web/1.0; AI Agent) Python/3.12',
-    platform:    'Linux',
-    language:    'en-US',
-    languages:   ['en-US', 'en'],
+    userAgent:   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    platform:    'Win32',
+    language:    'ko-KR',
+    languages:   ['ko-KR', 'ko', 'en-US', 'en'],
     onLine:      true,
     cookieEnabled: true,
     doNotTrack:  null,
-    hardwareConcurrency: 4,
+    hardwareConcurrency: 8,
     maxTouchPoints: 0,
-    vendor: 'AN-Web',
-    appName: 'AN-Web',
-    appVersion: '1.0',
+    vendor: 'Google Inc.',
+    appName: 'Netscape',
+    appVersion: '5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    product: 'Gecko',
+    productSub: '20030107',
+    vendorSub: '',
+    webdriver: false,
     geolocation: null,
     clipboard: null,
+    permissions: { query: function() { return Promise.resolve({ state: 'denied' }); } },
+    mediaDevices: { enumerateDevices: function() { return Promise.resolve([]); } },
     serviceWorker: { register: function() { return Promise.reject(new Error('not supported')); } },
+    sendBeacon: function() { return true; },
+    connection: { effectiveType: '4g', downlink: 10, rtt: 50, saveData: false },
 };
 
 // ── screen ────────────────────────────────────────────────────────────────────
 
 var screen = {
-    width: 1280, height: 800,
-    availWidth: 1280, availHeight: 800,
+    width: 1920, height: 1080,
+    availWidth: 1920, availHeight: 1040,
     colorDepth: 24, pixelDepth: 24,
+    orientation: { type: 'landscape-primary', angle: 0 },
 };
 
 // ── localStorage / sessionStorage ────────────────────────────────────────────
@@ -1118,23 +1930,35 @@ var sessionStorage  = _makeStorage('session');
 
 var _timerCallbacks = {};
 var _intervalCallbacks = {};
+var _timerIdToKey = {};
 
 function setTimeout(fn, delay) {
     if (typeof delay !== 'number') delay = 0;
     var key = '_t' + Date.now() + '_' + Math.random();
     _timerCallbacks[key] = fn;
     var id = _py_set_timeout_ms(delay, key);
+    _timerIdToKey[id] = key;
     return id;
 }
 function clearTimeout(id) {
+    var key = _timerIdToKey[id];
+    if (key) {
+        delete _timerCallbacks[key];
+        delete _timerIdToKey[id];
+    }
     _py_clear_timeout(id);
 }
 function setInterval(fn, delay) {
-    // For simplicity, setInterval is treated as a one-shot (like setTimeout)
-    // Real repeating intervals would require scheduler support
-    return setTimeout(fn, delay || 0);
+    if (typeof delay !== 'number' || delay < 1) delay = 1;
+    var key = '_i' + Date.now() + '_' + Math.random();
+    _timerCallbacks[key] = fn;
+    var id = _py_set_timeout_ms(delay, key);
+    _timerIdToKey[id] = key;
+    _intervalCallbacks[id] = { fn: fn, delay: delay, key: key };
+    return id;
 }
 function clearInterval(id) {
+    delete _intervalCallbacks[id];
     clearTimeout(id);
 }
 function queueMicrotask(fn) {
@@ -1149,9 +1973,30 @@ function cancelAnimationFrame(id) {
 
 // Fire all timers that the Python layer has marked as ready
 function _fireReadyTimers() {
-    var fired = JSON.parse(_py_get_fired_timers());
-    // fired is a list of timer IDs — but we keyed by string key, not id
-    // This is a limitation; for now JS timers are best-effort
+    var firedStr = _py_get_fired_timers();
+    var fired = JSON.parse(firedStr);
+    for (var i = 0; i < fired.length; i++) {
+        var tid = fired[i];
+        var key = _timerIdToKey[tid];
+        if (key && _timerCallbacks[key]) {
+            try {
+                _timerCallbacks[key]();
+            } catch(e) {
+                console.error('Timer callback error:', e);
+            }
+            // Check if it's an interval — re-register
+            if (_intervalCallbacks[tid]) {
+                var interval = _intervalCallbacks[tid];
+                var newId = _py_set_timeout_ms(interval.delay, interval.key);
+                _timerIdToKey[newId] = interval.key;
+                _intervalCallbacks[newId] = interval;
+                delete _intervalCallbacks[tid];
+            }
+            delete _timerCallbacks[key];
+            delete _timerIdToKey[tid];
+        }
+    }
+    return fired.length;
 }
 
 // ── fetch ─────────────────────────────────────────────────────────────────────
@@ -1282,6 +2127,308 @@ window.queueMicrotask = queueMicrotask;
 window.requestAnimationFrame = requestAnimationFrame;
 window.cancelAnimationFrame  = cancelAnimationFrame;
 window.EventTarget  = EventTarget;
+window.self = window;
+window.top  = window;
+window.parent = window;
+window.frameElement = null;
+window.frames = [];
+window.length = 0;
+
+// window needs EventTarget capabilities
+window._listeners = {};
+window.addEventListener = EventTarget.prototype.addEventListener.bind(window);
+window.removeEventListener = EventTarget.prototype.removeEventListener.bind(window);
+window.dispatchEvent = EventTarget.prototype.dispatchEvent.bind(window);
+
+// Standard event handler properties (null by default, like real browsers)
+var _eventHandlerNames = [
+    'onabort', 'onblur', 'onchange', 'onclick', 'onclose', 'oncontextmenu',
+    'ondblclick', 'onerror', 'onfocus', 'onfocusin', 'onfocusout', 'oninput',
+    'oninvalid', 'onkeydown', 'onkeypress', 'onkeyup', 'onload', 'onmousedown',
+    'onmouseenter', 'onmouseleave', 'onmousemove', 'onmouseout', 'onmouseover',
+    'onmouseup', 'onreset', 'onresize', 'onscroll', 'onselect', 'onsubmit',
+    'onunload', 'onbeforeunload', 'onhashchange', 'onmessage', 'onoffline',
+    'ononline', 'onpagehide', 'onpageshow', 'onpopstate', 'onstorage',
+    'ontouchstart', 'ontouchmove', 'ontouchend', 'ontouchcancel',
+    'onanimationend', 'onanimationiteration', 'onanimationstart',
+    'ontransitionend', 'onwheel', 'ondrag', 'ondragend', 'ondragenter',
+    'ondragleave', 'ondragover', 'ondragstart', 'ondrop', 'onpointerdown',
+    'onpointermove', 'onpointerup', 'onpointercancel', 'onpointerover',
+    'onpointerout', 'onpointerenter', 'onpointerleave', 'ongotpointercapture',
+    'onlostpointercapture', 'oncut', 'oncopy', 'onpaste', 'onbeforecut',
+    'onbeforecopy', 'onbeforepaste', 'onselectstart', 'onreadystatechange',
+];
+for (var _ehi = 0; _ehi < _eventHandlerNames.length; _ehi++) {
+    if (!(_eventHandlerNames[_ehi] in window)) {
+        window[_eventHandlerNames[_ehi]] = null;
+    }
+}
+// Also set on HTMLElement prototype so created elements have them too
+for (var _ehi2 = 0; _ehi2 < _eventHandlerNames.length; _ehi2++) {
+    if (!(_eventHandlerNames[_ehi2] in HTMLElement.prototype)) {
+        HTMLElement.prototype[_eventHandlerNames[_ehi2]] = null;
+    }
+}
+
+// ── DOM constructor stubs (for instanceof / polyfill checks) ──────────────────
+function Node() {}
+Node.ELEMENT_NODE = 1;
+Node.ATTRIBUTE_NODE = 2;
+Node.TEXT_NODE = 3;
+Node.CDATA_SECTION_NODE = 4;
+Node.COMMENT_NODE = 8;
+Node.DOCUMENT_NODE = 9;
+Node.DOCUMENT_TYPE_NODE = 10;
+Node.DOCUMENT_FRAGMENT_NODE = 11;
+Node.prototype = Object.create(EventTarget.prototype);
+Node.prototype.constructor = Node;
+Node.prototype.nodeType = 1;
+Node.prototype.nodeName = '';
+Node.prototype.nodeValue = null;
+Node.prototype.parentNode = null;
+Node.prototype.childNodes = [];
+Node.prototype.firstChild = null;
+Node.prototype.lastChild = null;
+Node.prototype.previousSibling = null;
+Node.prototype.nextSibling = null;
+Node.prototype.ownerDocument = null;
+Node.prototype.contains = function(other) {
+    if (this === other) return true;
+    var ch = this.children || this.childNodes || [];
+    for (var i = 0; i < ch.length; i++) {
+        if (ch[i] && ch[i].contains && ch[i].contains(other)) return true;
+    }
+    return false;
+};
+Node.prototype.compareDocumentPosition = function(other) { return 0; };
+Node.prototype.isEqualNode = function(other) { return this === other; };
+Node.prototype.isSameNode = function(other) { return this === other; };
+Node.prototype.cloneNode = function(deep) { return this; };
+Node.prototype.normalize = function() {};
+Node.prototype.hasChildNodes = function() { return (this.children || this.childNodes || []).length > 0; };
+Node.prototype.getRootNode = function() { return document; };
+
+function Element() {}
+Element.prototype = Object.create(Node.prototype);
+Element.prototype.constructor = Element;
+Element.prototype.nodeType = 1;
+Element.prototype.matches = function(sel) { return false; };
+Element.prototype.closest = function(sel) { return null; };
+Element.prototype.getBoundingClientRect = function() {
+    return { top:0, right:0, bottom:0, left:0, width:0, height:0, x:0, y:0 };
+};
+Element.prototype.getClientRects = function() { return []; };
+Element.prototype.setAttribute = function(n,v) { this._attributes = this._attributes || {}; this._attributes[n] = String(v); };
+Element.prototype.getAttribute = function(n) { return (this._attributes || {})[n] || null; };
+Element.prototype.removeAttribute = function(n) { if (this._attributes) delete this._attributes[n]; };
+Element.prototype.hasAttribute = function(n) { return !!(this._attributes && n in this._attributes); };
+Element.prototype.getAttributeNames = function() { return Object.keys(this._attributes || {}); };
+Element.prototype.getElementsByTagName = function(tag) {
+    tag = tag.toUpperCase();
+    var result = [];
+    var ch = this.children || [];
+    for (var i = 0; i < ch.length; i++) {
+        if (ch[i] && ch[i].tagName === tag) result.push(ch[i]);
+        if (ch[i] && ch[i].getElementsByTagName) {
+            result = result.concat(ch[i].getElementsByTagName(tag));
+        }
+    }
+    return result;
+};
+Element.prototype.getElementsByClassName = function(cls) { return []; };
+Element.prototype.insertAdjacentElement = function(pos, el) { return el; };
+Element.prototype.insertAdjacentText = function(pos, text) {};
+Element.prototype.scrollIntoView = function() {};
+Element.prototype.focus = function() {};
+Element.prototype.blur = function() {};
+Element.prototype.click = function() {};
+// classList, dataset, style are defined per-element in _makeElement()
+// — no prototype definitions here to avoid setter conflicts.
+
+function HTMLElement() {}
+HTMLElement.prototype = Object.create(Element.prototype);
+HTMLElement.prototype.constructor = HTMLElement;
+HTMLElement.prototype.offsetWidth = 0;
+HTMLElement.prototype.offsetHeight = 0;
+HTMLElement.prototype.offsetTop = 0;
+HTMLElement.prototype.offsetLeft = 0;
+HTMLElement.prototype.offsetParent = null;
+HTMLElement.prototype.clientWidth = 0;
+HTMLElement.prototype.clientHeight = 0;
+HTMLElement.prototype.clientTop = 0;
+HTMLElement.prototype.clientLeft = 0;
+HTMLElement.prototype.scrollWidth = 0;
+HTMLElement.prototype.scrollHeight = 0;
+HTMLElement.prototype.scrollTop = 0;
+HTMLElement.prototype.scrollLeft = 0;
+
+function Text() {}
+Text.prototype = Object.create(Node.prototype);
+Text.prototype.constructor = Text;
+Text.prototype.nodeType = 3;
+
+function Comment() {}
+Comment.prototype = Object.create(Node.prototype);
+Comment.prototype.constructor = Comment;
+Comment.prototype.nodeType = 8;
+
+function DocumentFragment() {}
+DocumentFragment.prototype = Object.create(Node.prototype);
+DocumentFragment.prototype.constructor = DocumentFragment;
+DocumentFragment.prototype.nodeType = 11;
+DocumentFragment.prototype.children = [];
+DocumentFragment.prototype.querySelector = function() { return null; };
+DocumentFragment.prototype.querySelectorAll = function() { return []; };
+DocumentFragment.prototype.getElementById = function() { return null; };
+DocumentFragment.prototype.appendChild = function(c) { this.children = this.children || []; this.children.push(c); return c; };
+
+function HTMLDocument() {}
+HTMLDocument.prototype = Object.create(Node.prototype);
+HTMLDocument.prototype.constructor = HTMLDocument;
+
+// HTML element subclasses commonly checked by polyfills
+function HTMLDivElement() {}
+HTMLDivElement.prototype = Object.create(HTMLElement.prototype);
+function HTMLSpanElement() {}
+HTMLSpanElement.prototype = Object.create(HTMLElement.prototype);
+function HTMLAnchorElement() {}
+HTMLAnchorElement.prototype = Object.create(HTMLElement.prototype);
+function HTMLImageElement() {}
+HTMLImageElement.prototype = Object.create(HTMLElement.prototype);
+function HTMLInputElement() {}
+HTMLInputElement.prototype = Object.create(HTMLElement.prototype);
+function HTMLButtonElement() {}
+HTMLButtonElement.prototype = Object.create(HTMLElement.prototype);
+function HTMLFormElement() {}
+HTMLFormElement.prototype = Object.create(HTMLElement.prototype);
+function HTMLScriptElement() {}
+HTMLScriptElement.prototype = Object.create(HTMLElement.prototype);
+function HTMLStyleElement() {}
+HTMLStyleElement.prototype = Object.create(HTMLElement.prototype);
+function HTMLLinkElement() {}
+HTMLLinkElement.prototype = Object.create(HTMLElement.prototype);
+function HTMLIFrameElement() {}
+HTMLIFrameElement.prototype = Object.create(HTMLElement.prototype);
+function HTMLCanvasElement() {}
+HTMLCanvasElement.prototype = Object.create(HTMLElement.prototype);
+HTMLCanvasElement.prototype.getContext = function() { return null; };
+function HTMLVideoElement() {}
+HTMLVideoElement.prototype = Object.create(HTMLElement.prototype);
+function HTMLAudioElement() {}
+HTMLAudioElement.prototype = Object.create(HTMLElement.prototype);
+function HTMLTemplateElement() {}
+HTMLTemplateElement.prototype = Object.create(HTMLElement.prototype);
+HTMLTemplateElement.prototype.content = new DocumentFragment();
+
+// SVG stubs
+function SVGElement() {}
+SVGElement.prototype = Object.create(Element.prototype);
+
+// Additional DOM types needed by polyfills
+function DocumentType() {}
+DocumentType.prototype = Object.create(Node.prototype);
+DocumentType.prototype.constructor = DocumentType;
+DocumentType.prototype.nodeType = 10;
+
+function ProcessingInstruction() {}
+ProcessingInstruction.prototype = Object.create(Node.prototype);
+ProcessingInstruction.prototype.constructor = ProcessingInstruction;
+
+function CDATASection() {}
+CDATASection.prototype = Object.create(Text.prototype);
+CDATASection.prototype.constructor = CDATASection;
+CDATASection.prototype.nodeType = 4;
+
+function Range() {}
+Range.prototype.cloneContents = function() { return new DocumentFragment(); };
+Range.prototype.cloneRange = function() { return new Range(); };
+Range.prototype.collapse = function() {};
+Range.prototype.createContextualFragment = function(html) { return new DocumentFragment(); };
+Range.prototype.deleteContents = function() {};
+Range.prototype.detach = function() {};
+Range.prototype.getBoundingClientRect = function() { return {top:0,right:0,bottom:0,left:0,width:0,height:0}; };
+Range.prototype.getClientRects = function() { return []; };
+Range.prototype.insertNode = function() {};
+Range.prototype.selectNode = function() {};
+Range.prototype.selectNodeContents = function() {};
+Range.prototype.setEnd = function() {};
+Range.prototype.setEndAfter = function() {};
+Range.prototype.setEndBefore = function() {};
+Range.prototype.setStart = function() {};
+Range.prototype.setStartAfter = function() {};
+Range.prototype.setStartBefore = function() {};
+Range.prototype.surroundContents = function() {};
+Range.prototype.toString = function() { return ''; };
+
+function Selection() {}
+Selection.prototype.addRange = function() {};
+Selection.prototype.collapse = function() {};
+Selection.prototype.collapseToEnd = function() {};
+Selection.prototype.collapseToStart = function() {};
+Selection.prototype.containsNode = function() { return false; };
+Selection.prototype.deleteFromDocument = function() {};
+Selection.prototype.extend = function() {};
+Selection.prototype.getRangeAt = function() { return new Range(); };
+Selection.prototype.removeAllRanges = function() {};
+Selection.prototype.removeRange = function() {};
+Selection.prototype.selectAllChildren = function() {};
+Selection.prototype.setBaseAndExtent = function() {};
+Selection.prototype.toString = function() { return ''; };
+Selection.prototype.rangeCount = 0;
+Selection.prototype.anchorNode = null;
+Selection.prototype.focusNode = null;
+Selection.prototype.isCollapsed = true;
+Selection.prototype.type = 'None';
+
+function TreeWalker() {}
+TreeWalker.prototype.currentNode = null;
+TreeWalker.prototype.firstChild = function() { return null; };
+TreeWalker.prototype.lastChild = function() { return null; };
+TreeWalker.prototype.nextNode = function() { return null; };
+TreeWalker.prototype.nextSibling = function() { return null; };
+TreeWalker.prototype.parentNode = function() { return null; };
+TreeWalker.prototype.previousNode = function() { return null; };
+TreeWalker.prototype.previousSibling = function() { return null; };
+
+function NodeIterator() {}
+NodeIterator.prototype.nextNode = function() { return null; };
+NodeIterator.prototype.previousNode = function() { return null; };
+NodeIterator.prototype.detach = function() {};
+
+// Expose all constructors on window
+window.Node = Node;
+window.Element = Element;
+window.HTMLElement = HTMLElement;
+window.HTMLDocument = HTMLDocument;
+window.Text = Text;
+window.Comment = Comment;
+window.DocumentFragment = DocumentFragment;
+window.DocumentType = DocumentType;
+window.ProcessingInstruction = ProcessingInstruction;
+window.CDATASection = CDATASection;
+window.Range = Range;
+window.Selection = Selection;
+window.TreeWalker = TreeWalker;
+window.NodeIterator = NodeIterator;
+window.HTMLDivElement = HTMLDivElement;
+window.HTMLSpanElement = HTMLSpanElement;
+window.HTMLAnchorElement = HTMLAnchorElement;
+window.HTMLImageElement = HTMLImageElement;
+window.HTMLInputElement = HTMLInputElement;
+window.HTMLButtonElement = HTMLButtonElement;
+window.HTMLFormElement = HTMLFormElement;
+window.HTMLScriptElement = HTMLScriptElement;
+window.HTMLStyleElement = HTMLStyleElement;
+window.HTMLLinkElement = HTMLLinkElement;
+window.HTMLIFrameElement = HTMLIFrameElement;
+window.HTMLCanvasElement = HTMLCanvasElement;
+window.HTMLVideoElement = HTMLVideoElement;
+window.HTMLAudioElement = HTMLAudioElement;
+window.HTMLTemplateElement = HTMLTemplateElement;
+window.SVGElement = SVGElement;
+window.CharacterData = Text;  // polyfill compat
+window.NodeList = Array;      // polyfill compat
+
 window.self         = window;
 window.top          = window;
 window.parent       = window;
@@ -1295,15 +2442,44 @@ window.confirm = function(msg) { _py_console_log('[confirm] ' + msg); return tru
 window.prompt  = function(msg, def_) { _py_console_log('[prompt] ' + msg); return def_ || ''; };
 
 window.getComputedStyle = function(el, pseudo) {
-    return {
-        getPropertyValue: function(prop) { return ''; },
-        display: 'block',
-        visibility: 'visible',
-    };
+    return new Proxy({}, {
+        get: function(target, prop) {
+            if (prop === 'getPropertyValue') return function(p) { return ''; };
+            if (prop === 'display') return 'block';
+            if (prop === 'visibility') return 'visible';
+            if (prop === 'position') return 'static';
+            if (prop === 'overflow') return 'visible';
+            if (prop === 'opacity') return '1';
+            if (prop === 'width') return 'auto';
+            if (prop === 'height') return 'auto';
+            if (prop === 'fontSize') return '16px';
+            if (prop === 'color') return 'rgb(0, 0, 0)';
+            if (prop === 'backgroundColor') return 'rgba(0, 0, 0, 0)';
+            if (prop === 'length') return 0;
+            if (prop === 'cssText') return '';
+            return '';
+        }
+    });
 };
 window.matchMedia = function(query) {
-    return { matches: false, media: query, addListener: function(){}, removeListener: function(){} };
+    var matches = false;
+    if (query.indexOf('prefers-color-scheme: light') >= 0) matches = true;
+    if (query.indexOf('(min-width:') >= 0) {
+        var m = query.match(/min-width:\s*(\d+)/);
+        if (m && parseInt(m[1]) <= 1920) matches = true;
+    }
+    return {
+        matches: matches,
+        media: query,
+        addListener: function(){},
+        removeListener: function(){},
+        addEventListener: function(){},
+        removeEventListener: function(){},
+        onchange: null,
+        dispatchEvent: function() { return true; }
+    };
 };
+window.getSelection = function() { return new Selection(); };
 
 // URL / URLSearchParams polyfill (QuickJS has no browser globals)
 var URL = (typeof URL !== 'undefined') ? URL : (function() {
@@ -1372,6 +2548,10 @@ window.IntersectionObserver = function(cb) {
 window.ResizeObserver = function(cb) {
     return { observe: function() {}, unobserve: function() {}, disconnect: function() {} };
 };
+window.PerformanceObserver = function(cb) {
+    return { observe: function() {}, disconnect: function() {}, takeRecords: function() { return []; } };
+};
+PerformanceObserver.supportedEntryTypes = [];
 
 window.CustomEvent = function(type, init) {
     init = init || {};
@@ -1379,15 +2559,142 @@ window.CustomEvent = function(type, init) {
     this.detail = init.detail || null;
     this.bubbles = init.bubbles || false;
     this.cancelable = init.cancelable || false;
+    this.target = null;
+    this.currentTarget = null;
+    this.eventPhase = 0;
+    this.timeStamp = _py_perf_now();
+    this.preventDefault = function() { this.defaultPrevented = true; };
+    this.stopPropagation = function() {};
+    this.stopImmediatePropagation = function() {};
+    this.defaultPrevented = false;
 };
 window.Event = function(type, init) {
     init = init || {};
     this.type = type;
     this.bubbles = init.bubbles || false;
     this.cancelable = init.cancelable || false;
-    this.preventDefault = function() {};
+    this.target = null;
+    this.currentTarget = null;
+    this.eventPhase = 0;
+    this.timeStamp = _py_perf_now();
+    this.preventDefault = function() { this.defaultPrevented = true; };
     this.stopPropagation = function() {};
     this.stopImmediatePropagation = function() {};
+    this.defaultPrevented = false;
+};
+window.MouseEvent = function(type, init) {
+    window.Event.call(this, type, init);
+    init = init || {};
+    this.clientX = init.clientX || 0;
+    this.clientY = init.clientY || 0;
+    this.button = init.button || 0;
+};
+window.KeyboardEvent = function(type, init) {
+    window.Event.call(this, type, init);
+    init = init || {};
+    this.key = init.key || '';
+    this.code = init.code || '';
+    this.keyCode = init.keyCode || 0;
+};
+window.FocusEvent = function(type, init) { window.Event.call(this, type, init); };
+window.ErrorEvent = function(type, init) {
+    window.Event.call(this, type, init);
+    init = init || {};
+    this.message = init.message || '';
+    this.filename = init.filename || '';
+    this.lineno = init.lineno || 0;
+    this.colno = init.colno || 0;
+    this.error = init.error || null;
+};
+window.InputEvent = function(type, init) {
+    window.Event.call(this, type, init);
+    this.data = (init || {}).data || null;
+    this.inputType = (init || {}).inputType || '';
+};
+
+// DOMParser for runtime HTML parsing
+window.DOMParser = function() {};
+window.DOMParser.prototype.parseFromString = function(str, type) {
+    return document;
+};
+
+// TextEncoder/TextDecoder
+window.TextEncoder = function() {};
+window.TextEncoder.prototype.encode = function(str) {
+    var arr = [];
+    for (var i = 0; i < str.length; i++) arr.push(str.charCodeAt(i));
+    return new Uint8Array(arr);
+};
+window.TextDecoder = function() {};
+window.TextDecoder.prototype.decode = function(buf) { return String.fromCharCode.apply(null, buf); };
+
+// window dimensions
+window.innerWidth = 1920;
+window.innerHeight = 1080;
+window.outerWidth = 1920;
+window.outerHeight = 1080;
+window.devicePixelRatio = 1;
+window.scrollX = 0;
+window.scrollY = 0;
+window.pageXOffset = 0;
+window.pageYOffset = 0;
+window.scrollTo = function() {};
+window.scrollBy = function() {};
+window.scroll = function() {};
+
+// atob/btoa
+window.atob = function(s) {
+    // Simple base64 decode
+    var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+    var o = '';
+    for (var i = 0; i < s.length;) {
+        var a = chars.indexOf(s.charAt(i++));
+        var b = chars.indexOf(s.charAt(i++));
+        var c = chars.indexOf(s.charAt(i++));
+        var d = chars.indexOf(s.charAt(i++));
+        var bits = (a << 18) | (b << 12) | (c << 6) | d;
+        o += String.fromCharCode((bits >> 16) & 0xFF);
+        if (c !== 64) o += String.fromCharCode((bits >> 8) & 0xFF);
+        if (d !== 64) o += String.fromCharCode(bits & 0xFF);
+    }
+    return o;
+};
+window.btoa = function(s) {
+    var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    var o = '';
+    for (var i = 0; i < s.length; i += 3) {
+        var a = s.charCodeAt(i);
+        var b = i + 1 < s.length ? s.charCodeAt(i + 1) : 0;
+        var c = i + 2 < s.length ? s.charCodeAt(i + 2) : 0;
+        o += chars[(a >> 2) & 63];
+        o += chars[((a & 3) << 4) | ((b >> 4) & 15)];
+        o += (i + 1 < s.length) ? chars[((b & 15) << 2) | ((c >> 6) & 3)] : '=';
+        o += (i + 2 < s.length) ? chars[c & 63] : '=';
+    }
+    return o;
+};
+
+// Map, Set, WeakMap, WeakSet - already in QuickJS but check
+if (typeof Map === 'undefined') { window.Map = function() { this._data = {}; }; }
+if (typeof Set === 'undefined') { window.Set = function() { this._data = []; }; }
+if (typeof WeakMap === 'undefined') { window.WeakMap = function() {}; }
+if (typeof WeakRef === 'undefined') { window.WeakRef = function(t) { this.deref = function() { return t; }; }; }
+if (typeof Symbol === 'undefined') { window.Symbol = function(d) { return '__sym_' + (d || '') + '_' + Date.now(); }; }
+if (typeof Proxy === 'undefined') { window.Proxy = function(t, h) { return t; }; }
+
+// crypto.getRandomValues stub
+window.crypto = {
+    getRandomValues: function(arr) {
+        for (var i = 0; i < arr.length; i++) arr[i] = Math.floor(Math.random() * 256);
+        return arr;
+    },
+    randomUUID: function() {
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+            var r = Math.random() * 16 | 0;
+            return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+        });
+    },
+    subtle: {}
 };
 
 // Give window EventTarget capabilities
