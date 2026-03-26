@@ -33,7 +33,7 @@ _MAX_EXTERNAL_SCRIPTS = 100
 # Maximum total script execution time (seconds)
 _MAX_SCRIPT_TIME = 30.0
 # Number of event-loop settle rounds after all scripts
-_SETTLE_ROUNDS = 5
+_SETTLE_ROUNDS = 10
 # Max macrotask wait per settle round (ms)
 _MACROTASK_WAIT_MS = 200
 
@@ -119,6 +119,13 @@ class NavigateAction(Action):
                 )
             )
 
+        # ── 5b. Fire DOMContentLoaded + load (HTML5 lifecycle) ────────
+        if js_runtime is not None and js_runtime.is_available():
+            js_runtime.dispatch_dom_content_loaded()
+            await js_runtime.drain_microtasks()
+            js_runtime.dispatch_load()
+            await js_runtime.drain_microtasks()
+
         # ── 6. Settle event loop (microtasks + macrotasks) ────────────
         await _settle_page(session, rounds=_SETTLE_ROUNDS)
 
@@ -152,7 +159,13 @@ async def _execute_scripts_full(
     base_url: str,
 ) -> tuple[int, int, int]:
     """
-    Execute all <script> tags in document order, fetching external scripts.
+    Execute all <script> tags respecting the HTML5 script execution model.
+
+    - Inline scripts execute in document order as encountered.
+    - External scripts with ``defer`` execute after all inline scripts,
+      in document order (matching real browser behavior).
+    - External scripts without ``defer`` or ``async`` execute in document
+      order at the point they're encountered (blocking).
 
     Returns ``(found, executed, external_loaded)`` counts.
     """
@@ -168,8 +181,11 @@ async def _execute_scripts_full(
         if isinstance(node, Element) and node.tag == "script":
             script_nodes.append(node)
 
+    # Separate deferred external scripts from immediate-execution scripts
+    deferred_scripts: list[Any] = []  # (node, ) pairs for defer="defer" scripts
+    immediate_scripts: list[Any] = []
+
     for node in script_nodes:
-        # Skip non-JS script tags (e.g. type="application/json", "application/ld+json")
         stype = (node.get_attribute("type") or "").lower()
         if stype and stype not in (
             "text/javascript",
@@ -180,13 +196,20 @@ async def _execute_scripts_full(
             continue
 
         src = node.get_attribute("src")
+        has_defer = node.get_attribute("defer") is not None
 
+        if src and has_defer:
+            deferred_scripts.append(node)
+        else:
+            immediate_scripts.append(node)
+
+    # Phase 1: Execute inline scripts and non-deferred external scripts
+    for node in immediate_scripts:
+        src = node.get_attribute("src")
         if src:
-            # ── External script: fetch and execute ───────────────────
             found += 1
             if external_loaded >= _MAX_EXTERNAL_SCRIPTS:
                 continue
-
             resolved_url = urljoin(base_url, src)
             try:
                 script_response = await session.network.get(
@@ -208,17 +231,13 @@ async def _execute_scripts_full(
                         if result.ok:
                             executed += 1
                         external_loaded += 1
-
-                        # Drain microtasks after each script
                         await js_runtime.drain_microtasks()
             except Exception as exc:
                 log.debug("External script fetch failed (%s): %s", resolved_url, exc)
         else:
-            # ── Inline script ────────────────────────────────────────
             code = node.text_content.strip()
             if not code:
                 continue
-
             found += 1
             result = js_runtime.load_script(code, src_hint="<inline-script>")
             if result.ok:
@@ -226,19 +245,51 @@ async def _execute_scripts_full(
             else:
                 err = result.error
                 log.debug("Inline script error: %s", err.message if err else "unknown")
-
-            # Drain microtasks after each script
             await js_runtime.drain_microtasks()
+
+    # Phase 2: Execute deferred external scripts (after all inline scripts)
+    for node in deferred_scripts:
+        src = node.get_attribute("src")
+        if not src:
+            continue
+        found += 1
+        if external_loaded >= _MAX_EXTERNAL_SCRIPTS:
+            continue
+        resolved_url = urljoin(base_url, src)
+        try:
+            script_response = await session.network.get(
+                resolved_url,
+                headers={
+                    "Sec-Fetch-Dest": "script",
+                    "Sec-Fetch-Mode": "no-cors",
+                    "Sec-Fetch-Site": "same-origin",
+                    "Referer": base_url,
+                },
+                resource_type="script",
+            )
+            if script_response.ok:
+                code = script_response.text
+                if code.strip():
+                    result = js_runtime.load_script(
+                        code, src_hint=resolved_url
+                    )
+                    if result.ok:
+                        executed += 1
+                    external_loaded += 1
+                    await js_runtime.drain_microtasks()
+        except Exception as exc:
+            log.debug("Deferred script fetch failed (%s): %s", resolved_url, exc)
 
     return found, executed, external_loaded
 
 
 async def _settle_page(session: Any, rounds: int = 5) -> None:
     """
-    Full page settle: drain microtasks, fire timers, settle network.
+    Full page settle: drain microtasks, fire timers, process fetches,
+    settle network.
 
     Runs multiple rounds to handle timer-triggered scripts that enqueue
-    more microtasks or timers.
+    more microtasks, timers, or fetch requests.
     """
     js_runtime = getattr(session, "js_runtime", None)
     scheduler = getattr(session, "scheduler", None)
@@ -258,17 +309,22 @@ async def _settle_page(session: Any, rounds: int = 5) -> None:
             if fired > 0:
                 activity = True
 
-        # 3. Drain microtasks again (macrotask callbacks may have queued promises)
+        # 3. Process pending async fetch requests
+        fetched = await _process_pending_fetches(session)
+        if fetched > 0:
+            activity = True
+
+        # 4. Drain microtasks again (macrotask/fetch callbacks may have queued promises)
         if js_runtime and js_runtime.is_available():
             drained = await js_runtime.drain_microtasks()
             if drained > 0:
                 activity = True
 
-        # 4. Network settle
+        # 5. Network settle
         if scheduler:
             await scheduler.settle_network(timeout=1.0)
 
-        # 5. DOM mutation flush
+        # 6. DOM mutation flush
         if scheduler:
             await scheduler.flush_dom_mutations()
 
@@ -277,3 +333,69 @@ async def _settle_page(session: Any, rounds: int = 5) -> None:
 
         # Small yield to let asyncio tasks run
         await asyncio.sleep(0.01)
+
+
+async def _process_pending_fetches(session: Any) -> int:
+    """
+    Process any pending async fetch requests queued by JS code.
+
+    Returns the number of fetches processed.
+    """
+    pending = getattr(session, "_pending_fetches", None)
+    if not pending:
+        return 0
+
+    network = getattr(session, "network", None)
+    if not network:
+        return 0
+
+    processed = 0
+    # Process all unresolved fetches
+    for request_id, info in list(pending.items()):
+        if info.get("resolved"):
+            continue
+
+        url = info.get("url", "")
+        method = info.get("method", "GET")
+        body_json = info.get("body_json", "null")
+        headers_json = info.get("headers_json", "null")
+
+        try:
+            import json
+            headers = json.loads(headers_json) if headers_json and headers_json != "null" else {}
+            body = json.loads(body_json) if body_json and body_json != "null" else None
+
+            if "Referer" not in headers:
+                headers["Referer"] = getattr(session, "_current_url", "") or ""
+
+            if method.upper() == "GET":
+                resp = await network.get(url, headers=headers)
+            else:
+                resp = await network.get(url, headers=headers)  # simplified
+
+            result = {
+                "ok": resp.ok,
+                "status": resp.status,
+                "text": resp.text,
+                "headers": {},
+                "url": resp.url,
+            }
+            info["resolved"] = True
+            info["result"] = result
+            processed += 1
+
+            # Resolve the JS promise via eval
+            js_runtime = getattr(session, "js_runtime", None)
+            if js_runtime and js_runtime.is_available():
+                result_json = json.dumps(result)
+                # the _py_fetch_poll will now return resolved=True
+                # but we also need to trigger any waiting code
+                await js_runtime.drain_microtasks()
+
+        except Exception as exc:
+            log.debug("Async fetch failed for %s: %s", url[:60], exc)
+            info["resolved"] = True
+            info["result"] = {"ok": False, "status": 0, "text": "", "error": str(exc)}
+            processed += 1
+
+    return processed

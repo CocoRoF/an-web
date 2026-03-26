@@ -229,6 +229,30 @@ def _register_py_callbacks(ctx: Any, session: Session) -> None:
                         return json.dumps({"prev": prev, "next": next_})
         return json.dumps({"prev": None, "next": None})
 
+    def _py_get_children(node_id: str) -> str:
+        """Return the direct children of a node as a JSON array."""
+        el = _find_element_by_id(session, node_id)
+        if el is None:
+            return "[]"
+        from an_web.dom.nodes import Element, TextNode
+        result = []
+        for child in getattr(el, "children", []):
+            if isinstance(child, Element):
+                result.append(marshal_element(child))
+            elif isinstance(child, TextNode):
+                result.append({
+                    "nodeId": child.node_id,
+                    "nodeType": 3,
+                    "tag": "#text",
+                    "tagName": "#text",
+                    "id": "",
+                    "className": "",
+                    "attributes": {},
+                    "textContent": child.data,
+                    "children": [],
+                })
+        return json.dumps(result)
+
     def _py_query_selector_in(node_id: str, selector: str) -> str:
         """querySelector scoped to the subtree of node with node_id."""
         doc = getattr(session, "_current_document", None)
@@ -318,6 +342,7 @@ def _register_py_callbacks(ctx: Any, session: Session) -> None:
     ctx.add_callable("_py_get_text_content", _py_get_text_content)
     ctx.add_callable("_py_get_parent", _py_get_parent)
     ctx.add_callable("_py_get_siblings", _py_get_siblings)
+    ctx.add_callable("_py_get_children", _py_get_children)
     ctx.add_callable("_py_query_selector_in", _py_query_selector_in)
     ctx.add_callable("_py_query_selector_all_in", _py_query_selector_all_in)
     ctx.add_callable("_py_get_forms", _py_get_forms)
@@ -560,6 +585,19 @@ def _register_py_callbacks(ctx: Any, session: Session) -> None:
         return json.dumps({"nodeId": node_id, "nodeType": 3, "data": text,
                           "textContent": text, "tag": "#text"})
 
+    def _py_create_document_fragment() -> str:
+        """Create a DocumentFragment node backed by Python."""
+        from an_web.dom.nodes import Element
+        _node_id_counter[0] += 1
+        node_id = f"js_{_node_id_counter[0]}"
+        # Use Element as backing container — fragments act as element collections
+        frag = Element(node_id=node_id, tag="#document-fragment", attributes={})
+        if not hasattr(session, "_js_created_nodes"):
+            session._js_created_nodes = {}
+        session._js_created_nodes[node_id] = frag
+        return json.dumps({"nodeId": node_id, "nodeType": 11, "tag": "",
+                          "tagName": "", "attributes": {}, "children": []})
+
     def _py_append_child(parent_id: str, child_id: str) -> bool:
         """Append child node to parent in the Python DOM tree."""
         parent = _find_node(session, parent_id)
@@ -741,6 +779,7 @@ def _register_py_callbacks(ctx: Any, session: Session) -> None:
 
     ctx.add_callable("_py_create_element", _py_create_element)
     ctx.add_callable("_py_create_text_node", _py_create_text_node)
+    ctx.add_callable("_py_create_document_fragment", _py_create_document_fragment)
     ctx.add_callable("_py_append_child", _py_append_child)
     ctx.add_callable("_py_remove_child", _py_remove_child)
     ctx.add_callable("_py_insert_before", _py_insert_before)
@@ -979,6 +1018,8 @@ EventTarget.prototype.dispatchEvent = function(event) {
 
 // ── Element proxy ─────────────────────────────────────────────────────────────
 
+var _elementIndex = 0;
+
 function _makeElement(data) {
     if (!data) return null;
     var proto = (typeof HTMLElement !== 'undefined') ? HTMLElement.prototype : EventTarget.prototype;
@@ -996,6 +1037,10 @@ function _makeElement(data) {
     el._innerHTML   = data.innerHTML || '';
     el._attributes  = data.attributes || {};
     el._children    = (data.children || []).map(_makeElement);
+    el.ownerDocument = (typeof document !== 'undefined') ? document : null;
+    el.sourceIndex  = _elementIndex++;
+    el.nodeName     = el.tagName || (el.nodeType === 3 ? '#text' : '');
+    el.nodeValue    = el.nodeType === 3 ? el._textContent : null;
 
     // textContent — getter reads from Python, setter writes back
     Object.defineProperty(el, 'textContent', {
@@ -1025,9 +1070,7 @@ function _makeElement(data) {
             el._innerHTML = String(v);
             if (el.nodeId) {
                 _py_set_inner_html(el.nodeId, String(v));
-                // Refresh children from Python
-                var updated = _safeParse(_py_query_selector_all_in(el.nodeId, '*'));
-                if (updated) el._children = updated.map(_makeElement);
+                el._childrenDirty = true;
             }
         },
         configurable: true
@@ -1189,6 +1232,52 @@ function _makeElement(data) {
         set: function(v) { el.setAttribute('placeholder', v); },
     });
 
+    // URL-derived properties for <a> and <area> elements (protocol, host, etc.)
+    // Many libraries use document.createElement('a') as a URL parser.
+    (function() {
+        function _parseURL(href) {
+            if (!href) return {protocol:'',host:'',hostname:'',port:'',pathname:'/',search:'',hash:''};
+            var m = /^([a-z][a-z0-9+.-]*:)?\/\/([^/?#]*)?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i.exec(href);
+            if (!m) {
+                // Relative or malformed — just set pathname
+                var qIdx = href.indexOf('?'), hIdx = href.indexOf('#');
+                var p = href, s = '', h = '';
+                if (qIdx >= 0) { p = href.substring(0, qIdx); s = href.substring(qIdx); }
+                if (hIdx >= 0) { h = href.substring(hIdx); if (qIdx < 0 || hIdx < qIdx) p = href.substring(0, hIdx); s = ''; }
+                return {protocol:'',host:'',hostname:'',port:'',pathname:p||'/',search:s,hash:h};
+            }
+            var proto = m[1] || '';
+            var fullHost = m[2] || '';
+            var portSep = fullHost.lastIndexOf(':');
+            var hostname = portSep >= 0 ? fullHost.substring(0, portSep) : fullHost;
+            var port = portSep >= 0 ? fullHost.substring(portSep + 1) : '';
+            return {
+                protocol: proto,
+                host: fullHost,
+                hostname: hostname,
+                port: port,
+                pathname: m[3] || '/',
+                search: m[4] || '',
+                hash: m[5] || ''
+            };
+        }
+        var urlProps = ['protocol','host','hostname','port','pathname','search','hash'];
+        for (var i = 0; i < urlProps.length; i++) {
+            (function(prop) {
+                Object.defineProperty(el, prop, {
+                    get: function() { return _parseURL(el._attributes['href'] || '')[prop]; },
+                    set: function(v) {
+                        var parts = _parseURL(el._attributes['href'] || '');
+                        parts[prop] = v;
+                        var url = parts.protocol + '//' + parts.host + parts.pathname + parts.search + parts.hash;
+                        el.setAttribute('href', url);
+                    },
+                    configurable: true
+                });
+            })(urlProps[i]);
+        }
+    })();
+
     // parentElement — lazy Python lookup
     Object.defineProperty(el, 'parentElement', {
         get: function() {
@@ -1255,21 +1344,69 @@ function _makeElement(data) {
         return el.querySelectorAll('.' + cls);
     };
 
-    // children array access
+    // children array access — dynamically fetched from Python DOM
+    // _children is used as a cache; refreshed from Python when needed
+    el._childrenDirty = true;
+    function _refreshChildren() {
+        if (el._childrenDirty && el.nodeId && el.nodeId.indexOf('_new_') < 0 && el.nodeId.indexOf('_frag_') < 0) {
+            var raw = _safeParse(_py_get_children(el.nodeId));
+            if (raw && raw.length !== undefined) {
+                el._children = raw.map(_makeElement);
+                el._childrenDirty = false;
+            }
+        }
+        return el._children;
+    }
     Object.defineProperty(el, 'children', {
-        get: function() { return el._children; }
+        get: function() { return _refreshChildren(); },
+        configurable: true
     });
     Object.defineProperty(el, 'childNodes', {
-        get: function() { return el._children; }
+        get: function() { return _refreshChildren(); },
+        configurable: true
     });
     Object.defineProperty(el, 'firstChild', {
-        get: function() { return el._children[0] || null; }
+        get: function() { var ch = _refreshChildren(); return ch[0] || null; },
+        configurable: true
     });
     Object.defineProperty(el, 'lastChild', {
-        get: function() { return el._children[el._children.length - 1] || null; }
+        get: function() { var ch = _refreshChildren(); return ch[ch.length - 1] || null; },
+        configurable: true
+    });
+    Object.defineProperty(el, 'firstElementChild', {
+        get: function() {
+            var ch = _refreshChildren();
+            for (var i = 0; i < ch.length; i++) {
+                if (ch[i] && ch[i].nodeType === 1) return ch[i];
+            }
+            return null;
+        },
+        configurable: true
+    });
+    Object.defineProperty(el, 'lastElementChild', {
+        get: function() {
+            var ch = _refreshChildren();
+            for (var i = ch.length - 1; i >= 0; i--) {
+                if (ch[i] && ch[i].nodeType === 1) return ch[i];
+            }
+            return null;
+        },
+        configurable: true
     });
     Object.defineProperty(el, 'childElementCount', {
-        get: function() { return el._children.length; }
+        get: function() {
+            var ch = _refreshChildren();
+            var count = 0;
+            for (var i = 0; i < ch.length; i++) {
+                if (ch[i] && ch[i].nodeType === 1) count++;
+            }
+            return count;
+        },
+        configurable: true
+    });
+    Object.defineProperty(el, 'hasChildNodes', {
+        value: function() { return _refreshChildren().length > 0; },
+        configurable: true
     });
 
     // Style stub
@@ -1291,15 +1428,14 @@ function _makeElement(data) {
     el.appendChild  = function(child) {
         if (child && child.nodeId && el.nodeId) {
             _py_append_child(el.nodeId, child.nodeId);
-            if (el._children.indexOf(child) < 0) el._children.push(child);
+            el._childrenDirty = true;
         }
         return child;
     };
     el.removeChild  = function(child) {
         if (child && child.nodeId && el.nodeId) {
             _py_remove_child(el.nodeId, child.nodeId);
-            var idx = el._children.indexOf(child);
-            if (idx >= 0) el._children.splice(idx, 1);
+            el._childrenDirty = true;
         }
         return child;
     };
@@ -1307,24 +1443,15 @@ function _makeElement(data) {
         if (newNode && newNode.nodeId && el.nodeId) {
             var refId = (ref && ref.nodeId) ? ref.nodeId : 'null';
             _py_insert_before(el.nodeId, newNode.nodeId, refId);
-            if (ref) {
-                var idx = el._children.indexOf(ref);
-                if (idx >= 0) el._children.splice(idx, 0, newNode);
-                else el._children.push(newNode);
-            } else {
-                el._children.push(newNode);
-            }
+            el._childrenDirty = true;
         }
         return newNode;
     };
     el.replaceChild = function(newNode, old) {
         if (old && newNode && el.nodeId) {
-            var idx = el._children.indexOf(old);
-            if (idx >= 0) {
-                _py_remove_child(el.nodeId, old.nodeId);
-                _py_append_child(el.nodeId, newNode.nodeId);
-                el._children[idx] = newNode;
-            }
+            _py_remove_child(el.nodeId, old.nodeId);
+            _py_append_child(el.nodeId, newNode.nodeId);
+            el._childrenDirty = true;
         }
         return old;
     };
@@ -1394,9 +1521,7 @@ function _makeElement(data) {
     el.insertAdjacentHTML = function(pos, html) {
         if (el.nodeId && html) {
             _py_insert_adjacent_html(el.nodeId, pos, html);
-            // Refresh children from Python DOM
-            var updated = _safeParse(_py_query_selector_all_in(el.nodeId, '*'));
-            if (updated) el._children = updated.map(_makeElement);
+            el._childrenDirty = true;
         }
     };
     el.insertAdjacentText = function(pos, text) {
@@ -1440,6 +1565,21 @@ function _makeElement(data) {
     el.scrollWidth = 0; el.scrollHeight = 0;
     el.scrollTop = 0; el.scrollLeft = 0;
     el.clientWidth = 0; el.clientHeight = 0;
+
+    // compareDocumentPosition — required by Sizzle/jQuery
+    el.compareDocumentPosition = function(other) {
+        if (!other) return 1; // DISCONNECTED
+        if (el === other) return 0;
+        // Use sourceIndex for ordering when available
+        if (typeof other.sourceIndex === 'number') {
+            if (el.sourceIndex < other.sourceIndex) return 4; // FOLLOWING
+            if (el.sourceIndex > other.sourceIndex) return 2; // PRECEDING
+        }
+        // Check containment
+        if (el.contains && el.contains(other)) return 20; // CONTAINED_BY | FOLLOWING
+        if (other.contains && other.contains(el)) return 10; // CONTAINS | PRECEDING
+        return 4; // FOLLOWING (default)
+    };
 
     return el;
 }
@@ -1513,8 +1653,42 @@ var document = (function() {
         get: function() { return doc.querySelector('head'); },
     });
     Object.defineProperty(doc, 'documentElement', {
-        get: function() { return doc.querySelector('html') || doc.querySelector('body'); },
+        get: function() { return doc.querySelector('html'); },
     });
+    Object.defineProperty(doc, 'childNodes', {
+        get: function() {
+            var de = doc.documentElement;
+            return de ? [doc.doctype, de] : [doc.doctype];
+        },
+    });
+    Object.defineProperty(doc, 'children', {
+        get: function() {
+            var de = doc.documentElement;
+            return de ? [de] : [];
+        },
+    });
+    Object.defineProperty(doc, 'firstChild', {
+        get: function() { return doc.doctype || doc.documentElement; },
+    });
+    Object.defineProperty(doc, 'lastChild', {
+        get: function() { return doc.documentElement || doc.doctype; },
+    });
+    Object.defineProperty(doc, 'firstElementChild', {
+        get: function() { return doc.documentElement; },
+    });
+    Object.defineProperty(doc, 'lastElementChild', {
+        get: function() { return doc.documentElement; },
+    });
+    Object.defineProperty(doc, 'childElementCount', {
+        get: function() { return doc.documentElement ? 1 : 0; },
+    });
+    doc.hasChildNodes = function() { return true; };
+    doc.compareDocumentPosition = function(other) {
+        if (!other) return 1;
+        if (other === doc) return 0;
+        return 20; // CONTAINED_BY | FOLLOWING
+    };
+    doc.contains = function(node) { return node !== null && node !== undefined; };
 
     doc.querySelector = function(sel) {
         var raw = _safeParse(_py_query_selector(sel));
@@ -1562,6 +1736,8 @@ var document = (function() {
         return { nodeType: 3, nodeId: '', data: text, textContent: text, nodeValue: text };
     };
     doc.createDocumentFragment = function() {
+        var raw = _safeParse(_py_create_document_fragment());
+        if (raw) return _makeElement(raw);
         return _makeElement({ nodeId: '_frag_' + Date.now(), tag: '', tagName: '', nodeType: 11, attributes: {}, children: [] });
     };
 
@@ -1623,13 +1799,6 @@ var document = (function() {
     // hasFocus
     doc.hasFocus = function() { return true; };
 
-    // contains
-    doc.contains = function(node) { return node !== null && node !== undefined; };
-
-    // importNode / adoptNode stubs
-    doc.importNode = function(node, deep) { return node; };
-    doc.adoptNode   = function(node) { return node; };
-
     return doc;
 })();
 
@@ -1682,8 +1851,8 @@ var history = (function() {
     Object.defineProperty(h, 'length', {
         get: function() { return _py_history_length(); }
     });
-    h.pushState    = function(state, title, url) { if (url) _py_win_navigate(url); };
-    h.replaceState = function(state, title, url) { if (url) _py_win_navigate(url); };
+    h.pushState    = function(state, title, url) {};
+    h.replaceState = function(state, title, url) {};
     h.back         = function() {};
     h.forward      = function() {};
     h.go           = function() {};
@@ -1958,6 +2127,48 @@ window.queueMicrotask = queueMicrotask;
 window.requestAnimationFrame = requestAnimationFrame;
 window.cancelAnimationFrame  = cancelAnimationFrame;
 window.EventTarget  = EventTarget;
+window.self = window;
+window.top  = window;
+window.parent = window;
+window.frameElement = null;
+window.frames = [];
+window.length = 0;
+
+// window needs EventTarget capabilities
+window._listeners = {};
+window.addEventListener = EventTarget.prototype.addEventListener.bind(window);
+window.removeEventListener = EventTarget.prototype.removeEventListener.bind(window);
+window.dispatchEvent = EventTarget.prototype.dispatchEvent.bind(window);
+
+// Standard event handler properties (null by default, like real browsers)
+var _eventHandlerNames = [
+    'onabort', 'onblur', 'onchange', 'onclick', 'onclose', 'oncontextmenu',
+    'ondblclick', 'onerror', 'onfocus', 'onfocusin', 'onfocusout', 'oninput',
+    'oninvalid', 'onkeydown', 'onkeypress', 'onkeyup', 'onload', 'onmousedown',
+    'onmouseenter', 'onmouseleave', 'onmousemove', 'onmouseout', 'onmouseover',
+    'onmouseup', 'onreset', 'onresize', 'onscroll', 'onselect', 'onsubmit',
+    'onunload', 'onbeforeunload', 'onhashchange', 'onmessage', 'onoffline',
+    'ononline', 'onpagehide', 'onpageshow', 'onpopstate', 'onstorage',
+    'ontouchstart', 'ontouchmove', 'ontouchend', 'ontouchcancel',
+    'onanimationend', 'onanimationiteration', 'onanimationstart',
+    'ontransitionend', 'onwheel', 'ondrag', 'ondragend', 'ondragenter',
+    'ondragleave', 'ondragover', 'ondragstart', 'ondrop', 'onpointerdown',
+    'onpointermove', 'onpointerup', 'onpointercancel', 'onpointerover',
+    'onpointerout', 'onpointerenter', 'onpointerleave', 'ongotpointercapture',
+    'onlostpointercapture', 'oncut', 'oncopy', 'onpaste', 'onbeforecut',
+    'onbeforecopy', 'onbeforepaste', 'onselectstart', 'onreadystatechange',
+];
+for (var _ehi = 0; _ehi < _eventHandlerNames.length; _ehi++) {
+    if (!(_eventHandlerNames[_ehi] in window)) {
+        window[_eventHandlerNames[_ehi]] = null;
+    }
+}
+// Also set on HTMLElement prototype so created elements have them too
+for (var _ehi2 = 0; _ehi2 < _eventHandlerNames.length; _ehi2++) {
+    if (!(_eventHandlerNames[_ehi2] in HTMLElement.prototype)) {
+        HTMLElement.prototype[_eventHandlerNames[_ehi2]] = null;
+    }
+}
 
 // ── DOM constructor stubs (for instanceof / polyfill checks) ──────────────────
 function Node() {}
@@ -2386,6 +2597,15 @@ window.KeyboardEvent = function(type, init) {
     this.keyCode = init.keyCode || 0;
 };
 window.FocusEvent = function(type, init) { window.Event.call(this, type, init); };
+window.ErrorEvent = function(type, init) {
+    window.Event.call(this, type, init);
+    init = init || {};
+    this.message = init.message || '';
+    this.filename = init.filename || '';
+    this.lineno = init.lineno || 0;
+    this.colno = init.colno || 0;
+    this.error = init.error || null;
+};
 window.InputEvent = function(type, init) {
     window.Event.call(this, type, init);
     this.data = (init || {}).data || null;

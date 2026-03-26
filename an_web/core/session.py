@@ -180,10 +180,7 @@ class Session:
             # sessionStorage is scoped to the page — clear on navigation
             self._session_storage.clear()
 
-            # Fire page lifecycle events (scripts already loaded by NavigateAction)
-            if self.js_runtime is not None:
-                self.js_runtime.dispatch_dom_content_loaded()
-                self.js_runtime.dispatch_load()
+            # DOMContentLoaded + load already fired by NavigateAction
 
             self._page_state.status = EngineStatus.IDLE
             self._page_state.dom_ready = True

@@ -99,11 +99,19 @@ def _parse_selectolax(html: str, base_url: str) -> Document:
     # stable for selectolax nodes because each attribute access creates a new
     # Python wrapper around the same C pointer.
     #
-    # The selectolax root (html element) maps to our Document so that
-    # body/head become direct children of doc.
+    # The selectolax root maps to doc for parent-chain lookups.
+    # However, we now create an actual <html> Element so that
+    # document.documentElement works in JavaScript (required by jQuery/Sizzle).
     sl_to_dom: dict[int, Node] = {}
+
+    # Create the <html> element as Document's child
+    html_el = Element(node_id=_new_id(), tag="html", attributes={})
+    html_el.visibility_state = "visible"
+    doc.register_element(html_el)
+    doc.append_child(html_el)
+
     if p.root is not None:
-        sl_to_dom[p.root.mem_id] = doc
+        sl_to_dom[p.root.mem_id] = html_el
 
     # css("*") yields elements in document order (pre-order DFS)
     for sl_node in p.css("*"):
@@ -113,12 +121,12 @@ def _parse_selectolax(html: str, base_url: str) -> Document:
 
         node_mem_id = sl_node.mem_id
 
-        # html → doc root (already mapped above, but re-register for safety)
+        # html → map to our html_el (already created above)
         if tag == "html":
-            sl_to_dom[node_mem_id] = doc
+            sl_to_dom[node_mem_id] = html_el
             continue
 
-        # head → keep as element in DOM tree so script/link tags are discoverable
+        # head → keep as element under html_el
         if tag == "head":
             attrs_h: dict[str, str] = {}
             if sl_node.attributes:
@@ -126,7 +134,7 @@ def _parse_selectolax(html: str, base_url: str) -> Document:
             head_el = Element(node_id=_new_id(), tag="head", attributes=attrs_h)
             head_el.visibility_state = "none"
             doc.register_element(head_el)
-            doc.append_child(head_el)
+            html_el.append_child(head_el)
             sl_to_dom[node_mem_id] = head_el
             continue
 
