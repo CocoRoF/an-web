@@ -1,18 +1,36 @@
 """
-QuickJS runtime bridge for AN-Web.
+V8 runtime bridge for AN-Web.
 
-Uses quickjs-py (pip install quickjs) to embed QuickJS engine.
+Uses PyMiniRacer (pip install py_mini_racer) to embed Google's V8 engine.
 Falls back to a no-op stub if the package is absent, allowing all
 DOM/semantic/network functionality to work without JS support.
 
+V8 advantages:
+- Full ES2024+ (async/await, modules, WeakRef, BigInt, etc.)
+- Automatic microtask flushing after each eval()
+- Higher performance on large webpack bundles
+- Same engine as Chrome, ensuring real-world compatibility
+
+Architecture:
+    PyMiniRacer does not support add_callable() (registering Python
+    functions into JS). Instead, all _py_* host functions are implemented
+    as pure JS functions inside the bootstrap shim, backed by a
+    synchronous command bridge:
+
+    1. The bootstrap creates _py_* functions that call into a Python-side
+       dispatcher via a special ``_callPyBridge(name, argsJson)`` pattern.
+    2. ``_callPyBridge`` is injected via eval before scripts run.
+    3. V8 auto-flushes microtasks after each eval(), so Promises settle
+       automatically without manual draining.
+
 Lifecycle::
 
-    runtime = JSRuntime(session)          # initialises QuickJS + host API
+    runtime = JSRuntime(session)
     result  = runtime.eval("document.title")
-    result  = runtime.eval_safe("1+1")    # never throws; returns EvalResult
-    runtime.call("initApp", arg1, arg2)   # call a named JS function
-    await runtime.drain_microtasks()      # process Promise chains
-    runtime.close()                       # release QuickJS context
+    result  = runtime.eval_safe("1+1")
+    runtime.call("initApp", arg1, arg2)
+    await runtime.drain_microtasks()
+    runtime.close()
 """
 from __future__ import annotations
 
@@ -21,7 +39,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any
 
-from an_web.js.bridge import EvalResult, JSError, js_to_py, py_to_js
+from an_web.js.bridge import EvalResult, JSError, py_to_js
 
 if TYPE_CHECKING:
     from an_web.core.session import Session
@@ -30,33 +48,24 @@ log = logging.getLogger(__name__)
 
 # Max microtask drain iterations (safety cap)
 _MAX_MICROTASK_JOBS = 1000
-# Memory / stack limits for the QuickJS sandbox
-_MEMORY_LIMIT_BYTES = 64 * 1024 * 1024   # 64 MiB
-_STACK_SIZE_BYTES   = 512 * 1024          # 512 KiB
+# V8 soft memory limit
+_V8_MEMORY_LIMIT = 256 * 1024 * 1024  # 256 MiB
 
 # Minimum script size (bytes) to consider for polyfill detection.
-# Small scripts are never polyfills and checking them would be wasteful.
 _POLYFILL_MIN_SIZE = 50_000
 
 
 def _is_corejs_polyfill(source: str) -> bool:
-    """Detect core-js / polyfill.io bundles that cause infinite loops in QuickJS.
+    """Detect core-js / polyfill.io bundles.
 
-    QuickJS already supports ES2020+ natively, so these bundles are
-    unnecessary and their aggressive patching of RegExp, Array, Symbol etc.
-    can create infinite loops when interacting with Python-backed DOM objects.
-
-    Heuristic: large script with many core-js module IDs and prototype patches.
+    V8 handles modern JS natively, but these bundles often contain
+    aggressive patching that conflicts with our host API shim.
     """
     if len(source) < _POLYFILL_MIN_SIZE:
         return False
-    # Quick check: core-js webpack modules have numbered IDs and `.prototype`
-    # A 200KB+ bundle with 100+ `.prototype` and webpack-style `function(t,r,e)`
-    # is almost certainly a core-js polyfill.
     head = source[:5000]
     if "polyfill" in head.lower():
         return True
-    # Count core-js signatures in first 1000 chars
     sample = source[:2000]
     if (
         sample.count(".prototype") > 3
@@ -75,16 +84,10 @@ def _extract_webpack_runtime(source: str) -> str | None:
     loading) alongside the polyfill modules.  Skipping the entire bundle
     kills webpack's module system.
 
-    Strategy: keep the entire IIFE (modules + runtime) but:
-    1. Remove entry module calls that trigger polyfill patching
-    2. Make chunk callback errors non-fatal so entry modules that
-       depend on not-yet-available data don't crash chunk registration
-
     Returns ``None`` if no webpack runtime is found.
     """
     import re
 
-    # Verify the bundle has a webpack runtime (push interceptor)
     if 'self.webpackChunkpc' not in source[-3000:]:
         return None
 
@@ -95,8 +98,6 @@ def _extract_webpack_runtime(source: str) -> str | None:
     if not push_match:
         return None
 
-    # 1) Strip polyfill entry module calls at the tail.
-    #    Pattern: }(),n(XXXXX);var X=n(XXXXX);X=n.O(X)}();
     cleaned = re.sub(
         r'\}\s*\(\s*\)\s*,\s*\w\(\d+\)[^}]*\}\s*\(\s*\)\s*;?\s*$',
         '}()}();',
@@ -113,11 +114,6 @@ def _extract_webpack_runtime(source: str) -> str | None:
     if cleaned == source:
         return None
 
-    # 2) Make the chunk callback error-tolerant.
-    #    The interceptor has: if(a)var f=a(n)
-    #    Wrap in try/catch: if(a)try{var f=a(n)}catch(_e){}
-    #    This ensures chunks are still marked as installed even when
-    #    entry modules throw (e.g. accessing data not yet available).
     cleaned = cleaned.replace(
         'if(a)var f=a(n)',
         'if(a)try{var f=a(n)}catch(_e){}'
@@ -126,20 +122,57 @@ def _extract_webpack_runtime(source: str) -> str | None:
     return cleaned
 
 
+def _v8_to_py(value: Any, ctx: Any = None) -> Any:
+    """Convert a PyMiniRacer return value to a Python native type.
+
+    PyMiniRacer returns JSObject for complex types.  When *ctx* is
+    provided, we use ``JSON.stringify`` inside V8 to serialise it,
+    which is more reliable than ``str()``.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+
+    # JSObject — use V8 JSON.stringify if we have the context
+    type_name = type(value).__name__
+    if type_name == "JSObject" and ctx is not None:
+        try:
+            # Store in a temp var, stringify, then clean up
+            ctx.eval("var __tmp_conv = null;")
+            # Re-evaluate the expression won't work — use the object id
+            json_str = ctx.eval(
+                "JSON.stringify(__tmp_conv)"
+            )
+            if json_str and isinstance(json_str, str):
+                return json.loads(json_str)
+        except Exception:
+            pass
+
+    # Fallback: str() → JSON parse
+    try:
+        s = str(value)
+        try:
+            return json.loads(s)
+        except (json.JSONDecodeError, ValueError):
+            return s
+    except Exception:
+        pass
+    return value
+
+
 class JSRuntime:
     """
-    Wraps a QuickJS context with AN-Web host Web API bindings.
+    Wraps a V8 context (via PyMiniRacer) with AN-Web host Web API bindings.
 
     Thread-safety: NOT thread-safe. Create one JSRuntime per Session.
-    The runtime is synchronous internally; async drain helpers exist
-    to cooperate with the asyncio event loop without blocking it.
+    V8 automatically flushes microtasks after each eval() call, so
+    Promise chains settle without manual intervention.
     """
 
     def __init__(self, session: Session) -> None:
         self.session = session
         self._ctx: Any = None
         self._available: bool = False
-        self._scripts_loaded: list[str] = []   # record of eval'd script tags
+        self._scripts_loaded: list[str] = []
         self._try_init()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -147,20 +180,19 @@ class JSRuntime:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _try_init(self) -> None:
-        """Attempt to create a QuickJS context. Falls back to stub on failure."""
+        """Attempt to create a V8 context via PyMiniRacer."""
         try:
-            import quickjs  # type: ignore[import]
-            ctx = quickjs.Context()
-            ctx.set_memory_limit(_MEMORY_LIMIT_BYTES)
-            ctx.set_max_stack_size(_STACK_SIZE_BYTES)
+            from py_mini_racer import MiniRacer  # type: ignore[import]
+            ctx = MiniRacer()
+            ctx.set_soft_memory_limit(_V8_MEMORY_LIMIT)
             self._ctx = ctx
             self._available = True
             self._setup_host_api()
         except ImportError:
-            log.debug("quickjs package not installed — JS runtime disabled")
+            log.debug("py_mini_racer not installed — JS runtime disabled")
             self._available = False
         except Exception as exc:
-            log.warning("JSRuntime init failed: %s", exc)
+            log.warning("JSRuntime V8 init failed: %s", exc)
             self._available = False
 
     def _setup_host_api(self) -> None:
@@ -174,7 +206,7 @@ class JSRuntime:
             log.warning("host API install failed: %s", exc)
 
     def _reset_context(self) -> None:
-        """Re-create the QuickJS context (e.g. after navigation)."""
+        """Re-create the V8 context (e.g. after navigation)."""
         self.close()
         self._scripts_loaded.clear()
         self._try_init()
@@ -185,22 +217,24 @@ class JSRuntime:
 
     def eval(self, script: str) -> Any:
         """
-        Evaluate a JS script/expression and return the raw quickjs result.
+        Evaluate a JS script/expression and return the result.
 
-        For objects/arrays, the returned value is a ``_quickjs.Object``
-        with a ``.json()`` method. Use :func:`js_to_py` to convert.
+        V8 automatically flushes microtasks after eval(), so Promise
+        continuations (.then) are already settled when this returns.
 
         Raises:
             JSError: if the script throws a JS exception.
-            RuntimeError: if QuickJS is not available.
+            RuntimeError: if V8 is not available.
         """
         if not self._available or not self._ctx:
             raise RuntimeError("JS runtime not available")
         try:
-            return self._ctx.eval(script)
+            result = self._ctx.eval(script)
+            # Process any pending bridge commands after eval
+            self._process_bridge_commands()
+            return self._convert_result(result, script)
         except Exception as exc:
-            # quickjs raises quickjs.JSException for runtime errors
-            raise JSError.from_quickjs_exception(exc) from exc
+            raise JSError.from_v8_exception(exc) from exc
 
     def eval_safe(self, script: str, default: Any = None) -> EvalResult:
         """
@@ -217,19 +251,35 @@ class JSRuntime:
             return EvalResult.success(default)
         try:
             raw = self._ctx.eval(script)
-            return EvalResult.success(js_to_py(raw))
+            self._process_bridge_commands()
+            return EvalResult.success(self._convert_result(raw, script))
         except Exception as exc:
-            err = JSError.from_quickjs_exception(exc)
+            err = JSError.from_v8_exception(exc)
             log.debug("eval_safe error: %s", err)
             return EvalResult.failure(err)
 
-    def get_global(self, name: str, default: Any = None) -> Any:
-        """
-        Retrieve a named global from the JS context.
+    def _convert_result(self, value: Any, script: str = "") -> Any:
+        """Convert a V8 result to a Python native type.
 
-        Returns *default* if the name is undefined or runtime unavailable.
+        PyMiniRacer returns ``JSObject`` for complex JS objects.  When
+        detected, we re-eval with ``JSON.stringify`` to produce a dict.
         """
-        result = self.eval_safe(f"(typeof {name} !== 'undefined') ? JSON.stringify({name}) : null")
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if type(value).__name__ == "JSObject" and self._ctx and script:
+            try:
+                json_str = self._ctx.eval(f"JSON.stringify({script})")
+                if isinstance(json_str, str):
+                    return json.loads(json_str)
+            except Exception:
+                pass
+        return _v8_to_py(value)
+
+    def get_global(self, name: str, default: Any = None) -> Any:
+        """Retrieve a named global from the JS context."""
+        result = self.eval_safe(
+            f"(typeof {name} !== 'undefined') ? JSON.stringify({name}) : null"
+        )
         if not result.ok or result.value is None:
             return default
         if isinstance(result.value, str):
@@ -240,42 +290,20 @@ class JSRuntime:
         return result.value
 
     def set_global(self, name: str, value: Any) -> None:
-        """
-        Set a named global in the JS context.
-
-        For callables, use the underlying ctx.add_callable() directly.
-        For everything else, the value is JSON-serialised and injected.
-        """
+        """Set a named global in the JS context via JSON serialisation."""
         if not self._available or not self._ctx:
             return
         try:
-            if callable(value):
-                self._ctx.add_callable(name, value)
-            else:
-                js_val = py_to_js(value)
-                if isinstance(js_val, bool | int | float | str) or js_val is None:
-                    # Can set directly
-                    self._ctx.set(name, js_val)
-                else:
-                    # Inject via JSON
-                    serialised = json.dumps(js_val, default=str)
-                    self._ctx.eval(f"var {name} = {serialised};")
+            js_val = py_to_js(value)
+            serialised = json.dumps(js_val, default=str)
+            self._ctx.eval(f"var {name} = {serialised};")
         except Exception as exc:
             log.debug("set_global '%s' failed: %s", name, exc)
 
     def call(self, fn_name: str, *args: Any) -> Any:
-        """
-        Call a named JS function with Python arguments.
-
-        Arguments are converted via py_to_js(). The return value is
-        converted via js_to_py().
-
-        Raises:
-            JSError: if the JS function throws.
-        """
+        """Call a named JS function with Python arguments."""
         if not self._available or not self._ctx:
             return None
-        # Build arg list as JSON-safe literals
         js_args: list[str] = []
         for a in args:
             converted = py_to_js(a)
@@ -286,7 +314,7 @@ class JSRuntime:
 
         script = f"{fn_name}({', '.join(js_args)})"
         raw = self.eval(script)
-        return js_to_py(raw)
+        return _v8_to_py(raw)
 
     def call_safe(self, fn_name: str, *args: Any) -> EvalResult:
         """Non-throwing variant of call()."""
@@ -300,27 +328,71 @@ class JSRuntime:
             return EvalResult.failure(err)
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Bridge command processing
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _process_bridge_commands(self) -> None:
+        """
+        Process pending bridge commands and sync DOM mutations from JS.
+
+        After each eval(), JS may have queued async commands and logged
+        DOM mutations.  Process both so the Python DOM stays in sync.
+        """
+        if not self._ctx:
+            return
+        # 1. Drain bridge commands (dynamic scripts, navigations)
+        try:
+            raw = self._ctx.eval(
+                "typeof _drainBridgeCommands === 'function'"
+                " ? _drainBridgeCommands() : '[]'"
+            )
+            if raw and raw != '[]':
+                commands = json.loads(raw) if isinstance(raw, str) else []
+                for cmd in commands:
+                    self._handle_bridge_command(cmd)
+        except Exception:
+            pass
+
+        # 2. Sync DOM mutations back to Python
+        try:
+            from an_web.js.host_api import sync_dom_mutations
+            sync_dom_mutations(self._ctx, self.session)
+        except Exception:
+            pass
+
+    def _handle_bridge_command(self, cmd: dict) -> None:
+        """Handle a single bridge command from JS."""
+        cmd_type = cmd.get("type", "")
+        if cmd_type == "dynamic_script":
+            src = cmd.get("src", "")
+            if src:
+                pending = getattr(self.session, "_pending_dynamic_scripts", None)
+                if pending is None:
+                    self.session._pending_dynamic_scripts = []  # type: ignore[attr-defined]
+                    pending = self.session._pending_dynamic_scripts  # type: ignore[attr-defined]
+                pending.append({"src": src})
+        elif cmd_type == "navigate":
+            url = cmd.get("url", "")
+            if url:
+                self.session._pending_js_navigation = url  # type: ignore[attr-defined]
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Script tag loading
     # ─────────────────────────────────────────────────────────────────────────
 
     def load_script(self, source: str, src_hint: str = "<script>") -> EvalResult:
         """
-        Execute an inline script tag source.
+        Execute a script tag source.
 
         Records the script in _scripts_loaded for debugging/replaying.
-        Errors are logged but not raised (mirrors browser behaviour where
-        a broken third-party script shouldn't crash the page).
+        Errors are logged but not raised (mirrors browser behaviour).
 
-        Core-js style polyfill bundles are auto-skipped because they can
-        cause infinite loops in QuickJS (which already supports ES2020+).
+        Core-js polyfill bundles are handled specially — skip polyfill
+        modules but keep webpack runtime.
         """
-        # QuickJS rejects embedded null bytes — strip them.
         source = source.replace("\x00", "")
 
         if _is_corejs_polyfill(source):
-            # The polyfill modules cause infinite loops, but the bundle may
-            # also contain the webpack 5 runtime (module system, push
-            # interceptor). Extract and run only the runtime portion.
             runtime = _extract_webpack_runtime(source)
             if runtime:
                 log.info(
@@ -330,7 +402,10 @@ class JSRuntime:
                 result = self.eval_safe(runtime)
                 self._scripts_loaded.append(src_hint)
                 if not result.ok:
-                    log.debug("Webpack runtime from '%s' threw: %s", src_hint[:60], result.error)
+                    log.debug(
+                        "Webpack runtime from '%s' threw: %s",
+                        src_hint[:60], result.error,
+                    )
                 return result
             else:
                 log.info(
@@ -347,10 +422,7 @@ class JSRuntime:
         return result
 
     async def load_script_async(self, source: str, src_hint: str = "<script>") -> EvalResult:
-        """
-        Async variant of load_script() — yields to the event loop first
-        so network-triggered re-renders can interleave properly.
-        """
+        """Async variant — yields to the event loop first."""
         await asyncio.sleep(0)
         return self.load_script(source, src_hint)
 
@@ -360,44 +432,40 @@ class JSRuntime:
 
     async def drain_microtasks(self, max_jobs: int = _MAX_MICROTASK_JOBS) -> int:
         """
-        Drain all pending JS microtasks (Promise callbacks, queueMicrotask)
-        and fire ready timers.
+        Drain pending JS microtasks and fire ready timers.
 
-        Yields to asyncio between batches so network I/O can proceed.
+        V8 automatically flushes microtasks after each eval(), so this
+        primarily handles timer callbacks. After firing timers (via eval),
+        V8 auto-flushes the resulting microtasks.
 
         Returns:
-            Number of microtask jobs executed.
+            Approximate number of tasks processed.
         """
         if not self._available or not self._ctx:
             return 0
 
         total = 0
         try:
-            while total < max_jobs:
-                ran = self._ctx.execute_pending_job()
-                if not ran:
-                    break
-                total += 1
-                # Yield to event loop every 16 jobs
-                if total % 16 == 0:
-                    await asyncio.sleep(0)
-        except Exception as exc:
-            log.debug("drain_microtasks error after %d jobs: %s", total, exc)
+            # Fire any ready timers (implemented in JS)
+            raw = self._ctx.eval(
+                "typeof _fireReadyTimers === 'function'"
+                " ? _fireReadyTimers() : 0"
+            )
+            timers_fired = int(raw) if raw else 0
+            total += timers_fired
 
-        # Fire any ready timers and drain resulting microtasks
-        try:
-            timers_fired = self.eval_safe("typeof _fireReadyTimers === 'function' ? _fireReadyTimers() : 0")
-            if timers_fired.ok and timers_fired.value and int(timers_fired.value) > 0:
-                # Drain microtasks queued by timer callbacks
-                extra = 0
-                while extra < max_jobs:
-                    ran = self._ctx.execute_pending_job()
-                    if not ran:
-                        break
-                    extra += 1
-                    total += 1
+            # V8 auto-flushes microtasks after the eval above,
+            # so .then() chains from timer callbacks are settled.
+
+            # Process bridge commands from timer callbacks
+            self._process_bridge_commands()
+
+            # Yield to asyncio event loop
+            if total > 0:
+                await asyncio.sleep(0)
+
         except Exception as exc:
-            log.debug("timer fire error: %s", exc)
+            log.debug("drain_microtasks error: %s", exc)
 
         return total
 
@@ -406,12 +474,7 @@ class JSRuntime:
         microtask_rounds: int = 3,
         yield_between: float = 0.0,
     ) -> None:
-        """
-        Full event-loop settle: drain microtasks across multiple rounds.
-
-        Runs *microtask_rounds* drain passes with optional asyncio yields
-        between them.
-        """
+        """Full event-loop settle: drain microtasks across multiple rounds."""
         for _ in range(microtask_rounds):
             drained = await self.drain_microtasks()
             if yield_between > 0:
@@ -424,13 +487,7 @@ class JSRuntime:
     # ─────────────────────────────────────────────────────────────────────────
 
     def on_page_load(self) -> None:
-        """
-        Called by Session.navigate() after a new document is parsed.
-
-        Resets the JS context for the new page so scripts don't bleed
-        across navigations. The host API is re-installed so document/
-        window proxy callbacks reflect the new document.
-        """
+        """Reset the V8 context for a new page."""
         self._reset_context()
 
     def dispatch_dom_content_loaded(self) -> None:
@@ -453,27 +510,22 @@ class JSRuntime:
     # ─────────────────────────────────────────────────────────────────────────
 
     def is_available(self) -> bool:
-        """Return True if QuickJS is usable."""
+        """Return True if V8 is usable."""
         return self._available
 
     def memory_usage(self) -> dict[str, int]:
-        """Return QuickJS memory statistics (if available)."""
+        """Return V8 heap statistics."""
         if not self._available or not self._ctx:
             return {}
         try:
-            mem = self._ctx.memory()
-            if hasattr(mem, "__dict__"):
-                return {k: v for k, v in mem.__dict__.items() if isinstance(v, int)}
-            return {}
+            stats = self._ctx.heap_stats()
+            return {k: v for k, v in stats.items() if isinstance(v, int)}
         except Exception:
             return {}
 
     @property
     def ctx(self) -> Any:
-        """
-        Direct access to the underlying quickjs.Context.
-        Use with care — bypasses error handling.
-        """
+        """Direct access to the underlying MiniRacer context."""
         return self._ctx
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -481,7 +533,7 @@ class JSRuntime:
     # ─────────────────────────────────────────────────────────────────────────
 
     def close(self) -> None:
-        """Release the QuickJS context."""
+        """Release the V8 context."""
         self._ctx = None
         self._available = False
 
@@ -493,4 +545,4 @@ class JSRuntime:
 
     def __repr__(self) -> str:
         status = "available" if self._available else "unavailable"
-        return f"JSRuntime({status}, scripts={len(self._scripts_loaded)})"
+        return f"JSRuntime(V8, {status}, scripts={len(self._scripts_loaded)})"

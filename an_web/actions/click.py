@@ -348,7 +348,7 @@ def _dispatch_mouse_events(element: Any, session: Any) -> list[str]:
     """
     Dispatch mousedown → mouseup → click on the element.
 
-    If a JS runtime is available, fires real DOM MouseEvents via QuickJS
+    If a JS runtime is available, fires real DOM MouseEvents via V8
     so that JS event listeners actually trigger.  Falls back to attribute
     markers (for headless DOM-only mode).
 

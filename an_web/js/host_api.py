@@ -1,24 +1,26 @@
 """
-Host Web API implementations injected into QuickJS context.
+Host Web API implementations injected into V8 context (PyMiniRacer).
 
-Architecture
-------------
-quickjs-py only supports registering Python callables (via add_callable) and
-setting primitive globals (via ctx.set). Complex browser objects like
-``document``, ``window``, ``location``, etc. are built as follows:
+Architecture (V8 mode)
+----------------------
+PyMiniRacer does not support registering Python callables into JS
+(no ``add_callable``).  Instead, all ``_py_*`` host functions are
+implemented as pure JavaScript operating on pre-injected DOM state:
 
-1. **Python callback layer**: thin Python functions handle DOM reads/writes,
-   network requests, and storage operations.
-2. **JS shim layer**: a single JS bootstrap script constructs the full API
-   surface using those callbacks, then installs it on globalThis.
-
-This two-layer approach lets the JS shim code live in Python strings for
-easy maintenance while keeping all side-effectful operations in Python.
+1. **State injection**: Python serialises the entire DOM tree and
+   session state (URL, cookies, storage) into JSON and injects it
+   into V8 as global variables.
+2. **JS bridge functions**: All ``_py_*`` functions are defined in
+   JavaScript, operating on the injected state.
+3. **JS browser shim**: The bootstrap script constructs document,
+   window, location, etc. using these bridge functions.
+4. **Mutation sync**: After script execution, Python reads a mutation
+   log from V8 and applies DOM changes back to the Python tree.
 
 Injection order:
-    1. Register all ``_py_*`` callbacks via ctx.add_callable()
-    2. Run the JS bootstrap script that builds globalThis.document,
-       globalThis.window, globalThis.location, etc.
+    1. Serialise and inject DOM tree + session state
+    2. Define all ``_py_*`` bridge functions in JS
+    3. Run the JS bootstrap that builds the browser globals
 """
 from __future__ import annotations
 
@@ -39,790 +41,184 @@ log = logging.getLogger(__name__)
 # Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-
 def install_host_api(ctx: Any, session: Session) -> None:
     """
-    Install the complete host Web API into a QuickJS context.
+    Install the complete host Web API into a V8 context (PyMiniRacer).
 
-    This is called once after Context() creation. It:
-    1. Registers all Python-backed ``_py_*`` callables.
-    2. Evaluates the JS bootstrap that builds the browser globals.
+    This is called once after MiniRacer() creation.  It:
+    1. Serialises the DOM tree and session state into JS globals.
+    2. Defines all ``_py_*`` bridge functions as pure JS.
+    3. Evaluates the JS bootstrap that builds the browser globals.
 
     Args:
-        ctx:     A ``quickjs.Context`` instance.
+        ctx:     A ``py_mini_racer.MiniRacer`` instance.
         session: The owning Session (for DOM/network/storage access).
     """
-    _register_py_callbacks(ctx, session)
+    _inject_dom_state(ctx, session)
+    _inject_session_state(ctx, session)
+    ctx.eval(_JS_PY_FUNCTIONS)
     ctx.eval(_JS_BOOTSTRAP)
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Python callback registration
+# State injection (Python → V8)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _register_py_callbacks(ctx: Any, session: Session) -> None:
-    """Register all _py_* Python functions into the QuickJS context."""
+def _inject_dom_state(ctx: Any, session: Session) -> None:
+    """Serialise the full Python DOM tree and inject it into V8."""
+    dom_json = _serialize_dom_tree(session)
+    ctx.eval(f"var _domTree = {dom_json};")
 
-    # ── Console ──────────────────────────────────────────────────────────────
-    _console_log = logging.getLogger("an_web.js.console")
 
-    def _py_console_log(*args: Any) -> None:
-        _console_log.debug(" ".join(str(a) for a in args))
+def _inject_session_state(ctx: Any, session: Session) -> None:
+    """Inject URL, cookies, storage, and other session state into V8."""
+    state_json = _serialize_session_state(session)
+    ctx.eval(f"var _sessionState = {state_json};")
 
-    def _py_console_warn(*args: Any) -> None:
-        _console_log.warning(" ".join(str(a) for a in args))
 
-    def _py_console_error(*args: Any) -> None:
-        _console_log.error(" ".join(str(a) for a in args))
+def reinject_dom_state(ctx: Any, session: Session) -> None:
+    """Re-inject DOM tree and session state after the document has changed.
 
-    ctx.add_callable("_py_console_log", _py_console_log)
-    ctx.add_callable("_py_console_warn", _py_console_warn)
-    ctx.add_callable("_py_console_error", _py_console_error)
+    Called between HTML parsing and script execution so that V8 scripts
+    see the real DOM tree rather than the empty one from context creation.
+    """
+    _inject_dom_state(ctx, session)
+    _inject_session_state(ctx, session)
 
-    # ── document ─────────────────────────────────────────────────────────────
 
-    def _py_doc_meta() -> str:
-        doc = getattr(session, "_current_document", None)
-        return json.dumps(marshal_document(doc))
+def _serialize_dom_tree(session: Session) -> str:
+    """Walk the Python DOM and return a JSON string for V8."""
+    from an_web.dom.nodes import Element, TextNode
 
-    def _py_doc_get_title() -> str:
-        doc = getattr(session, "_current_document", None)
-        return getattr(doc, "title", "") or ""
+    doc = getattr(session, "_current_document", None)
+    if doc is None:
+        return json.dumps(
+            {"nodes": {}, "rootId": None, "idIndex": {}, "tagIndex": {}}
+        )
 
-    def _py_doc_set_title(new_title: str) -> None:
-        doc = getattr(session, "_current_document", None)
-        if doc is not None:
-            doc.title = new_title
+    nodes: dict[str, Any] = {}
+    id_index: dict[str, str] = {}
+    tag_index: dict[str, list[str]] = {}
+    root_id: str | None = None
 
-    def _py_doc_get_url() -> str:
-        return getattr(session, "_current_url", "about:blank") or "about:blank"
+    for node in doc.iter_descendants():
+        if isinstance(node, Element):
+            nid = node.node_id
+            child_ids = [
+                getattr(c, "node_id", "") for c in node.children
+            ]
+            parent_id = (
+                getattr(node.parent, "node_id", None)
+                if node.parent else None
+            )
+            attrs = dict(node.attributes)
+            nodes[nid] = {
+                "nodeId": nid,
+                "nodeType": 1,
+                "tag": node.tag,
+                "tagName": node.tag.upper(),
+                "attributes": attrs,
+                "id": attrs.get("id", ""),
+                "className": attrs.get("class", ""),
+                "textContent": node.text_content or "",
+                "children": child_ids,
+                "parentId": parent_id,
+                "isInteractive": getattr(node, "is_interactive", False),
+                "visibilityState": getattr(
+                    node, "visibility_state", "visible"
+                ),
+                "semanticRole": getattr(node, "semantic_role", None),
+                "stableSelector": getattr(node, "stable_selector", None),
+            }
+            if node.tag == "html":
+                root_id = nid
+            eid = attrs.get("id", "")
+            if eid:
+                id_index[eid] = nid
+            tag_index.setdefault(node.tag, []).append(nid)
 
-    def _py_query_selector(selector: str) -> str:
-        doc = getattr(session, "_current_document", None)
-        if doc is None:
-            return "null"
-        # Document doesn't have querySelector; use SelectorEngine
-        from an_web.dom.selectors import SelectorEngine
-        engine = SelectorEngine()
-        # Strip any leading nodeId prefix added by element.querySelector
-        sel = selector.split(" ", 1)[-1] if " " in selector else selector
-        el = engine.query_selector(doc, sel)
-        if el is None:
-            return "null"
-        return json.dumps(marshal_element(el))
+        elif isinstance(node, TextNode):
+            nid = node.node_id
+            parent_id = (
+                getattr(node.parent, "node_id", None)
+                if node.parent else None
+            )
+            nodes[nid] = {
+                "nodeId": nid,
+                "nodeType": 3,
+                "tag": "#text",
+                "data": node.data,
+                "textContent": node.data,
+                "parentId": parent_id,
+            }
 
-    def _py_query_selector_all(selector: str) -> str:
-        doc = getattr(session, "_current_document", None)
-        if doc is None:
-            return "[]"
-        from an_web.dom.selectors import SelectorEngine
-        engine = SelectorEngine()
-        sel = selector.split(" ", 1)[-1] if " " in selector else selector
-        elements = engine.query_selector_all(doc, sel)
-        return json.dumps([marshal_element(e) for e in elements])
-
-    def _py_get_element_by_id(elem_id: str) -> str:
-        doc = getattr(session, "_current_document", None)
-        if doc is None:
-            return "null"
-        el = doc.get_element_by_id(elem_id)
-        if el is None:
-            return "null"
-        return json.dumps(marshal_element(el))
-
-    def _py_get_elements_by_tag(tag: str) -> str:
-        doc = getattr(session, "_current_document", None)
-        if doc is None:
-            return "[]"
-        from an_web.dom.nodes import Element
-        elements = [
-            e for e in doc.iter_descendants()
-            if isinstance(e, Element) and e.tag == tag.lower()
-        ]
-        return json.dumps([marshal_element(e) for e in elements])
-
-    def _py_get_elements_by_class(class_name: str) -> str:
-        doc = getattr(session, "_current_document", None)
-        if doc is None:
-            return "[]"
-        from an_web.dom.nodes import Element
-        elements = [
-            e for e in doc.iter_descendants()
-            if isinstance(e, Element)
-            and class_name in (e.attributes.get("class", "") or "").split()
-        ]
-        return json.dumps([marshal_element(e) for e in elements])
-
-    def _py_get_attribute(node_id: str, attr_name: str) -> str:
-        """Get attribute value for a node identified by node_id."""
-        el = _find_element_by_id(session, node_id)
-        if el is None:
-            return "null"
-        val = el.attributes.get(attr_name)
-        return json.dumps(val)
-
-    def _py_set_attribute(node_id: str, attr_name: str, value: str) -> None:
-        el = _find_element_by_id(session, node_id)
-        if el is not None:
-            el.attributes[attr_name] = value
-
-    def _py_get_inner_html(node_id: str) -> str:
-        from an_web.js.bridge import _inner_html
-        el = _find_element_by_id(session, node_id)
-        if el is None:
-            return ""
-        return _inner_html(el)
-
-    def _py_get_text_content(node_id: str) -> str:
-        el = _find_element_by_id(session, node_id)
-        if el is None:
-            return ""
-        return getattr(el, "text_content", "") or ""
-
-    def _py_remove_attribute(node_id: str, attr_name: str) -> None:
-        el = _find_element_by_id(session, node_id)
-        if el is not None:
-            el.attributes.pop(attr_name, None)
-
-    def _py_has_attribute(node_id: str, attr_name: str) -> bool:
-        el = _find_element_by_id(session, node_id)
-        if el is None:
-            return False
-        return attr_name in el.attributes
-
-    def _py_get_parent(node_id: str) -> str:
-        """Return the parent element serialised, or 'null'."""
-        doc = getattr(session, "_current_document", None)
-        if doc is None:
-            return "null"
-        from an_web.dom.nodes import Element
-        # Build child->parent map lazily
-        target = _find_element_by_id(session, node_id)
-        if target is None:
-            return "null"
-        # Walk tree to find parent
-        for node in doc.iter_descendants():
+    # Also include any JS-created nodes from a previous context
+    js_nodes = getattr(session, "_js_created_nodes", {})
+    for nid, node in js_nodes.items():
+        if nid not in nodes:
             if isinstance(node, Element):
-                for child in node.children:
-                    if getattr(child, "node_id", None) == node_id:
-                        return json.dumps(marshal_element(node))
-        return "null"
+                nodes[nid] = {
+                    "nodeId": nid, "nodeType": 1, "tag": node.tag,
+                    "tagName": node.tag.upper(),
+                    "attributes": dict(node.attributes),
+                    "id": node.attributes.get("id", ""),
+                    "className": node.attributes.get("class", ""),
+                    "textContent": node.text_content or "",
+                    "children": [
+                        getattr(c, "node_id", "") for c in node.children
+                    ],
+                    "parentId": (
+                        getattr(node.parent, "node_id", None)
+                        if node.parent else None
+                    ),
+                }
+            elif isinstance(node, TextNode):
+                nodes[nid] = {
+                    "nodeId": nid, "nodeType": 3, "tag": "#text",
+                    "data": node.data, "textContent": node.data,
+                    "parentId": (
+                        getattr(node.parent, "node_id", None)
+                        if node.parent else None
+                    ),
+                }
 
-    def _py_get_siblings(node_id: str) -> str:
-        """Return {prev, next} sibling element nodeIds (or null)."""
-        doc = getattr(session, "_current_document", None)
-        if doc is None:
-            return json.dumps({"prev": None, "next": None})
-        from an_web.dom.nodes import Element
-        for node in doc.iter_descendants():
-            if isinstance(node, Element):
-                siblings = [c for c in node.children if isinstance(c, Element)]
-                for i, child in enumerate(siblings):
-                    if child.node_id == node_id:
-                        prev = json.loads(
-                            json.dumps(marshal_element(siblings[i - 1]))
-                        ) if i > 0 else None
-                        next_ = json.loads(
-                            json.dumps(marshal_element(siblings[i + 1]))
-                        ) if i < len(siblings) - 1 else None
-                        return json.dumps({"prev": prev, "next": next_})
-        return json.dumps({"prev": None, "next": None})
+    return json.dumps(
+        {
+            "nodes": nodes,
+            "rootId": root_id,
+            "idIndex": id_index,
+            "tagIndex": tag_index,
+        },
+        default=str,
+    )
 
-    def _py_get_children(node_id: str) -> str:
-        """Return the direct children of a node as a JSON array."""
-        el = _find_element_by_id(session, node_id)
-        if el is None:
-            return "[]"
-        from an_web.dom.nodes import Element, TextNode
-        result = []
-        for child in getattr(el, "children", []):
-            if isinstance(child, Element):
-                result.append(marshal_element(child))
-            elif isinstance(child, TextNode):
-                result.append({
-                    "nodeId": child.node_id,
-                    "nodeType": 3,
-                    "tag": "#text",
-                    "tagName": "#text",
-                    "id": "",
-                    "className": "",
-                    "attributes": {},
-                    "textContent": child.data,
-                    "children": [],
-                })
-        return json.dumps(result)
 
-    def _py_query_selector_in(node_id: str, selector: str) -> str:
-        """querySelector scoped to the subtree of node with node_id."""
-        doc = getattr(session, "_current_document", None)
-        if doc is None:
-            return "null"
-        from an_web.dom.nodes import Element
-        from an_web.dom.selectors import SelectorEngine
-        root = _find_element_by_id(session, node_id)
-        if root is None:
-            return "null"
-        # Create a temporary search context over root's descendants
-        engine = SelectorEngine()
-        # Use the selector engine on full doc then filter to root's subtree
-        descendants = {n.node_id for n in root.iter_descendants() if isinstance(n, Element)}
-        all_matches = engine.query_selector_all(doc, selector)
-        for el in all_matches:
-            if el.node_id in descendants:
-                return json.dumps(marshal_element(el))
-        return "null"
+def _serialize_session_state(session: Session) -> str:
+    """Serialise URL, cookies, storage etc. for V8 injection."""
+    url = getattr(session, "_current_url", "about:blank") or "about:blank"
+    doc = getattr(session, "_current_document", None)
+    title = (getattr(doc, "title", "") or "") if doc else ""
 
-    def _py_query_selector_all_in(node_id: str, selector: str) -> str:
-        """querySelectorAll scoped to subtree of node with node_id."""
-        doc = getattr(session, "_current_document", None)
-        if doc is None:
-            return "[]"
-        from an_web.dom.nodes import Element
-        from an_web.dom.selectors import SelectorEngine
-        root = _find_element_by_id(session, node_id)
-        if root is None:
-            return "[]"
-        engine = SelectorEngine()
-        descendants = {n.node_id for n in root.iter_descendants() if isinstance(n, Element)}
-        all_matches = engine.query_selector_all(doc, selector)
-        scoped = [el for el in all_matches if el.node_id in descendants]
-        return json.dumps([marshal_element(e) for e in scoped])
+    cookies = ""
+    cookie_jar = getattr(session, "cookies", None)
+    if cookie_jar:
+        cookies = cookie_jar.cookie_header(url) or ""
 
-    def _py_get_forms() -> str:
-        """Return all <form> elements."""
-        doc = getattr(session, "_current_document", None)
-        if doc is None:
-            return "[]"
-        from an_web.dom.nodes import Element
-        forms = [
-            e for e in doc.iter_descendants()
-            if isinstance(e, Element) and e.tag == "form"
-        ]
-        return json.dumps([marshal_element(f) for f in forms])
+    local_storage = dict(getattr(session, "_local_storage", {}))
+    session_storage = dict(getattr(session, "_session_storage", {}))
+    history_length = len(getattr(session, "_history", []))
 
-    def _py_get_links() -> str:
-        """Return all <a href> elements."""
-        doc = getattr(session, "_current_document", None)
-        if doc is None:
-            return "[]"
-        from an_web.dom.nodes import Element
-        links = [
-            el for el in doc.iter_descendants()
-            if isinstance(el, Element) and el.tag == "a" and "href" in el.attributes
-        ]
-        return json.dumps([marshal_element(el) for el in links])
-
-    def _py_get_images() -> str:
-        """Return all <img> elements."""
-        doc = getattr(session, "_current_document", None)
-        if doc is None:
-            return "[]"
-        from an_web.dom.nodes import Element
-        imgs = [
-            e for e in doc.iter_descendants()
-            if isinstance(e, Element) and e.tag == "img"
-        ]
-        return json.dumps([marshal_element(i) for i in imgs])
-
-    ctx.add_callable("_py_doc_meta", _py_doc_meta)
-    ctx.add_callable("_py_doc_get_title", _py_doc_get_title)
-    ctx.add_callable("_py_doc_set_title", _py_doc_set_title)
-    ctx.add_callable("_py_doc_get_url", _py_doc_get_url)
-    ctx.add_callable("_py_query_selector", _py_query_selector)
-    ctx.add_callable("_py_query_selector_all", _py_query_selector_all)
-    ctx.add_callable("_py_get_element_by_id", _py_get_element_by_id)
-    ctx.add_callable("_py_get_elements_by_tag", _py_get_elements_by_tag)
-    ctx.add_callable("_py_get_elements_by_class", _py_get_elements_by_class)
-    ctx.add_callable("_py_get_attribute", _py_get_attribute)
-    ctx.add_callable("_py_set_attribute", _py_set_attribute)
-    ctx.add_callable("_py_remove_attribute", _py_remove_attribute)
-    ctx.add_callable("_py_has_attribute", _py_has_attribute)
-    ctx.add_callable("_py_get_inner_html", _py_get_inner_html)
-    ctx.add_callable("_py_get_text_content", _py_get_text_content)
-    ctx.add_callable("_py_get_parent", _py_get_parent)
-    ctx.add_callable("_py_get_siblings", _py_get_siblings)
-    ctx.add_callable("_py_get_children", _py_get_children)
-    ctx.add_callable("_py_query_selector_in", _py_query_selector_in)
-    ctx.add_callable("_py_query_selector_all_in", _py_query_selector_all_in)
-    ctx.add_callable("_py_get_forms", _py_get_forms)
-    ctx.add_callable("_py_get_links", _py_get_links)
-    ctx.add_callable("_py_get_images", _py_get_images)
-
-    # ── window / location / navigator ────────────────────────────────────────
-
-    def _py_win_href() -> str:
-        return getattr(session, "_current_url", "about:blank") or "about:blank"
-
-    def _py_win_navigate(url: str) -> None:
-        """Synchronous navigate — stores pending navigation for session."""
-        session._pending_js_navigation = url
-
-    def _py_history_length() -> int:
-        return len(getattr(session, "_history", []))
-
-    ctx.add_callable("_py_win_href", _py_win_href)
-    ctx.add_callable("_py_win_navigate", _py_win_navigate)
-    ctx.add_callable("_py_history_length", _py_history_length)
-
-    # ── localStorage / sessionStorage ────────────────────────────────────────
-
-    def _py_storage_get(store_name: str, key: str) -> str:
-        store = _get_storage(session, store_name)
-        val = store.get(key)
-        return json.dumps(val)
-
-    def _py_storage_set(store_name: str, key: str, value: str) -> None:
-        store = _get_storage(session, store_name)
-        store[key] = value
-
-    def _py_storage_remove(store_name: str, key: str) -> None:
-        store = _get_storage(session, store_name)
-        store.pop(key, None)
-
-    def _py_storage_clear(store_name: str) -> None:
-        store = _get_storage(session, store_name)
-        store.clear()
-
-    def _py_storage_key(store_name: str, index: int) -> str:
-        store = _get_storage(session, store_name)
-        keys = list(store.keys())
-        return json.dumps(keys[index] if index < len(keys) else None)
-
-    def _py_storage_length(store_name: str) -> int:
-        store = _get_storage(session, store_name)
-        return len(store)
-
-    ctx.add_callable("_py_storage_get", _py_storage_get)
-    ctx.add_callable("_py_storage_set", _py_storage_set)
-    ctx.add_callable("_py_storage_remove", _py_storage_remove)
-    ctx.add_callable("_py_storage_clear", _py_storage_clear)
-    ctx.add_callable("_py_storage_key", _py_storage_key)
-    ctx.add_callable("_py_storage_length", _py_storage_length)
-
-    # ── document.cookie ───────────────────────────────────────────────────────
-
-    def _py_get_cookies() -> str:
-        """Return cookie string for current URL."""
-        cookies = getattr(session, "cookies", None)
-        url = getattr(session, "_current_url", "about:blank")
-        if cookies is None:
-            return ""
-        return cookies.cookie_header(url) or ""
-
-    def _py_set_cookie(cookie_str: str) -> None:
-        """Set a cookie from JS (document.cookie = ...)."""
-        cookies = getattr(session, "cookies", None)
-        url = getattr(session, "_current_url", "about:blank")
-        if cookies is None:
-            return
-        from urllib.parse import urlparse
-
-        from an_web.net.cookies import Cookie
-        parts = [p.strip() for p in cookie_str.split(";")]
-        if not parts or not parts[0]:
-            return
-        name, _, value = parts[0].partition("=")
-        name = name.strip()
-        value = value.strip()
-        if not name:
-            return
-        domain = urlparse(url).hostname or ""
-        cookie = Cookie(name=name, value=value, domain=domain)
-        for part in parts[1:]:
-            key, _, val = part.partition("=")
-            key = key.strip().lower()
-            if key == "path":
-                cookie.path = val.strip() or "/"
-            elif key == "domain":
-                cookie.domain = val.strip().lstrip(".")
-        cookies.set(cookie)
-
-    ctx.add_callable("_py_get_cookies", _py_get_cookies)
-    ctx.add_callable("_py_set_cookie", _py_set_cookie)
-
-    # ── Timers ────────────────────────────────────────────────────────────────
-    # JS timers are stored in session._pending_timers for the scheduler
-    # to drain. We use a cooperative model: setTimeout stores the callback
-    # id + delay, and drain_microtasks() fires any whose delay <= elapsed.
-
-    _timer_registry: dict[int, tuple[float, str]] = {}
-    _timer_counter: list[int] = [0]
-    _timer_callbacks: dict[int, Any] = {}  # id -> JS function name or None
-
-    def _py_set_timeout_ms(delay_ms: float, callback_key: str) -> int:
-        _timer_counter[0] += 1
-        tid = _timer_counter[0]
-        fire_at = time.monotonic() + (delay_ms / 1000.0)
-        _timer_registry[tid] = (fire_at, callback_key)
-        # Store on session so JSRuntime can fire them
-        if not hasattr(session, "_js_timers"):
-            session._js_timers = {}  # type: ignore[attr-defined]
-        session._js_timers[tid] = (fire_at, callback_key)  # type: ignore[attr-defined]
-        return tid
-
-    def _py_clear_timeout(timer_id: int) -> None:
-        _timer_registry.pop(timer_id, None)
-        timers = getattr(session, "_js_timers", {})
-        timers.pop(timer_id, None)
-
-    def _py_get_fired_timers() -> str:
-        """Return list of timer_ids whose fire_at <= now. Used by drain loop."""
-        now = time.monotonic()
-        fired = [
-            tid for tid, (fire_at, _) in list(_timer_registry.items())
-            if fire_at <= now
-        ]
-        for tid in fired:
-            _timer_registry.pop(tid, None)
-            timers = getattr(session, "_js_timers", {})
-            timers.pop(tid, None)
-        return json.dumps(fired)
-
-    ctx.add_callable("_py_set_timeout_ms", _py_set_timeout_ms)
-    ctx.add_callable("_py_clear_timeout", _py_clear_timeout)
-    ctx.add_callable("_py_get_fired_timers", _py_get_fired_timers)
-
-    # ── fetch (sync shim using asyncio.run_until_complete) ───────────────────
-    # Real async fetch is handled by the session's network layer; this provides
-    # a synchronous bridge for script-triggered fetches within JS eval.
-
-    def _py_fetch_sync(url: str, method: str, body_json: str, headers_json: str) -> str:
-        """
-        Synchronous network request from JS. Returns JSON response dict.
-        Supports both sync (loop not running) and async (enqueue for later) modes.
-        """
-        import asyncio
-        network = getattr(session, "network", None)
-        if network is None:
-            return json.dumps({"ok": False, "status": 0, "text": "", "error": "no_network"})
-        try:
-            headers = json.loads(headers_json) if headers_json else {}
-            body = json.loads(body_json) if body_json else None
-
-            # Add browser-like headers for fetch requests
-            if "Referer" not in headers:
-                headers["Referer"] = getattr(session, "_current_url", "") or ""
-            if "Sec-Fetch-Dest" not in headers:
-                headers["Sec-Fetch-Dest"] = "empty"
-            if "Sec-Fetch-Mode" not in headers:
-                headers["Sec-Fetch-Mode"] = "cors"
-
-            # Try to run synchronously
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-
-            if loop is not None and loop.is_running():
-                # In async context: use thread to avoid blocking
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(
-                        asyncio.run,
-                        _do_fetch(network, url, method, headers, body)
-                    )
-                    try:
-                        result = future.result(timeout=10.0)
-                        return result
-                    except Exception as exc:
-                        log.debug("_py_fetch_sync thread error: %s", exc)
-                        return json.dumps({"ok": False, "status": 0, "text": "",
-                                          "error": str(exc)})
-            else:
-                loop = asyncio.new_event_loop()
-                try:
-                    result = loop.run_until_complete(
-                        _do_fetch(network, url, method, headers, body)
-                    )
-                    return result
-                finally:
-                    loop.close()
-
-        except Exception as exc:
-            log.debug("_py_fetch_sync error: %s", exc)
-            return json.dumps({"ok": False, "status": 0, "text": "", "error": str(exc)})
-
-    ctx.add_callable("_py_fetch_sync", _py_fetch_sync)
-
-    # ── Date.now() shim ───────────────────────────────────────────────────────
-    # QuickJS has Date built-in; no override needed unless we want determinism.
-
-    # ── Performance.now() ─────────────────────────────────────────────────────
-    _start_time = time.monotonic()
-
-    def _py_perf_now() -> float:
-        return (time.monotonic() - _start_time) * 1000.0
-
-    ctx.add_callable("_py_perf_now", _py_perf_now)
-
-    # ── DOM Mutation callbacks ────────────────────────────────────────────────
-    # These callbacks allow JS to actually modify the Python DOM tree.
-
-    _node_id_counter = [1000000]  # Start high to avoid collision with parser IDs
-
-    def _py_create_element(tag: str) -> str:
-        """Create a new Element in the Python DOM and return its JSON."""
-        from an_web.dom.nodes import Element
-        _node_id_counter[0] += 1
-        node_id = f"js_{_node_id_counter[0]}"
-        el = Element(node_id=node_id, tag=tag.lower(), attributes={})
-        # Store in a registry on the session for later lookup
-        if not hasattr(session, "_js_created_nodes"):
-            session._js_created_nodes = {}
-        session._js_created_nodes[node_id] = el
-        return json.dumps(marshal_element(el))
-
-    def _py_create_text_node(text: str) -> str:
-        """Create a TextNode in the Python DOM."""
-        from an_web.dom.nodes import TextNode
-        _node_id_counter[0] += 1
-        node_id = f"js_{_node_id_counter[0]}"
-        tn = TextNode(node_id=node_id, data=text)
-        if not hasattr(session, "_js_created_nodes"):
-            session._js_created_nodes = {}
-        session._js_created_nodes[node_id] = tn
-        return json.dumps({"nodeId": node_id, "nodeType": 3, "data": text,
-                          "textContent": text, "tag": "#text"})
-
-    def _py_create_document_fragment() -> str:
-        """Create a DocumentFragment node backed by Python."""
-        from an_web.dom.nodes import Element
-        _node_id_counter[0] += 1
-        node_id = f"js_{_node_id_counter[0]}"
-        # Use Element as backing container — fragments act as element collections
-        frag = Element(node_id=node_id, tag="#document-fragment", attributes={})
-        if not hasattr(session, "_js_created_nodes"):
-            session._js_created_nodes = {}
-        session._js_created_nodes[node_id] = frag
-        return json.dumps({"nodeId": node_id, "nodeType": 11, "tag": "",
-                          "tagName": "", "attributes": {}, "children": []})
-
-    def _py_append_child(parent_id: str, child_id: str) -> bool:
-        """Append child node to parent in the Python DOM tree."""
-        parent = _find_node(session, parent_id)
-        child = _find_node(session, child_id)
-        if parent is None or child is None:
-            return False
-        # Remove from old parent if already in tree
-        if child.parent is not None:
-            try:
-                child.parent.children.remove(child)
-            except ValueError:
-                pass
-        parent.append_child(child)
-        # Register in document's id map
-        from an_web.dom.nodes import Element
-        doc = getattr(session, "_current_document", None)
-        if doc and isinstance(child, Element):
-            doc.register_element(child)
-        # Queue dynamic <script src="..."> for async loading
-        _maybe_queue_dynamic_script(session, child)
-        return True
-
-    def _py_remove_child(parent_id: str, child_id: str) -> bool:
-        """Remove child node from parent in the Python DOM tree."""
-        parent = _find_node(session, parent_id)
-        child = _find_node(session, child_id)
-        if parent is None or child is None:
-            return False
-        try:
-            parent.remove_child(child)
-            return True
-        except (ValueError, Exception):
-            return False
-
-    def _py_insert_before(parent_id: str, new_id: str, ref_id: str) -> bool:
-        """Insert new_node before ref_node under parent."""
-        parent = _find_node(session, parent_id)
-        new_node = _find_node(session, new_id)
-        if parent is None or new_node is None:
-            return False
-        if not ref_id or ref_id == "null":
-            parent.append_child(new_node)
-            _maybe_queue_dynamic_script(session, new_node)
-            return True
-        ref_node = _find_node(session, ref_id)
-        if ref_node is None:
-            parent.append_child(new_node)
-            _maybe_queue_dynamic_script(session, new_node)
-            return True
-        # Remove from old parent
-        if new_node.parent is not None:
-            try:
-                new_node.parent.children.remove(new_node)
-            except ValueError:
-                pass
-        # Insert at the correct position
-        try:
-            idx = parent.children.index(ref_node)
-            new_node.parent = parent
-            parent.children.insert(idx, new_node)
-        except ValueError:
-            parent.append_child(new_node)
-        # Queue dynamic <script src="..."> for async loading
-        _maybe_queue_dynamic_script(session, new_node)
-        return True
-
-    def _py_set_inner_html(node_id: str, html_str: str) -> bool:
-        """Parse HTML string and replace node's children."""
-        from an_web.dom.nodes import Element
-        target = _find_node(session, node_id)
-        if target is None:
-            return False
-        # Clear existing children
-        target.children.clear()
-        # Parse the HTML fragment
-        if not html_str.strip():
-            return True
-        try:
-            from an_web.browser.parser import parse_html
-            doc = getattr(session, "_current_document", None)
-            base_url = getattr(session, "_current_url", "about:blank")
-            frag_doc = parse_html(f"<div>{html_str}</div>", base_url=base_url)
-            # Find the wrapper div and steal its children
-            for node in frag_doc.iter_descendants():
-                if isinstance(node, Element) and node.tag == "div":
-                    for child in list(node.children):
-                        child.parent = target
-                        target.children.append(child)
-                        if isinstance(child, Element) and doc:
-                            doc.register_element(child)
-                            # Register all descendants too
-                            for desc in child.iter_descendants():
-                                if isinstance(desc, Element):
-                                    doc.register_element(desc)
-                    break
-        except Exception as exc:
-            log.debug("_py_set_inner_html error: %s", exc)
-            return False
-        return True
-
-    def _py_set_text_content(node_id: str, text: str) -> bool:
-        """Replace node's children with a single text node."""
-        from an_web.dom.nodes import TextNode
-        target = _find_node(session, node_id)
-        if target is None:
-            return False
-        target.children.clear()
-        if text:
-            _node_id_counter[0] += 1
-            tn = TextNode(node_id=f"js_{_node_id_counter[0]}", data=text)
-            target.append_child(tn)
-        return True
-
-    def _py_insert_adjacent_html(node_id: str, position: str, html_str: str) -> bool:
-        """Insert HTML relative to a node (beforebegin/afterbegin/beforeend/afterend)."""
-        from an_web.dom.nodes import Element
-        target = _find_node(session, node_id)
-        if target is None or not html_str.strip():
-            return False
-        try:
-            from an_web.browser.parser import parse_html
-            base_url = getattr(session, "_current_url", "about:blank")
-            frag_doc = parse_html(f"<div>{html_str}</div>", base_url=base_url)
-            doc = getattr(session, "_current_document", None)
-            new_nodes = []
-            for node in frag_doc.iter_descendants():
-                if isinstance(node, Element) and node.tag == "div":
-                    new_nodes = list(node.children)
-                    break
-
-            pos = position.lower()
-            parent = target.parent
-            if pos == "beforeend":
-                for n in new_nodes:
-                    target.append_child(n)
-                    _register_deep(n, doc)
-            elif pos == "afterbegin":
-                for i, n in enumerate(new_nodes):
-                    n.parent = target
-                    target.children.insert(i, n)
-                    _register_deep(n, doc)
-            elif pos == "beforebegin" and parent:
-                idx = parent.children.index(target)
-                for i, n in enumerate(new_nodes):
-                    n.parent = parent
-                    parent.children.insert(idx + i, n)
-                    _register_deep(n, doc)
-            elif pos == "afterend" and parent:
-                idx = parent.children.index(target) + 1
-                for i, n in enumerate(new_nodes):
-                    n.parent = parent
-                    parent.children.insert(idx + i, n)
-                    _register_deep(n, doc)
-        except Exception as exc:
-            log.debug("_py_insert_adjacent_html error: %s", exc)
-            return False
-        return True
-
-    def _py_clone_node(node_id: str, deep: bool) -> str:
-        """Clone a node (optionally deep) and return its JSON."""
-        from an_web.dom.nodes import Element
-        source = _find_node(session, node_id)
-        if source is None:
-            return "null"
-        clone = _deep_clone_node(source, deep, _node_id_counter, session)
-        if clone is None:
-            return "null"
-        return json.dumps(marshal_element(clone) if isinstance(clone, Element)
-                         else {"nodeId": clone.node_id, "nodeType": 3,
-                               "data": getattr(clone, "data", ""),
-                               "textContent": getattr(clone, "data", ""),
-                               "tag": "#text"})
-
-    def _py_remove_node(node_id: str) -> bool:
-        """Remove a node from the tree."""
-        target = _find_node(session, node_id)
-        if target is None or target.parent is None:
-            return False
-        try:
-            target.parent.children.remove(target)
-            target.parent = None
-            return True
-        except ValueError:
-            return False
-
-    ctx.add_callable("_py_create_element", _py_create_element)
-    ctx.add_callable("_py_create_text_node", _py_create_text_node)
-    ctx.add_callable("_py_create_document_fragment", _py_create_document_fragment)
-    ctx.add_callable("_py_append_child", _py_append_child)
-    ctx.add_callable("_py_remove_child", _py_remove_child)
-    ctx.add_callable("_py_insert_before", _py_insert_before)
-    ctx.add_callable("_py_set_inner_html", _py_set_inner_html)
-    ctx.add_callable("_py_set_text_content", _py_set_text_content)
-    ctx.add_callable("_py_insert_adjacent_html", _py_insert_adjacent_html)
-    ctx.add_callable("_py_clone_node", _py_clone_node)
-    ctx.add_callable("_py_remove_node", _py_remove_node)
-
-    # ── Async fetch bridge ────────────────────────────────────────────────────
-    # Store pending fetch requests that will be resolved by the event loop
-
-    def _py_fetch_async(request_id: str, url: str, method: str, body_json: str, headers_json: str) -> None:
-        """Queue an async fetch request to be resolved by the event loop."""
-        if not hasattr(session, "_pending_fetches"):
-            session._pending_fetches = {}
-        session._pending_fetches[request_id] = {
+    return json.dumps(
+        {
             "url": url,
-            "method": method,
-            "body_json": body_json,
-            "headers_json": headers_json,
-            "resolved": False,
-            "result": None,
-        }
-
-    def _py_fetch_poll(request_id: str) -> str:
-        """Check if an async fetch has been resolved."""
-        fetches = getattr(session, "_pending_fetches", {})
-        entry = fetches.get(request_id)
-        if entry is None:
-            return json.dumps({"resolved": False, "error": "not_found"})
-        if entry.get("resolved"):
-            return json.dumps({"resolved": True, "result": entry["result"]})
-        return json.dumps({"resolved": False})
-
-    ctx.add_callable("_py_fetch_async", _py_fetch_async)
-    ctx.add_callable("_py_fetch_poll", _py_fetch_poll)
+            "title": title,
+            "cookies": cookies,
+            "localStorage": local_storage,
+            "sessionStorage": session_storage,
+            "historyLength": history_length,
+        },
+        default=str,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -976,6 +372,801 @@ async def _do_fetch(network: Any, url: str, method: str,
 # ─────────────────────────────────────────────────────────────────────────────
 # JS bootstrap script
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+_JS_PY_FUNCTIONS = r"""
+'use strict';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V8 Bridge Layer — Pure JS implementations of all _py_* host functions
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// In the original architecture these were Python callables registered via
+// ctx.add_callable().  PyMiniRacer (V8) does not support that, so every
+// _py_* function is now a JS function operating on pre-injected state:
+//
+//   _domTree       — full DOM tree serialised from Python
+//   _sessionState  — URL, cookies, storage, history length
+//
+// Mutations are tracked in _mutationLog and synced back to Python after
+// each eval() round.
+
+var _mutationLog   = [];
+var _bridgeCommands = [];
+var _nodeIdCounter  = 2000000;   // high start to avoid collision
+
+// ── Console ──────────────────────────────────────────────────────────────
+
+var _consoleMessages = [];
+
+function _py_console_log()  { /* no-op in V8 — output captured by _consoleMessages */ }
+function _py_console_warn() {}
+function _py_console_error(){}
+
+// ── Document metadata ────────────────────────────────────────────────────
+
+function _py_doc_meta() {
+    return JSON.stringify({
+        title:      _sessionState.title || '',
+        url:        _sessionState.url   || 'about:blank',
+        readyState: 'complete',
+        nodeType:   9,
+    });
+}
+
+function _py_doc_get_title()  { return _sessionState.title || ''; }
+function _py_doc_set_title(t) { _sessionState.title = String(t); _mutationLog.push({type:'setTitle', title:String(t)}); }
+function _py_doc_get_url()    { return _sessionState.url || 'about:blank'; }
+
+// ── CSS selector engine (minimal) ───────────────────────────────────────
+
+function _parseCompoundSelector(sel) {
+    var res = {tag:'', id:'', classes:[], attrs:[]};
+    var i = 0;
+    if (i < sel.length && /[a-zA-Z*]/.test(sel[i])) {
+        var e = i;
+        while (e < sel.length && /[a-zA-Z0-9-]/.test(sel[e])) e++;
+        res.tag = sel.substring(i, e).toLowerCase();
+        i = e;
+    }
+    while (i < sel.length) {
+        if (sel[i] === '#') {
+            i++; var e = i;
+            while (e < sel.length && /[a-zA-Z0-9_-]/.test(sel[e])) e++;
+            res.id = sel.substring(i, e); i = e;
+        } else if (sel[i] === '.') {
+            i++; var e = i;
+            while (e < sel.length && /[a-zA-Z0-9_-]/.test(sel[e])) e++;
+            res.classes.push(sel.substring(i, e)); i = e;
+        } else if (sel[i] === '[') {
+            i++; var e = sel.indexOf(']', i); if (e < 0) break;
+            var inner = sel.substring(i, e);
+            var m = inner.match(/^([a-zA-Z_:][a-zA-Z0-9_:.\-]*)\s*(~=|\^=|\$=|\*=|=)\s*["']?([^"']*)["']?$/);
+            if (m) res.attrs.push({name:m[1], op:m[2], value:m[3]});
+            else   res.attrs.push({name:inner.trim(), op:'exists'});
+            i = e + 1;
+        } else if (sel[i] === ':') {
+            // skip pseudo-selectors
+            break;
+        } else { i++; }
+    }
+    return res;
+}
+
+function _matchesSimple(nodeId, compound) {
+    var n = _domTree.nodes[nodeId];
+    if (!n || n.nodeType !== 1) return false;
+    var p = (typeof compound === 'string') ? _parseCompoundSelector(compound) : compound;
+    if (p.tag && p.tag !== '*' && n.tag !== p.tag) return false;
+    if (p.id  && (n.id || n.attributes && n.attributes.id || '') !== p.id) return false;
+    var cls = ' ' + (n.className || (n.attributes && n.attributes['class']) || '') + ' ';
+    for (var i = 0; i < p.classes.length; i++) {
+        if (cls.indexOf(' ' + p.classes[i] + ' ') < 0) return false;
+    }
+    for (var i = 0; i < p.attrs.length; i++) {
+        var a = p.attrs[i], attrs = n.attributes || {};
+        if (a.op === 'exists') { if (!(a.name in attrs)) return false; }
+        else if (a.op === '=')  { if (attrs[a.name] !== a.value) return false; }
+        else if (a.op === '~=') { if ((' '+(attrs[a.name]||'')+' ').indexOf(' '+a.value+' ')<0) return false; }
+        else if (a.op === '^=') { if (!(attrs[a.name]||'').startsWith(a.value)) return false; }
+        else if (a.op === '$=') { if (!(attrs[a.name]||'').endsWith(a.value)) return false; }
+        else if (a.op === '*=') { if ((attrs[a.name]||'').indexOf(a.value)<0) return false; }
+    }
+    return true;
+}
+
+function _isDescendantOf(nid, ancestorId) {
+    var node = _domTree.nodes[nid];
+    while (node && node.parentId) {
+        if (node.parentId === ancestorId) return true;
+        node = _domTree.nodes[node.parentId];
+    }
+    return false;
+}
+
+function _tokenizeSelector(sel) {
+    var tokens = [], cur = '', i = 0;
+    while (i < sel.length) {
+        var ch = sel[i];
+        if (ch === ' ' || ch === '>' || ch === '+' || ch === '~') {
+            if (cur.trim()) tokens.push({sel: cur.trim()});
+            var comb = ' ';
+            while (i < sel.length && ' >+~'.indexOf(sel[i]) >= 0) {
+                if (sel[i] !== ' ') comb = sel[i];
+                i++;
+            }
+            if (tokens.length > 0) tokens.push({comb: comb});
+            cur = '';
+        } else { cur += ch; i++; }
+    }
+    if (cur.trim()) tokens.push({sel: cur.trim()});
+    return tokens;
+}
+
+function _walkDescendants(rootId, fn) {
+    var node = _domTree.nodes[rootId];
+    if (!node || !node.children) return;
+    for (var i = 0; i < node.children.length; i++) {
+        fn(node.children[i]);
+        _walkDescendants(node.children[i], fn);
+    }
+}
+
+function _cssSelectAll(rootId, selector) {
+    if (!selector || !rootId) return [];
+    // comma-separated
+    if (selector.indexOf(',') >= 0) {
+        var parts = selector.split(','), results = [], seen = {};
+        for (var p = 0; p < parts.length; p++) {
+            var matches = _cssSelectAll(rootId, parts[p].trim());
+            for (var j = 0; j < matches.length; j++) {
+                if (!seen[matches[j]]) { seen[matches[j]] = true; results.push(matches[j]); }
+            }
+        }
+        return results;
+    }
+    selector = selector.trim();
+    var tokens = _tokenizeSelector(selector);
+
+    if (tokens.length === 1) {
+        // Fast path: ID lookup
+        var s = tokens[0].sel;
+        if (s[0] === '#') {
+            var nid = _domTree.idIndex[s.slice(1)];
+            if (nid && _isDescendantOf(nid, rootId)) return [nid];
+            return [];
+        }
+        // Simple walk
+        var result = [];
+        _walkDescendants(rootId, function(nid) {
+            if (_matchesSimple(nid, s)) result.push(nid);
+        });
+        return result;
+    }
+
+    // Complex: tokenised
+    var candidates = [];
+    var first = tokens[0].sel;
+    if (first[0] === '#') {
+        var nid = _domTree.idIndex[first.slice(1)];
+        if (nid && _isDescendantOf(nid, rootId)) candidates = [nid];
+    } else {
+        _walkDescendants(rootId, function(nid) {
+            if (_matchesSimple(nid, first)) candidates.push(nid);
+        });
+    }
+
+    for (var t = 1; t < tokens.length; t += 2) {
+        if (t + 1 >= tokens.length) break;
+        var comb = tokens[t].comb, next = tokens[t+1].sel;
+        var newCands = [];
+        for (var c = 0; c < candidates.length; c++) {
+            var cid = candidates[c];
+            if (comb === '>') {
+                var cn = _domTree.nodes[cid];
+                if (cn && cn.children) {
+                    for (var k = 0; k < cn.children.length; k++) {
+                        if (_matchesSimple(cn.children[k], next)) newCands.push(cn.children[k]);
+                    }
+                }
+            } else {
+                _walkDescendants(cid, function(nid) {
+                    if (_matchesSimple(nid, next)) newCands.push(nid);
+                });
+            }
+        }
+        candidates = newCands;
+    }
+    return candidates;
+}
+
+function _cssSelectOne(rootId, selector) {
+    var all = _cssSelectAll(rootId, selector);
+    return all.length > 0 ? all[0] : null;
+}
+
+function _nodeToJson(nodeId) {
+    var n = _domTree.nodes[nodeId];
+    return n ? JSON.stringify(n) : 'null';
+}
+
+function _nodesToJson(nodeIds) {
+    var arr = [];
+    for (var i = 0; i < nodeIds.length; i++) {
+        var n = _domTree.nodes[nodeIds[i]];
+        if (n) arr.push(n);
+    }
+    return JSON.stringify(arr);
+}
+
+// ── Document queries ─────────────────────────────────────────────────────
+
+function _py_query_selector(selector) {
+    var nid = _cssSelectOne(_domTree.rootId, selector);
+    return nid ? _nodeToJson(nid) : 'null';
+}
+
+function _py_query_selector_all(selector) {
+    var nids = _cssSelectAll(_domTree.rootId, selector);
+    return _nodesToJson(nids);
+}
+
+function _py_get_element_by_id(elemId) {
+    var nid = _domTree.idIndex[elemId];
+    return nid ? _nodeToJson(nid) : 'null';
+}
+
+function _py_get_elements_by_tag(tag) {
+    tag = tag.toLowerCase();
+    var nids = _domTree.tagIndex[tag] || [];
+    return _nodesToJson(nids);
+}
+
+function _py_get_elements_by_class(className) {
+    var result = [];
+    _walkDescendants(_domTree.rootId, function(nid) {
+        var n = _domTree.nodes[nid];
+        if (n && n.nodeType === 1) {
+            var cls = ' ' + (n.className || (n.attributes && n.attributes['class']) || '') + ' ';
+            if (cls.indexOf(' ' + className + ' ') >= 0) result.push(nid);
+        }
+    });
+    return _nodesToJson(result);
+}
+
+// ── Scoped queries ───────────────────────────────────────────────────────
+
+function _py_query_selector_in(nodeId, selector) {
+    var nid = _cssSelectOne(nodeId, selector);
+    return nid ? _nodeToJson(nid) : 'null';
+}
+
+function _py_query_selector_all_in(nodeId, selector) {
+    var nids = _cssSelectAll(nodeId, selector);
+    return _nodesToJson(nids);
+}
+
+// ── Element attribute access ─────────────────────────────────────────────
+
+function _py_get_attribute(nodeId, attrName) {
+    var n = _domTree.nodes[nodeId];
+    if (!n || !n.attributes) return 'null';
+    var v = n.attributes[attrName];
+    return v !== undefined ? JSON.stringify(v) : 'null';
+}
+
+function _py_set_attribute(nodeId, attrName, value) {
+    var n = _domTree.nodes[nodeId];
+    if (!n) return;
+    if (!n.attributes) n.attributes = {};
+    n.attributes[attrName] = value;
+    if (attrName === 'id')    { n.id = value; _domTree.idIndex[value] = nodeId; }
+    if (attrName === 'class') { n.className = value; }
+    _mutationLog.push({type:'setAttribute', nodeId:nodeId, name:attrName, value:value});
+}
+
+function _py_remove_attribute(nodeId, attrName) {
+    var n = _domTree.nodes[nodeId];
+    if (n && n.attributes) {
+        delete n.attributes[attrName];
+        if (attrName === 'id')    n.id = '';
+        if (attrName === 'class') n.className = '';
+    }
+    _mutationLog.push({type:'removeAttribute', nodeId:nodeId, name:attrName});
+}
+
+function _py_has_attribute(nodeId, attrName) {
+    var n = _domTree.nodes[nodeId];
+    return !!(n && n.attributes && attrName in n.attributes);
+}
+
+// ── Text / innerHTML ─────────────────────────────────────────────────────
+
+function _computeTextContent(nodeId) {
+    var n = _domTree.nodes[nodeId];
+    if (!n) return '';
+    if (n.nodeType === 3) return n.data || '';
+    var txt = '';
+    if (n.children) {
+        for (var i = 0; i < n.children.length; i++) txt += _computeTextContent(n.children[i]);
+    }
+    return txt;
+}
+
+function _py_get_text_content(nodeId) {
+    return _computeTextContent(nodeId);
+}
+
+function _nodeToHtml(nodeId) {
+    var n = _domTree.nodes[nodeId];
+    if (!n) return '';
+    if (n.nodeType === 3) return n.data || '';
+    var attrs = '';
+    if (n.attributes) { for (var k in n.attributes) attrs += ' ' + k + '="' + n.attributes[k] + '"'; }
+    var inner = '';
+    if (n.children) { for (var i = 0; i < n.children.length; i++) inner += _nodeToHtml(n.children[i]); }
+    return '<' + n.tag + attrs + '>' + inner + '</' + n.tag + '>';
+}
+
+function _py_get_inner_html(nodeId) {
+    var n = _domTree.nodes[nodeId];
+    if (!n || !n.children) return '';
+    var html = '';
+    for (var i = 0; i < n.children.length; i++) html += _nodeToHtml(n.children[i]);
+    return html;
+}
+
+function _py_set_text_content(nodeId, text) {
+    var n = _domTree.nodes[nodeId];
+    if (!n) return false;
+    n.children = [];
+    n.textContent = text;
+    if (text) {
+        _nodeIdCounter++;
+        var tnId = 'js_' + _nodeIdCounter;
+        var tn = {nodeId:tnId, nodeType:3, tag:'#text', data:text, textContent:text, parentId:nodeId};
+        _domTree.nodes[tnId] = tn;
+        n.children.push(tnId);
+    }
+    _mutationLog.push({type:'setTextContent', nodeId:nodeId, text:text});
+    return true;
+}
+
+// ── Minimal HTML fragment parser ─────────────────────────────────────────
+
+function _parseHtmlFragment(html) {
+    var nodes = [], pos = 0;
+    var voidTags = {br:1,hr:1,img:1,input:1,link:1,meta:1,area:1,base:1,col:1,embed:1,param:1,source:1,track:1,wbr:1};
+    while (pos < html.length) {
+        if (html[pos] === '<') {
+            if (html[pos+1] === '/') { // skip close tags
+                var gt = html.indexOf('>', pos);
+                pos = gt >= 0 ? gt + 1 : html.length;
+                continue;
+            }
+            if (html.substring(pos, pos+4) === '<!--') { // skip comments
+                var endC = html.indexOf('-->', pos);
+                pos = endC >= 0 ? endC + 3 : html.length;
+                continue;
+            }
+            var gt = html.indexOf('>', pos);
+            if (gt < 0) break;
+            var tagContent = html.substring(pos+1, gt);
+            var selfClose = tagContent[tagContent.length-1] === '/';
+            if (selfClose) tagContent = tagContent.slice(0,-1);
+            var spIdx = tagContent.search(/\s/);
+            var tagName = (spIdx >= 0 ? tagContent.slice(0,spIdx) : tagContent).toLowerCase().trim();
+            var attrStr = spIdx >= 0 ? tagContent.slice(spIdx) : '';
+            if (!tagName || tagName[0] === '!' || tagName[0] === '?') { pos = gt+1; continue; }
+            var attrs = {};
+            var attrRe = /\s+([a-zA-Z_:][a-zA-Z0-9_:.\-]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+)))?/g;
+            var am;
+            while ((am = attrRe.exec(attrStr)) !== null) {
+                attrs[am[1]] = am[2] !== undefined ? am[2] : (am[3] !== undefined ? am[3] : (am[4] || ''));
+            }
+            _nodeIdCounter++;
+            var newNode = {
+                nodeId:'js_'+_nodeIdCounter, nodeType:1, tag:tagName, tagName:tagName.toUpperCase(),
+                attributes:attrs, id:attrs.id||'', className:attrs['class']||'',
+                textContent:'', children:[], parentId:null
+            };
+            _domTree.nodes[newNode.nodeId] = newNode;
+            if (newNode.id) _domTree.idIndex[newNode.id] = newNode.nodeId;
+            if (!_domTree.tagIndex[tagName]) _domTree.tagIndex[tagName] = [];
+            _domTree.tagIndex[tagName].push(newNode.nodeId);
+            nodes.push(newNode);
+            pos = gt + 1;
+            if (selfClose || voidTags[tagName]) continue;
+            // Find matching close tag
+            var depth = 1, searchPos = pos;
+            while (depth > 0 && searchPos < html.length) {
+                var nextOpen = html.indexOf('<' + tagName, searchPos);
+                var nextClose = html.indexOf('</' + tagName, searchPos);
+                if (nextClose < 0) break;
+                if (nextOpen >= 0 && nextOpen < nextClose) {
+                    depth++;
+                    searchPos = nextOpen + tagName.length + 1;
+                } else {
+                    depth--;
+                    if (depth === 0) {
+                        var innerH = html.substring(pos, nextClose);
+                        var innerChildren = _parseHtmlFragment(innerH);
+                        for (var j = 0; j < innerChildren.length; j++) {
+                            innerChildren[j].parentId = newNode.nodeId;
+                            newNode.children.push(innerChildren[j].nodeId);
+                        }
+                        pos = html.indexOf('>', nextClose) + 1;
+                        if (pos === 0) pos = html.length;
+                    } else {
+                        searchPos = nextClose + tagName.length + 2;
+                    }
+                }
+            }
+        } else {
+            var nextTag = html.indexOf('<', pos);
+            var text = nextTag >= 0 ? html.substring(pos, nextTag) : html.substring(pos);
+            if (text.trim()) {
+                _nodeIdCounter++;
+                var tn = {nodeId:'js_'+_nodeIdCounter, nodeType:3, tag:'#text',
+                          data:text, textContent:text, parentId:null};
+                _domTree.nodes[tn.nodeId] = tn;
+                nodes.push(tn);
+            }
+            pos = nextTag >= 0 ? nextTag : html.length;
+        }
+    }
+    return nodes;
+}
+
+function _py_set_inner_html(nodeId, html) {
+    var n = _domTree.nodes[nodeId];
+    if (!n) return false;
+    n.children = [];
+    if (html && html.trim()) {
+        var newNodes = _parseHtmlFragment(html);
+        for (var i = 0; i < newNodes.length; i++) {
+            newNodes[i].parentId = nodeId;
+            n.children.push(newNodes[i].nodeId);
+        }
+    }
+    _mutationLog.push({type:'setInnerHTML', nodeId:nodeId, html:html||''});
+    return true;
+}
+
+// ── Tree navigation ──────────────────────────────────────────────────────
+
+function _py_get_parent(nodeId) {
+    var n = _domTree.nodes[nodeId];
+    if (!n || !n.parentId) return 'null';
+    return _nodeToJson(n.parentId);
+}
+
+function _py_get_siblings(nodeId) {
+    var n = _domTree.nodes[nodeId];
+    if (!n || !n.parentId) return JSON.stringify({prev:null, next:null});
+    var parent = _domTree.nodes[n.parentId];
+    if (!parent || !parent.children) return JSON.stringify({prev:null, next:null});
+    var idx = parent.children.indexOf(nodeId);
+    var prev = null, next = null;
+    for (var i = idx-1; i >= 0; i--) {
+        var s = _domTree.nodes[parent.children[i]];
+        if (s && s.nodeType === 1) { prev = s; break; }
+    }
+    for (var i = idx+1; i < parent.children.length; i++) {
+        var s = _domTree.nodes[parent.children[i]];
+        if (s && s.nodeType === 1) { next = s; break; }
+    }
+    return JSON.stringify({prev:prev, next:next});
+}
+
+function _py_get_children(nodeId) {
+    var n = _domTree.nodes[nodeId];
+    if (!n || !n.children) return '[]';
+    var result = [];
+    for (var i = 0; i < n.children.length; i++) {
+        var child = _domTree.nodes[n.children[i]];
+        if (child) result.push(child);
+    }
+    return JSON.stringify(result);
+}
+
+// ── DOM collections ──────────────────────────────────────────────────────
+
+function _py_get_forms()  { return _nodesToJson(_domTree.tagIndex['form'] || []); }
+function _py_get_links()  {
+    var tags = _domTree.tagIndex['a'] || [], result = [];
+    for (var i = 0; i < tags.length; i++) {
+        var n = _domTree.nodes[tags[i]];
+        if (n && n.attributes && n.attributes.href !== undefined) result.push(tags[i]);
+    }
+    return _nodesToJson(result);
+}
+function _py_get_images() { return _nodesToJson(_domTree.tagIndex['img'] || []); }
+
+// ── DOM mutation ─────────────────────────────────────────────────────────
+
+function _py_create_element(tag) {
+    _nodeIdCounter++;
+    var nodeId = 'js_' + _nodeIdCounter;
+    tag = tag.toLowerCase();
+    var node = {
+        nodeId:nodeId, nodeType:1, tag:tag, tagName:tag.toUpperCase(),
+        attributes:{}, id:'', className:'', textContent:'', innerHTML:'',
+        children:[], parentId:null, isInteractive:false, visibilityState:'visible',
+        semanticRole:null, stableSelector:null
+    };
+    _domTree.nodes[nodeId] = node;
+    if (!_domTree.tagIndex[tag]) _domTree.tagIndex[tag] = [];
+    _domTree.tagIndex[tag].push(nodeId);
+    _mutationLog.push({type:'createElement', nodeId:nodeId, tag:tag});
+    return JSON.stringify(node);
+}
+
+function _py_create_text_node(text) {
+    _nodeIdCounter++;
+    var nodeId = 'js_' + _nodeIdCounter;
+    var node = {nodeId:nodeId, nodeType:3, tag:'#text', data:text, textContent:text, parentId:null};
+    _domTree.nodes[nodeId] = node;
+    _mutationLog.push({type:'createTextNode', nodeId:nodeId, text:text});
+    return JSON.stringify(node);
+}
+
+function _py_create_document_fragment() {
+    _nodeIdCounter++;
+    var nodeId = 'js_' + _nodeIdCounter;
+    var node = {nodeId:nodeId, nodeType:11, tag:'#document-fragment', tagName:'',
+                attributes:{}, children:[], parentId:null};
+    _domTree.nodes[nodeId] = node;
+    return JSON.stringify(node);
+}
+
+function _py_append_child(parentId, childId) {
+    var parent = _domTree.nodes[parentId], child = _domTree.nodes[childId];
+    if (!parent || !child) return false;
+    // Remove from old parent
+    if (child.parentId) {
+        var old = _domTree.nodes[child.parentId];
+        if (old && old.children) {
+            var idx = old.children.indexOf(childId);
+            if (idx >= 0) old.children.splice(idx, 1);
+        }
+    }
+    if (!parent.children) parent.children = [];
+    parent.children.push(childId);
+    child.parentId = parentId;
+    if (child.id) _domTree.idIndex[child.id] = childId;
+    _mutationLog.push({type:'appendChild', parentId:parentId, childId:childId});
+    // Queue dynamic script
+    if (child.tag === 'script' && child.attributes && child.attributes.src) {
+        _bridgeCommands.push({type:'dynamic_script', src:child.attributes.src});
+    }
+    return true;
+}
+
+function _py_remove_child(parentId, childId) {
+    var parent = _domTree.nodes[parentId];
+    if (!parent || !parent.children) return false;
+    var idx = parent.children.indexOf(childId);
+    if (idx >= 0) {
+        parent.children.splice(idx, 1);
+        var child = _domTree.nodes[childId];
+        if (child) child.parentId = null;
+        _mutationLog.push({type:'removeChild', parentId:parentId, childId:childId});
+        return true;
+    }
+    return false;
+}
+
+function _py_insert_before(parentId, newId, refId) {
+    var parent = _domTree.nodes[parentId], newNode = _domTree.nodes[newId];
+    if (!parent || !newNode) return false;
+    if (newNode.parentId) {
+        var old = _domTree.nodes[newNode.parentId];
+        if (old && old.children) {
+            var idx = old.children.indexOf(newId);
+            if (idx >= 0) old.children.splice(idx, 1);
+        }
+    }
+    if (!parent.children) parent.children = [];
+    if (!refId || refId === 'null') {
+        parent.children.push(newId);
+    } else {
+        var ri = parent.children.indexOf(refId);
+        if (ri >= 0) parent.children.splice(ri, 0, newId);
+        else parent.children.push(newId);
+    }
+    newNode.parentId = parentId;
+    if (newNode.id) _domTree.idIndex[newNode.id] = newId;
+    _mutationLog.push({type:'insertBefore', parentId:parentId, newId:newId, refId:refId||'null'});
+    if (newNode.tag === 'script' && newNode.attributes && newNode.attributes.src) {
+        _bridgeCommands.push({type:'dynamic_script', src:newNode.attributes.src});
+    }
+    return true;
+}
+
+function _py_insert_adjacent_html(nodeId, position, html) {
+    var n = _domTree.nodes[nodeId];
+    if (!n || !html || !html.trim()) return false;
+    var newNodes = _parseHtmlFragment(html);
+    var pos = position.toLowerCase();
+    var parent = n.parentId ? _domTree.nodes[n.parentId] : null;
+    if (pos === 'beforeend') {
+        if (!n.children) n.children = [];
+        for (var i = 0; i < newNodes.length; i++) {
+            newNodes[i].parentId = nodeId;
+            n.children.push(newNodes[i].nodeId);
+        }
+    } else if (pos === 'afterbegin') {
+        if (!n.children) n.children = [];
+        for (var i = newNodes.length-1; i >= 0; i--) {
+            newNodes[i].parentId = nodeId;
+            n.children.unshift(newNodes[i].nodeId);
+        }
+    } else if (pos === 'beforebegin' && parent && parent.children) {
+        var idx = parent.children.indexOf(nodeId);
+        if (idx >= 0) {
+            for (var i = 0; i < newNodes.length; i++) {
+                newNodes[i].parentId = n.parentId;
+                parent.children.splice(idx+i, 0, newNodes[i].nodeId);
+            }
+        }
+    } else if (pos === 'afterend' && parent && parent.children) {
+        var idx = parent.children.indexOf(nodeId) + 1;
+        for (var i = 0; i < newNodes.length; i++) {
+            newNodes[i].parentId = n.parentId;
+            parent.children.splice(idx+i, 0, newNodes[i].nodeId);
+        }
+    }
+    _mutationLog.push({type:'insertAdjacentHTML', nodeId:nodeId, position:position, html:html});
+    return true;
+}
+
+function _py_clone_node(nodeId, deep) {
+    function _clone(nid, doDeep) {
+        var n = _domTree.nodes[nid];
+        if (!n) return null;
+        _nodeIdCounter++;
+        var newId = 'js_' + _nodeIdCounter;
+        var clone = JSON.parse(JSON.stringify(n));
+        clone.nodeId = newId;
+        clone.parentId = null;
+        clone.children = [];
+        _domTree.nodes[newId] = clone;
+        if (doDeep && n.children) {
+            for (var i = 0; i < n.children.length; i++) {
+                var cc = _clone(n.children[i], true);
+                if (cc) { cc.parentId = newId; clone.children.push(cc.nodeId); }
+            }
+        }
+        return clone;
+    }
+    var clone = _clone(nodeId, !!deep);
+    return clone ? JSON.stringify(clone) : 'null';
+}
+
+function _py_remove_node(nodeId) {
+    var n = _domTree.nodes[nodeId];
+    if (!n || !n.parentId) return false;
+    var parent = _domTree.nodes[n.parentId];
+    if (!parent || !parent.children) return false;
+    var idx = parent.children.indexOf(nodeId);
+    if (idx >= 0) {
+        parent.children.splice(idx, 1);
+        n.parentId = null;
+        _mutationLog.push({type:'removeNode', nodeId:nodeId});
+        return true;
+    }
+    return false;
+}
+
+// ── Window / navigation ──────────────────────────────────────────────────
+
+function _py_win_href()       { return _sessionState.url || 'about:blank'; }
+function _py_win_navigate(url){ _bridgeCommands.push({type:'navigate', url:url}); }
+function _py_history_length() { return _sessionState.historyLength || 1; }
+
+// ── Storage ──────────────────────────────────────────────────────────────
+
+function _py_storage_get(store, key) {
+    var s = store === 'local' ? _sessionState.localStorage : _sessionState.sessionStorage;
+    return s[key] !== undefined ? JSON.stringify(s[key]) : 'null';
+}
+function _py_storage_set(store, key, value) {
+    var s = store === 'local' ? _sessionState.localStorage : _sessionState.sessionStorage;
+    s[key] = value;
+}
+function _py_storage_remove(store, key) {
+    var s = store === 'local' ? _sessionState.localStorage : _sessionState.sessionStorage;
+    delete s[key];
+}
+function _py_storage_clear(store) {
+    if (store === 'local') _sessionState.localStorage = {};
+    else _sessionState.sessionStorage = {};
+}
+function _py_storage_key(store, index) {
+    var s = store === 'local' ? _sessionState.localStorage : _sessionState.sessionStorage;
+    var keys = Object.keys(s);
+    return index < keys.length ? JSON.stringify(keys[index]) : 'null';
+}
+function _py_storage_length(store) {
+    var s = store === 'local' ? _sessionState.localStorage : _sessionState.sessionStorage;
+    return Object.keys(s).length;
+}
+
+// ── Cookies ──────────────────────────────────────────────────────────────
+
+function _py_get_cookies() { return _sessionState.cookies || ''; }
+function _py_set_cookie(cookieStr) {
+    _mutationLog.push({type:'setCookie', cookie:cookieStr});
+    var pair = cookieStr.split(';')[0];
+    if (_sessionState.cookies) _sessionState.cookies += '; ' + pair;
+    else _sessionState.cookies = pair;
+}
+
+// ── Timers ───────────────────────────────────────────────────────────────
+
+var _timerRegistry = {};
+var _timerCounter  = 0;
+
+function _py_set_timeout_ms(delayMs, callbackKey) {
+    _timerCounter++;
+    var tid = _timerCounter;
+    _timerRegistry[tid] = {fireAt: Date.now() + delayMs, key: callbackKey};
+    return tid;
+}
+function _py_clear_timeout(timerId) { delete _timerRegistry[timerId]; }
+function _py_get_fired_timers() {
+    var now = Date.now(), fired = [];
+    for (var tid in _timerRegistry) {
+        if (_timerRegistry[tid].fireAt <= now) {
+            fired.push(parseInt(tid));
+            delete _timerRegistry[tid];
+        }
+    }
+    return JSON.stringify(fired);
+}
+
+// ── Fetch ────────────────────────────────────────────────────────────────
+// Synchronous fetch is not possible in V8.  The JS fetch() function
+// returns a Promise; the bridge queues requests for Python to resolve.
+
+function _py_fetch_sync(url, method, bodyJson, headersJson) {
+    // For synchronous callers (XHR), queue and return empty response
+    _bridgeCommands.push({type:'fetch', url:url, method:method, bodyJson:bodyJson, headersJson:headersJson});
+    return JSON.stringify({ok:false, status:0, text:'', error:'v8_async_only'});
+}
+
+var _resolvedFetches = {};
+
+function _py_fetch_async(requestId, url, method, bodyJson, headersJson) {
+    _bridgeCommands.push({type:'fetch_async', id:requestId, url:url, method:method, bodyJson:bodyJson, headersJson:headersJson});
+}
+function _py_fetch_poll(requestId) {
+    var r = _resolvedFetches[requestId];
+    if (r) return JSON.stringify({resolved:true, result:r});
+    return JSON.stringify({resolved:false});
+}
+
+// ── Performance ──────────────────────────────────────────────────────────
+
+var _perfStart = Date.now();
+function _py_perf_now() { return Date.now() - _perfStart; }
+
+// ── Bridge drains (called by Python after eval) ─────────────────────────
+
+function _drainBridgeCommands() {
+    var cmds = JSON.stringify(_bridgeCommands);
+    _bridgeCommands = [];
+    return cmds;
+}
+
+function _getMutationLog() {
+    var log = JSON.stringify(_mutationLog);
+    _mutationLog = [];
+    return log;
+}
+"""
+
 
 _JS_BOOTSTRAP = r"""
 'use strict';
@@ -1678,7 +1869,13 @@ var document = (function() {
         get: function() { return doc.querySelector('head'); },
     });
     Object.defineProperty(doc, 'documentElement', {
-        get: function() { return doc.querySelector('html'); },
+        get: function() {
+            if (_domTree.rootId) {
+                var raw = _nodeToJson(_domTree.rootId);
+                return raw ? _makeElement(JSON.parse(raw)) : null;
+            }
+            return null;
+        },
     });
     Object.defineProperty(doc, 'childNodes', {
         get: function() {
@@ -2506,7 +2703,7 @@ window.matchMedia = function(query) {
 };
 window.getSelection = function() { return new Selection(); };
 
-// URL / URLSearchParams polyfill (QuickJS has no browser globals)
+// URL / URLSearchParams polyfill (V8 via PyMiniRacer has no browser globals)
 var URL = (typeof URL !== 'undefined') ? URL : (function() {
     function URL(href, base) {
         if (base && !/^[a-z][a-z0-9+\-.]*:/i.test(href)) {
@@ -2699,7 +2896,7 @@ window.btoa = function(s) {
     return o;
 };
 
-// Map, Set, WeakMap, WeakSet - already in QuickJS but check
+// Map, Set, WeakMap, WeakSet - already in V8 but check
 if (typeof Map === 'undefined') { window.Map = function() { this._data = {}; }; }
 if (typeof Set === 'undefined') { window.Set = function() { this._data = []; }; }
 if (typeof WeakMap === 'undefined') { window.WeakMap = function() {}; }
@@ -2745,3 +2942,255 @@ def build_host_globals(session: Session) -> dict[str, Any]:
     handles everything directly on the ctx. Kept for API compatibility.
     """
     return {}
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DOM mutation sync (V8 → Python)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def sync_dom_mutations(ctx: Any, session: Any) -> None:
+    """
+    Read the mutation log from V8 and apply changes to the Python DOM.
+
+    Call this after every script evaluation to keep the Python DOM in
+    sync with the JS-side DOM tree.
+    """
+    try:
+        raw = ctx.eval(
+            "typeof _getMutationLog === 'function' ? _getMutationLog() : '[]'"
+        )
+        if not raw or raw == "[]":
+            return
+        mutations = json.loads(raw) if isinstance(raw, str) else []
+    except Exception:
+        return
+
+    from an_web.dom.nodes import Element, TextNode
+
+    for mut in mutations:
+        mt = mut.get("type", "")
+        try:
+            if mt == "createElement":
+                nid = mut["nodeId"]
+                tag = mut["tag"]
+                el = Element(node_id=nid, tag=tag, attributes={})
+                if not hasattr(session, "_js_created_nodes"):
+                    session._js_created_nodes = {}
+                session._js_created_nodes[nid] = el
+
+            elif mt == "createTextNode":
+                nid = mut["nodeId"]
+                text = mut.get("text", "")
+                tn = TextNode(node_id=nid, data=text)
+                if not hasattr(session, "_js_created_nodes"):
+                    session._js_created_nodes = {}
+                session._js_created_nodes[nid] = tn
+
+            elif mt == "appendChild":
+                parent = _find_node(session, mut["parentId"])
+                child = _find_node(session, mut["childId"])
+                if parent and child:
+                    if child.parent is not None:
+                        try:
+                            child.parent.children.remove(child)
+                        except ValueError:
+                            pass
+                    parent.append_child(child)
+                    doc = getattr(session, "_current_document", None)
+                    if doc and isinstance(child, Element):
+                        doc.register_element(child)
+                    _maybe_queue_dynamic_script(session, child)
+
+
+            elif mt == "removeChild":
+                parent = _find_node(session, mut["parentId"])
+                child = _find_node(session, mut["childId"])
+                if parent and child:
+                    try:
+                        parent.remove_child(child)
+                    except Exception:
+                        pass
+
+            elif mt == "insertBefore":
+                parent = _find_node(session, mut["parentId"])
+                new_node = _find_node(session, mut["newId"])
+                ref_id = mut.get("refId")
+                if parent and new_node:
+                    if new_node.parent is not None:
+                        try:
+                            new_node.parent.children.remove(new_node)
+                        except ValueError:
+                            pass
+                    if ref_id and ref_id != "null":
+                        ref_node = _find_node(session, ref_id)
+                        if ref_node:
+                            try:
+                                idx = parent.children.index(ref_node)
+                                new_node.parent = parent
+                                parent.children.insert(idx, new_node)
+                            except ValueError:
+                                parent.append_child(new_node)
+                        else:
+                            parent.append_child(new_node)
+                    else:
+                        parent.append_child(new_node)
+                    _maybe_queue_dynamic_script(session, new_node)
+
+            elif mt == "setAttribute":
+                el = _find_element_by_id(session, mut["nodeId"])
+                if el:
+                    el.attributes[mut["name"]] = mut["value"]
+
+            elif mt == "removeAttribute":
+                el = _find_element_by_id(session, mut["nodeId"])
+                if el:
+                    el.attributes.pop(mut["name"], None)
+
+            elif mt == "setInnerHTML":
+                el = _find_node(session, mut["nodeId"])
+                if el:
+                    el.children.clear()
+                    html_str = mut.get("html", "")
+                    if html_str.strip():
+                        try:
+                            from an_web.browser.parser import parse_html
+                            doc = getattr(session, "_current_document", None)
+                            base_url = getattr(
+                                session, "_current_url", "about:blank"
+                            )
+                            frag_doc = parse_html(
+                                f"<div>{html_str}</div>", base_url=base_url
+                            )
+                            for node in frag_doc.iter_descendants():
+                                if isinstance(node, Element) and node.tag == "div":
+                                    for child in list(node.children):
+                                        child.parent = el
+                                        el.children.append(child)
+                                        if doc and isinstance(child, Element):
+                                            doc.register_element(child)
+                                            for desc in child.iter_descendants():
+                                                if isinstance(desc, Element):
+                                                    doc.register_element(desc)
+                                    break
+                        except Exception as exc:
+                            log.debug("sync innerHTML error: %s", exc)
+
+            elif mt == "setTextContent":
+                el = _find_node(session, mut["nodeId"])
+                if el:
+                    el.children.clear()
+                    text = mut.get("text", "")
+                    if text:
+                        tn = TextNode(
+                            node_id=f"py_sync_{id(el)}", data=text
+                        )
+                        el.append_child(tn)
+
+            elif mt == "removeNode":
+                target = _find_node(session, mut["nodeId"])
+                if target and target.parent:
+                    try:
+                        target.parent.children.remove(target)
+                    except ValueError:
+                        pass
+                    target.parent = None
+
+            elif mt == "setCookie":
+                cookies = getattr(session, "cookies", None)
+                url = getattr(session, "_current_url", "about:blank")
+                if cookies:
+                    cookie_str = mut.get("cookie", "")
+                    _set_cookie_from_str(cookies, url, cookie_str)
+
+            elif mt == "setTitle":
+                doc = getattr(session, "_current_document", None)
+                if doc is not None:
+                    doc.title = mut.get("title", "")
+
+        except Exception as exc:
+            log.debug("sync mutation '%s' error: %s", mt, exc)
+
+    # Graft orphan JS subtrees into the document body so they appear
+    # in iter_descendants().  React/Next.js often builds subtrees in
+    # memory and the final attach may be undone by reconciliation,
+    # leaving rich content floating outside the tree.
+    _graft_orphan_subtrees(session)
+
+
+def _graft_orphan_subtrees(session: Any) -> None:
+    """Attach floating JS-created subtrees to the document body.
+
+    After mutation replay, some JS-created Element subtrees may be
+    disconnected from the document tree (their parent chain does not
+    reach the Document node).  This happens when React's reconciliation
+    removes freshly-rendered content from a container.
+
+    To keep this content accessible for AI extraction, we graft any
+    orphan subtree with children into ``<body>``.
+    """
+    from an_web.dom.nodes import Element
+
+    doc = getattr(session, "_current_document", None)
+    if doc is None:
+        return
+    js_nodes = getattr(session, "_js_created_nodes", {})
+    if not js_nodes:
+        return
+
+    # Find the <body> element
+    body = None
+    for node in doc.iter_descendants():
+        if isinstance(node, Element) and node.tag == "body":
+            body = node
+            break
+    if body is None:
+        return
+
+    grafted = 0
+    for nid, node in list(js_nodes.items()):
+        if not isinstance(node, Element):
+            continue
+        # Only graft elements that have children (non-trivial subtrees)
+        if not node.children:
+            continue
+        # Skip if already in the document tree
+        if node.parent is not None:
+            continue
+        # Graft under <body>
+        body.append_child(node)
+        doc.register_element(node)
+        for desc in node.iter_descendants():
+            if isinstance(desc, Element):
+                doc.register_element(desc)
+        grafted += 1
+
+    if grafted:
+        log.debug("_graft_orphan_subtrees: grafted %d subtrees", grafted)
+
+
+def _set_cookie_from_str(cookies: Any, url: str, cookie_str: str) -> None:
+    """Parse a cookie string and add it to the cookie jar."""
+    from urllib.parse import urlparse
+
+    from an_web.net.cookies import Cookie
+
+    parts = [p.strip() for p in cookie_str.split(";")]
+    if not parts or not parts[0]:
+        return
+    name, _, value = parts[0].partition("=")
+    name = name.strip()
+    value = value.strip()
+    if not name:
+        return
+    domain = urlparse(url).hostname or ""
+    cookie = Cookie(name=name, value=value, domain=domain)
+    for part in parts[1:]:
+        key, _, val = part.partition("=")
+        key = key.strip().lower()
+        if key == "path":
+            cookie.path = val.strip() or "/"
+        elif key == "domain":
+            cookie.domain = val.strip().lstrip(".")
+    cookies.set(cookie)

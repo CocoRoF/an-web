@@ -53,13 +53,13 @@ AN-Web is designed **from scratch** for the AI agent loop:
 | Concern | Traditional Headless | AN-Web |
 |---|---|---|
 | **Primary output** | Screenshots / DOM strings | `PageSemantics` — structured world model |
-| **JS engine** | V8 (full Chromium) | QuickJS (lightweight, embeddable) |
+| **JS engine** | V8 (full Chromium) | V8 via PyMiniRacer (Chrome-grade, lightweight embed) |
 | **Latency** | 500 ms+ cold start | < 50 ms per action |
 | **Memory** | 300–800 MB | ~30 MB |
 | **Action targeting** | CSS selectors / XPath only | Semantic: `{"by": "role", "role": "button", "text": "Sign In"}` |
 | **Policy & safety** | None built-in | Domain rules, rate limits, sandbox, approval flows |
 | **Observability** | External tracing | First-class `ArtifactCollector`, `StructuredLogger`, `ReplayEngine` |
-| **SPA support** | Full V8 | QuickJS + host Web API (webpack 5, React 18, jQuery) |
+| **SPA support** | Full V8 | V8 + host Web API (webpack 5, React 18, jQuery) |
 
 ---
 
@@ -90,7 +90,7 @@ pip install -e ".[dev]"
 | `selectolax` | Fast HTML parser (Lexbor backend) |
 | `html5lib` | Spec-compliant fallback parser |
 | `pydantic` | Request/response validation |
-| `quickjs` | Embedded JavaScript engine |
+| `py-mini-racer` | Embedded V8 JavaScript engine |
 | `cssselect` | CSS selector parsing |
 
 ---
@@ -788,9 +788,9 @@ trace_dict = tools.history_as_trace()
 
 ## JavaScript Execution & SPA Support
 
-### Embedded QuickJS Runtime
+### Embedded V8 Runtime
 
-AN-Web embeds a QuickJS JavaScript engine with a comprehensive host Web API layer:
+AN-Web embeds a V8 JavaScript engine (via PyMiniRacer) with a comprehensive host Web API layer:
 
 ```python
 # Via tool interface
@@ -808,7 +808,7 @@ await js.drain_microtasks()              # process Promise chains
 
 ### Host Web API Coverage
 
-The host API layer bridges Python DOM ↔ QuickJS, providing browser-compatible APIs:
+The host API layer bridges Python DOM ↔ V8, providing browser-compatible APIs:
 
 | Category | APIs |
 |---|---|
@@ -851,7 +851,7 @@ AN-Web can render modern Single Page Applications:
 │              Execution Plane                            │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐  │
 │  │ DOM Core │  │ JS Bridge│  │ Network  │  │Layout  │  │
-│  │ nodes/   │  │ QuickJS  │  │ httpx +  │  │Lite    │  │
+│  │ nodes/   │  │ V8       │  │ httpx +  │  │Lite    │  │
 │  │ selectors│  │ host_api │  │ cookies  │  │hit_test│  │
 │  └──────────┘  └──────────┘  └──────────┘  └────────┘  │
 ├─────────────────────────────────────────────────────────┤
@@ -866,7 +866,7 @@ AN-Web can render modern Single Page Applications:
 an_web/
 ├── core/         # ANWebEngine, Session, Scheduler, SnapshotManager, PageState
 ├── dom/          # Node/Element/Document, CSS Selectors, Mutation, Semantics
-├── js/           # QuickJS bridge, JSRuntime, Host Web API (DOM ↔ QuickJS bridge)
+├── js/           # V8 bridge, JSRuntime, Host Web API (DOM ↔ V8 bridge)
 ├── net/          # NetworkClient (httpx), CookieJar, ResourceLoader
 ├── actions/      # navigate, click, type, submit, extract, scroll, eval_js, wait_for
 ├── layout/       # Visibility, flow inference, hit-testing, LayoutEngine
@@ -999,7 +999,7 @@ async def safe_browse():
 ## Testing
 
 ```bash
-# Run all tests (1524 tests)
+# Run all tests (1525 tests)
 pytest
 
 # With coverage
@@ -1012,12 +1012,12 @@ pytest tests/unit/dom/ -v
 pytest tests/integration/ -v
 ```
 
-**Test Suite (1524 tests):**
+**Test Suite (1525 tests):**
 
 | Suite | Count | Covers |
 |---|---|---|
 | DOM / Selectors / Parser | ~330 | Core DOM tree, CSS selectors, HTML parsing |
-| JS Bridge + Runtime + Host API | ~300 | QuickJS eval, Promise drain, host Web API |
+| JS Bridge + Runtime + Host API | ~300 | V8 eval, Promise drain, host Web API |
 | Scheduler / Session / Engine | ~130 | Event loop, navigation, storage, snapshots |
 | Actions | ~190 | click, type, submit, extract, scroll, eval_js |
 | Layout | ~160 | Visibility, flow, hit-testing |
@@ -1090,7 +1090,7 @@ Apache-2.0
 git clone https://github.com/CocoRoF/an-web
 cd an-web
 pip install -e ".[dev]"
-pytest                    # all 1524 tests should pass
+pytest                    # all 1525 tests should pass
 ruff check an_web/        # linting
 mypy an_web/              # type checking
 ```

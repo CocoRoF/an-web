@@ -106,11 +106,19 @@ class NavigateAction(Action):
             )
             snapshot_id = snap.snapshot_id
 
+        # ── 4b. Re-inject DOM into V8 now that the document is parsed ──
+        js_runtime = getattr(session, "js_runtime", None)
+        if js_runtime is not None and js_runtime.is_available():
+            try:
+                from an_web.js.host_api import reinject_dom_state
+                reinject_dom_state(js_runtime.ctx, session)
+            except Exception:
+                pass
+
         # ── 5. Execute scripts (inline + external, in document order) ─
         scripts_found = 0
         scripts_executed = 0
         external_loaded = 0
-        js_runtime = getattr(session, "js_runtime", None)
 
         if js_runtime is not None and js_runtime.is_available():
             # Clear dynamic script queue before initial execution
@@ -130,6 +138,14 @@ class NavigateAction(Action):
 
         # ── 6. Settle event loop (microtasks + macrotasks + dynamic scripts)
         await _settle_page(session, rounds=_SETTLE_ROUNDS)
+
+        # ── 6b. Sync JS DOM mutations back to Python DOM ──────────────
+        if js_runtime is not None and js_runtime.is_available():
+            try:
+                from an_web.js.host_api import sync_dom_mutations
+                sync_dom_mutations(js_runtime.ctx, session)
+            except Exception:
+                pass
 
         # Count dynamic scripts that were loaded during settle
         dynamic_loaded = len(js_runtime._scripts_loaded) - scripts_found \

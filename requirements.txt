@@ -6,4 +6,4 @@ selectolax>=0.3.21
 html5lib>=1.1
 pydantic>=2.7.0
 cssselect>=1.2.0
-quickjs>=1.19.0
+py-mini-racer>=0.6.0

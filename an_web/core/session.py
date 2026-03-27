@@ -23,7 +23,7 @@ Lifecycle::
     await session.close()
 
 Design notes:
-- JS runtime (QuickJS) is reset on every navigate() so page-global state
+- JS runtime (V8) is reset on every navigate() so page-global state
   doesn't bleed between pages.
 - localStorage is keyed by origin (netloc) and survives navigations.
 - sessionStorage is per-page and cleared on every navigate().
@@ -66,7 +66,7 @@ class Session:
     - localStorage (per-origin, persists across navigations)
     - sessionStorage (per-page, cleared on navigate)
     - Navigation history with back() support
-    - JS runtime (QuickJS) instance — reset on every navigate
+    - JS runtime (V8) instance — reset on every navigate
     - Event-loop scheduler (microtasks, timers, network settle)
     - PageState tracking
     - SnapshotManager for deterministic replay
@@ -366,7 +366,7 @@ class Session:
         """
         if self._closed:
             return
-        # Shut down JS runtime first (releases QuickJS heap)
+        # Shut down JS runtime first (releases V8 heap)
         if self.js_runtime is not None:
             self.js_runtime.close()
         # Close the HTTP client (flushes keep-alive pool)

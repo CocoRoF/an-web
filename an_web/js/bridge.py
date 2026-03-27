@@ -1,11 +1,10 @@
 """
-JS <-> Python object marshalling for AN-Web QuickJS bridge.
+JS <-> Python object marshalling for AN-Web V8 bridge.
 
 Design principles:
 - Use JSON as the lingua franca between JS and Python where possible
-- Python callables registered via ctx.add_callable() receive/return JSON strings
 - Complex objects (DOM nodes, etc.) serialised to stable JSON representations
-- JSError captures structured JS exception info
+- JSError captures structured JS exception info from V8 (PyMiniRacer)
 """
 from __future__ import annotations
 
@@ -36,7 +35,17 @@ class JSError(Exception):
 
     @classmethod
     def from_quickjs_exception(cls, exc: Exception) -> JSError:
-        """Convert a quickjs.JSException into a structured JSError."""
+        """Deprecated alias for from_v8_exception. Kept for backward compatibility."""
+        return cls._parse_exception(exc)
+
+    @classmethod
+    def from_v8_exception(cls, exc: Exception) -> JSError:
+        """Convert a PyMiniRacer JSEvalException into a structured JSError."""
+        return cls._parse_exception(exc)
+
+    @classmethod
+    def _parse_exception(cls, exc: Exception) -> JSError:
+        """Parse a JS engine exception into a structured JSError."""
         raw_msg = str(exc)
         lines = raw_msg.splitlines()
         first = lines[0] if lines else raw_msg
@@ -45,6 +54,9 @@ class JSError(Exception):
         if ":" in first:
             js_type, _, message = first.partition(":")
             js_type = js_type.strip()
+            # V8 prefixes errors with "Uncaught " — strip it
+            if js_type.startswith("Uncaught "):
+                js_type = js_type[len("Uncaught "):]
             message = message.strip()
         else:
             js_type = "Error"
@@ -86,7 +98,7 @@ def py_to_js(value: Any) -> Any:
     """
     Convert a Python value to a JS-compatible form.
 
-    quickjs-py accepts: str, int, float, bool, None.
+    V8 (PyMiniRacer) accepts: str, int, float, bool, None.
     Everything else must be serialised; the caller is responsible for
     JSON.parse() on the JS side when needed.
     """
@@ -104,12 +116,10 @@ def py_to_js(value: Any) -> Any:
 
 def js_to_py(value: Any) -> Any:
     """
-    Convert a value returned by quickjs-py to a native Python value.
+    Convert a value returned by the JS engine to a native Python value.
 
-    quickjs-py returns:
-    - int / float / bool / str / None  for JS primitives
-    - _quickjs.Object                  for JS objects/arrays (has .json())
-    - quickjs.JSException              raised for errors (handled by caller)
+    PyMiniRacer (V8) returns native Python types directly for primitives
+    and JSObject for complex types. This function converts both.
     """
     try:
         if hasattr(value, "json"):
@@ -136,19 +146,9 @@ def js_to_py_string(value: Any) -> str:
 
 def make_json_callable(fn: Callable[..., Any]) -> Callable[..., str]:
     """
-    Wrap *fn* so that it integrates cleanly with quickjs's add_callable():
-
-    - Arguments arriving from JS as JSON strings are auto-decoded.
-    - The return value is JSON-encoded back to a string.
-    - Exceptions are returned as ``{"__error__": "..."}`` JSON.
-
-    Usage in host_api.py::
-
-        ctx.add_callable("_pyQS", make_json_callable(query_selector_fn))
-
-    In JS::
-
-        var el = JSON.parse(_pyQS(JSON.stringify({selector: ".btn"})));
+    Wrap *fn* so arguments from JS JSON strings are auto-decoded
+    and the return value is JSON-encoded back to a string.
+    Exceptions are returned as ``{"__error__": "..."}`` JSON.
     """
     def wrapper(*args: Any) -> str:
         decoded: list[Any] = []

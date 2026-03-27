@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 class EvalJSAction(Action):
     """
-    Evaluate arbitrary JavaScript in the current page's QuickJS context.
+    Evaluate arbitrary JavaScript in the current page's V8 context.
 
     The result is stringified and returned in ``effects["result"]``.
     Useful for inspecting page state, triggering custom JS logic, or
