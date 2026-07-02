@@ -29,7 +29,7 @@ async with ANWebEngine() as engine:
 - [빠른 시작](#빠른-시작)
 - [핵심 개념](#핵심-개념)
 - [사용 패턴 — 3단계 API](#사용-패턴--3단계-api)
-- [11개 도구 레퍼런스](#11개-도구-레퍼런스)
+- [13개 도구 레퍼런스](#11개-도구-레퍼런스)
 - [시맨틱 타겟팅](#시맨틱-타겟팅)
 - [데이터 추출](#데이터-추출)
 - [PageSemantics — AI 월드 모델](#pagesemantics--ai-월드-모델)
@@ -134,7 +134,7 @@ async with ANWebEngine() as engine:
 ```
 
 모든 상호작용은 동일한 `session.act({...})` 패턴을 따릅니다.
-하나의 메서드, 11개의 도구, 보일러플레이트 제로.
+하나의 메서드, 13개의 도구, 보일러플레이트 제로.
 
 ---
 
@@ -155,7 +155,7 @@ ANWebEngine (프로세스 레벨, 비동기 컨텍스트 매니저)
   └── Session (하나의 "브라우저 탭")
         ├── navigate(url)       → 페이지 로드, JS 실행, 안정화
         ├── snapshot()          → PageSemantics 객체 반환
-        ├── act({tool, ...})    → 11개 도구 중 하나 실행
+        ├── act({tool, ...})    → 13개 도구 중 하나 실행
         ├── execute_script(js)  → JavaScript 직접 실행
         ├── back()              → 이전 URL로 이동
         └── close()             → 리소스 정리
@@ -186,7 +186,7 @@ AN-Web은 용도에 맞게 선택할 수 있는 3단계 API를 제공합니다:
 
 **가장 간단함. 대부분의 경우 권장.**
 
-하나의 메서드로 11개 도구를 모두 처리합니다. 입력은 일반 dict:
+하나의 메서드로 13개 도구를 모두 처리합니다. 입력은 일반 dict:
 
 ```python
 async with ANWebEngine() as engine:
@@ -287,7 +287,7 @@ result = await dispatch_tool(
 
 ---
 
-## 11개 도구 레퍼런스
+## 13개 도구 레퍼런스
 
 ### `navigate` — URL 로드
 
@@ -379,6 +379,30 @@ result = await session.act({
     "tool": "eval_js",
     "script": "Array.from(document.querySelectorAll('a')).map(a => a.href)"
 })
+```
+
+---
+
+### `fetch` — 에이전트 직접 HTTP 요청 (APIRequestContext)
+
+페이지 JavaScript를 거치지 않고 세션의 쿠키·정책으로 HTTP 요청을 수행합니다.
+Playwright의 APIRequestContext에 해당하며, 페이지가 클라이언트에서 렌더링하는
+데이터를 가장 확실하게 가져오는 방법입니다.
+
+```python
+result = await session.act({"tool": "fetch", "url": "/api/v1/posts"})
+result["effects"]["json"]     # JSON 응답은 파싱되어 반환
+result["effects"]["status"]   # HTTP 상태
+```
+
+### `network` — 런타임 네트워크 활동
+
+페이지가 런타임에 수행한 fetch/XHR가 모두 기록됩니다. DOM에 데이터가
+없다면(클라이언트 렌더링) 보통 여기에 있습니다.
+
+```python
+result = await session.act({"tool": "network"})              # 목록+미리보기
+result = await session.act({"tool": "network", "index": 0})  # 전체 본문
 ```
 
 ---
@@ -544,6 +568,29 @@ AN-Web은 자동으로 페이지를 시맨틱 타입으로 분류합니다:
 | `form` | 일반 폼 | 문의 폼 |
 | `error` | 에러 페이지 (404, 500) | Not Found |
 | `generic` | 기타 | 랜딩 페이지 |
+
+---
+
+## MCP 서버 — an-web-mcp
+
+Microsoft의 playwright-mcp 규약을 따르는 MCP 서버를 내장합니다 — Chromium 없이
+같은 계약으로 동작합니다.
+
+```bash
+uvx --from 'an-web[mcp]' an-web-mcp
+# Claude Code 등록:
+claude mcp add an-web -- uvx --from 'an-web[mcp]' an-web-mcp
+```
+
+**도구 (13종)**: `browser_navigate`, `browser_navigate_back`, `browser_snapshot`,
+`browser_click`, `browser_type`, `browser_select_option`, `browser_wait_for`,
+`browser_evaluate`, `browser_extract`, `browser_fetch`,
+`browser_network_requests`, `browser_network_request`, `browser_close`
+
+- `browser_snapshot`은 접근성 트리 형식이며 인터랙티브 요소에 `[ref=nN]` 핸들이 붙습니다.
+- 액션 도구는 `element`(설명) + `target`(ref 또는 CSS 셀렉터) 쌍을 받습니다.
+- 모든 변경 도구는 새 스냅샷을 함께 반환합니다.
+- 환경변수: `ANWEB_ALLOWED_DOMAINS`, `ANWEB_BLOCKED_DOMAINS`, `ANWEB_NAV_TIMEOUT`
 
 ---
 
@@ -999,7 +1046,7 @@ async def safe_browse():
 ## 테스트
 
 ```bash
-# 전체 테스트 실행 (1540개)
+# 전체 테스트 실행 (1554개)
 pytest
 
 # 커버리지 포함
@@ -1012,7 +1059,7 @@ pytest tests/unit/dom/ -v
 pytest tests/integration/ -v
 ```
 
-**테스트 스위트 (1540개 테스트):**
+**테스트 스위트 (1554개 테스트):**
 
 | 스위트 | 수량 | 대상 |
 |---|---|---|
@@ -1041,7 +1088,7 @@ pytest tests/integration/ -v
 |---|---|---|
 | `navigate(url, timeout=None)` | `dict` | URL 로드, DOM 구축, JS 실행, 안정화 (기본 15초 예산) |
 | `snapshot()` | `PageSemantics` | 구조화된 시맨틱 페이지 상태 (객체) |
-| `act(tool_call)` | `dict` | 11개 도구 중 하나 실행 |
+| `act(tool_call)` | `dict` | 13개 도구 중 하나 실행 |
 | `execute_script(js)` | `Any` | JavaScript 직접 실행 |
 | `back()` | `dict` | 이전 URL로 이동 |
 | `close()` | `None` | 리소스 해제 |
@@ -1090,7 +1137,7 @@ Apache-2.0
 git clone https://github.com/CocoRoF/an-web
 cd an-web
 pip install -e ".[dev]"
-pytest                    # 1540개 테스트 모두 통과해야 함
+pytest                    # 1554개 테스트 모두 통과해야 함
 ruff check an_web/        # 린팅
 mypy an_web/              # 타입 체크
 ```

@@ -11,6 +11,9 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any
 
+# Elements whose text is never rendered — excluded from inner_text
+_NON_RENDERED_TAGS = frozenset({"script", "style", "template", "noscript"})
+
 
 class NodeType(Enum):
     ELEMENT = auto()
@@ -148,10 +151,31 @@ class Element(Node):
 
     @property
     def inner_text(self) -> str:
-        """Visible text content (approximation without full layout)."""
+        """Visible text content (approximation without full layout).
+
+        Per browser semantics, non-rendered content (script, style,
+        template, noscript) is excluded — unlike ``text_content``.
+        """
         if self.visibility_state in ("hidden", "none"):
             return ""
-        return self.text_content.strip()
+        if self.tag in _NON_RENDERED_TAGS:
+            return ""
+        parts: list[str] = []
+        self._collect_visible_text(parts)
+        return " ".join("".join(parts).split())
+
+    def _collect_visible_text(self, parts: list[str]) -> None:
+        for child in self.children:
+            if isinstance(child, TextNode):
+                parts.append(child.data)
+            elif isinstance(child, Element):
+                if child.tag in _NON_RENDERED_TAGS:
+                    continue
+                if child.visibility_state in ("hidden", "none"):
+                    continue
+                child._collect_visible_text(parts)
+                # block-level elements imply a word break
+                parts.append(" ")
 
     def to_dict(self) -> dict[str, Any]:
         return {

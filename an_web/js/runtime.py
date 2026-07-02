@@ -437,6 +437,20 @@ class JSRuntime:
             url = cmd.get("url", "")
             if url:
                 self.session._pending_js_navigation = url  # type: ignore[attr-defined]
+        elif cmd_type in ("fetch", "fetch_async"):
+            pending_fetches = getattr(self.session, "_pending_fetches", None)
+            if pending_fetches is None:
+                self.session._pending_fetches = {}  # type: ignore[attr-defined]
+                pending_fetches = self.session._pending_fetches  # type: ignore[attr-defined]
+            rid = str(cmd.get("id") or f"auto{len(pending_fetches) + 1}")
+            pending_fetches[rid] = {
+                "url": cmd.get("url", ""),
+                "method": cmd.get("method", "GET"),
+                "body": cmd.get("body"),
+                "headers_json": cmd.get("headersJson", "null"),
+                "kind": cmd.get("kind", "fetch"),
+                "resolved": False,
+            }
 
     # ─────────────────────────────────────────────────────────────────────────
     # Script tag loading

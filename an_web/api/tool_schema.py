@@ -260,6 +260,7 @@ TOOLS: list[dict[str, Any]] = [
             "Wait until a condition is satisfied before proceeding. "
             "'network_idle': wait for all pending requests to complete. "
             "'dom_stable': wait for DOM mutations to stop. "
+            "'selector': wait until a CSS selector matches an element. "
             "'element_visible': wait for a CSS-selected element to become visible."
         ),
         "input_schema": {
@@ -267,12 +268,12 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "condition": {
                     "type": "string",
-                    "enum": ["network_idle", "dom_stable", "element_visible"],
+                    "enum": ["network_idle", "dom_stable", "selector", "element_visible"],
                     "description": "Condition to wait for",
                 },
                 "selector": {
                     "type": "string",
-                    "description": "CSS selector — required for condition='element_visible'",
+                    "description": "CSS selector — required for condition='selector' or 'element_visible'",
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -289,8 +290,9 @@ TOOLS: list[dict[str, Any]] = [
         "name": "eval_js",
         "description": (
             "Execute JavaScript in the page context and return the result. "
-            "Use sparingly — prefer semantic actions (click, type, snapshot) when possible. "
-            "Useful for reading computed state or triggering custom JS logic."
+            "If the script returns a Promise it is awaited — e.g. "
+            "\"fetch('/api/items').then(r => r.json())\" returns the JSON. "
+            "Use sparingly — prefer semantic actions (click, type, snapshot) when possible."
         ),
         "input_schema": {
             "type": "object",
@@ -301,6 +303,78 @@ TOOLS: list[dict[str, Any]] = [
                 },
             },
             "required": ["script"],
+        },
+    },
+
+    # ── fetch ─────────────────────────────────────────────────────────────────
+    {
+        "name": "fetch",
+        "description": (
+            "Perform an HTTP request with the session's cookies and policy "
+            "(like Playwright's APIRequestContext). The reliable way to pull "
+            "data from the APIs a page uses — e.g. after 'network' reveals "
+            "an endpoint, or when JS-rendered content is missing from the "
+            "DOM. Relative URLs resolve against the current page. JSON "
+            "responses are parsed into effects.json."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Absolute URL, or path relative to the current page",
+                },
+                "method": {
+                    "type": "string",
+                    "default": "GET",
+                    "description": "HTTP method",
+                },
+                "headers": {
+                    "type": "object",
+                    "description": "Extra request headers",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Request body (for POST/PUT/PATCH)",
+                },
+                "max_body": {
+                    "type": "integer",
+                    "default": 200000,
+                    "description": "Response body cap in characters",
+                },
+            },
+            "required": ["url"],
+        },
+    },
+
+    # ── network ───────────────────────────────────────────────────────────────
+    {
+        "name": "network",
+        "description": (
+            "List fetch/XHR requests the page made at runtime, with response "
+            "body previews. Pages often load their real content this way — "
+            "check here when data is missing from the DOM. "
+            "Pass 'index' to get one request's full response body."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "index": {
+                    "type": "integer",
+                    "description": "Return the full body of the request at this index",
+                },
+                "max_body": {
+                    "type": "integer",
+                    "default": 2048,
+                    "description": "Response body preview size in characters",
+                },
+                "clear": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Clear the network log after reporting",
+                },
+            },
+            "required": [],
         },
     },
 ]

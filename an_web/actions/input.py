@@ -119,6 +119,8 @@ class TypeAction(Action):
         # ── 5. Drain event loop ───────────────────────────────────────
         if session.scheduler:
             await session.scheduler.drain_microtasks()
+        # Complete fetch/XHR work triggered by input/change handlers
+        await self._settle_after_action(session, budget_s=2.0)
 
         return ActionResult(
             status="ok",
@@ -173,6 +175,8 @@ class ClearAction(Action):
 
         if session.scheduler:
             await session.scheduler.drain_microtasks()
+        # Complete fetch/XHR work triggered by input/change handlers
+        await self._settle_after_action(session, budget_s=2.0)
 
         return ActionResult(
             status="ok",
@@ -266,6 +270,8 @@ class SelectAction(Action):
 
         if session.scheduler:
             await session.scheduler.drain_microtasks()
+        # Complete fetch/XHR work triggered by input/change handlers
+        await self._settle_after_action(session, budget_s=2.0)
 
         return ActionResult(
             status="ok",

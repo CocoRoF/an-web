@@ -11,6 +11,7 @@ from an_web.api.tool_schema import (
 EXPECTED_TOOLS = {
     "navigate", "snapshot", "click", "type", "clear",
     "select", "submit", "extract", "scroll", "wait_for", "eval_js",
+    "network", "fetch",
 }
 
 
@@ -83,7 +84,7 @@ class TestWaitForSchema:
     def test_condition_enum(self):
         s = get_schema("wait_for")
         assert set(s["properties"]["condition"]["enum"]) == {
-            "network_idle", "dom_stable", "element_visible"
+            "network_idle", "dom_stable", "selector", "element_visible"
         }
 
 

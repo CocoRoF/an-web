@@ -386,7 +386,13 @@ async def _settle_page(session: Any, rounds: int = 5) -> None:
 
 async def _process_pending_fetches(session: Any) -> int:
     """
-    Process any pending async fetch requests queued by JS code.
+    Perform HTTP requests queued by page JS (fetch / XMLHttpRequest) and
+    resolve the corresponding pending Promises / XHR events in V8 via
+    ``_resolveFetch(id, dataJson)``.
+
+    Every request/response pair is also appended to
+    ``session._network_log`` so AI agents can inspect what data the page
+    loaded, even when the framework fails to re-render it into the DOM.
 
     Returns the number of fetches processed.
     """
@@ -398,52 +404,96 @@ async def _process_pending_fetches(session: Any) -> int:
     if not network:
         return 0
 
+    import json as _json
+    import time as _time
+
+    js_runtime = getattr(session, "js_runtime", None)
+    base_url = getattr(session, "_current_url", "") or ""
     processed = 0
-    # Process all unresolved fetches
+
     for request_id, info in list(pending.items()):
         if info.get("resolved"):
+            pending.pop(request_id, None)
             continue
+        info["resolved"] = True
 
-        url = info.get("url", "")
-        method = info.get("method", "GET")
+        raw_url = info.get("url", "")
+        url = urljoin(base_url, raw_url) if base_url else raw_url
+        method = (info.get("method") or "GET").upper()
         headers_json = info.get("headers_json", "null")
-
         try:
-            import json
-            headers = json.loads(headers_json) if headers_json and headers_json != "null" else {}
+            headers = (
+                _json.loads(headers_json)
+                if headers_json and headers_json != "null" else {}
+            )
+            if not isinstance(headers, dict):
+                headers = {}
+        except Exception:
+            headers = {}
+        headers.setdefault("Referer", base_url)
 
-            if "Referer" not in headers:
-                headers["Referer"] = getattr(session, "_current_url", "") or ""
+        body = info.get("body")
+        body_bytes = body.encode("utf-8") if isinstance(body, str) else None
 
-            if method.upper() == "GET":
-                resp = await network.get(url, headers=headers)
-            else:
-                resp = await network.get(url, headers=headers)  # simplified
-
+        t0 = _time.monotonic()
+        try:
+            resp = await network.fetch(
+                url, method=method, headers=headers, body=body_bytes,
+                resource_type="xhr" if info.get("kind") == "xhr" else "fetch",
+            )
             result = {
                 "ok": resp.ok,
                 "status": resp.status,
+                "statusText": "",
                 "text": resp.text,
-                "headers": {},
+                "headers": dict(getattr(resp, "headers", None) or {}),
                 "url": resp.url,
+                "redirected": getattr(resp, "redirect_count", 0) > 0,
             }
-            info["resolved"] = True
-            info["result"] = result
-            processed += 1
-
-            # Resolve the JS promise via eval
-            js_runtime = getattr(session, "js_runtime", None)
-            if js_runtime and js_runtime.is_available():
-                # Trigger any waiting code / resolve promises
-                await js_runtime.drain_microtasks()
-
         except Exception as exc:
-            log.debug("Async fetch failed for %s: %s", url[:60], exc)
-            info["resolved"] = True
-            info["result"] = {"ok": False, "status": 0, "text": "", "error": str(exc)}
-            processed += 1
+            log.debug("Async fetch failed for %s: %s", url[:80], exc)
+            result = {
+                "ok": False, "status": 0, "text": "",
+                "error": str(exc)[:300], "headers": {}, "url": url,
+            }
+        elapsed_ms = round((_time.monotonic() - t0) * 1000, 1)
+
+        _record_network_activity(session, {
+            "url": url,
+            "method": method,
+            "kind": info.get("kind", "fetch"),
+            "status": result.get("status", 0),
+            "ok": result.get("ok", False),
+            "content_type": (result.get("headers") or {}).get("content-type", ""),
+            "body": result.get("text", ""),
+            "error": result.get("error"),
+            "elapsed_ms": elapsed_ms,
+        })
+
+        if js_runtime is not None and js_runtime.is_available():
+            payload = _json.dumps(_json.dumps(result))
+            js_runtime.eval_safe(
+                "typeof _resolveFetch === 'function' "
+                f"? _resolveFetch({_json.dumps(request_id)}, {payload}) : false"
+            )
+            await js_runtime.drain_microtasks()
+
+        pending.pop(request_id, None)
+        processed += 1
 
     return processed
+
+
+def _record_network_activity(session: Any, entry: dict[str, Any]) -> None:
+    """Append a request/response record to the session network log."""
+    log_list = getattr(session, "_network_log", None)
+    if log_list is None:
+        session._network_log = []
+        log_list = session._network_log
+    # Bound memory: keep the newest 200 entries
+    if len(log_list) >= 200:
+        del log_list[: len(log_list) - 199]
+    log_list.append(entry)
 
 
 async def _process_dynamic_scripts(session: Any) -> int:

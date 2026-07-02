@@ -88,6 +88,28 @@ class WaitForRequest(BaseModel):
         return self
 
 
+class FetchRequest(BaseModel):
+    tool: Literal["fetch"] = "fetch"
+    url: str
+    method: str = "GET"
+    headers: dict[str, str] | None = None
+    body: str | None = None
+    max_body: int = 200_000
+
+    @model_validator(mode="after")
+    def _check_url(self) -> FetchRequest:
+        if not self.url.strip():
+            raise ValueError("url must not be empty")
+        return self
+
+
+class NetworkRequest(BaseModel):
+    tool: Literal["network"] = "network"
+    index: int | None = None
+    max_body: int = 2048
+    clear: bool = False
+
+
 class ScrollRequest(BaseModel):
     tool: Literal["scroll"] = "scroll"
     target: str | SemanticTarget | None = None
@@ -109,7 +131,8 @@ class EvalJSRequest(BaseModel):
 ToolRequest = (
     NavigateRequest | ClickRequest | TypeRequest | ClearRequest
     | SelectRequest | SubmitRequest | ExtractRequest | SnapshotRequest
-    | WaitForRequest | ScrollRequest | EvalJSRequest
+    | WaitForRequest | ScrollRequest | EvalJSRequest | NetworkRequest
+    | FetchRequest
 )
 
 # Mapping tool name → request model
@@ -125,6 +148,8 @@ TOOL_REQUEST_MAP: dict[str, type[BaseModel]] = {
     "wait_for":  WaitForRequest,
     "scroll":    ScrollRequest,
     "eval_js":   EvalJSRequest,
+    "network":   NetworkRequest,
+    "fetch":     FetchRequest,
 }
 
 

@@ -114,6 +114,10 @@ class ClickAction(Action):
             await session.scheduler.settle_network(timeout=3.0)
             await session.scheduler.flush_dom_mutations()
 
+        # Complete fetch/XHR requests started by the click handlers so the
+        # DOM the caller observes next reflects the click's consequences.
+        await self._settle_after_action(session)
+
         # ── 7. Postcondition ──────────────────────────────────────────
         post_url = getattr(session, "_current_url", "")
         navigated = post_url != pre_url

@@ -166,6 +166,7 @@ class TestToolRequestMap:
         expected = {
             "navigate", "click", "type", "clear", "select", "submit",
             "extract", "snapshot", "wait_for", "scroll", "eval_js",
+            "network", "fetch",
         }
         assert expected == set(TOOL_REQUEST_MAP.keys())
 
