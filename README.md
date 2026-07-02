@@ -1099,7 +1099,7 @@ async def safe_browse():
 ## Testing
 
 ```bash
-# Run all tests (1554 tests)
+# Run all tests (1565 tests)
 pytest
 
 # With coverage
@@ -1112,7 +1112,7 @@ pytest tests/unit/dom/ -v
 pytest tests/integration/ -v
 ```
 
-**Test Suite (1554 tests):**
+**Test Suite (1565 tests):**
 
 | Suite | Count | Covers |
 |---|---|---|
@@ -1190,7 +1190,7 @@ Apache-2.0
 git clone https://github.com/CocoRoF/an-web
 cd an-web
 pip install -e ".[dev]"
-pytest                    # all 1554 tests should pass
+pytest                    # all 1565 tests should pass
 ruff check an_web/        # linting
 mypy an_web/              # type checking
 ```

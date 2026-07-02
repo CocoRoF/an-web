@@ -141,15 +141,32 @@ class NavigateAction(Action):
                         )
                     )
 
-                # ── 5b. Fire DOMContentLoaded + load (HTML5 lifecycle) ─
+                # ── 5b. Pre-DCL settle: complete dynamic chunk loads and
+                # fetches started during script execution.  Frameworks
+                # (Next.js) finalise their bootstrap at DOMContentLoaded;
+                # firing it while code-split chunks are still pending
+                # truncates their data streams ("Connection closed").
+                if js_runtime is not None and js_runtime.is_available():
+                    for _ in range(_SETTLE_ROUNDS):
+                        activity = await _process_dynamic_scripts(session)
+                        activity += await _process_pending_fetches(session)
+                        activity += await js_runtime.drain_microtasks()
+                        if not activity:
+                            break
+
+                # ── 5c. Fire DOMContentLoaded (readyState → interactive) ─
                 if js_runtime is not None and js_runtime.is_available():
                     js_runtime.dispatch_dom_content_loaded()
-                    await js_runtime.drain_microtasks()
-                    js_runtime.dispatch_load()
                     await js_runtime.drain_microtasks()
 
                 # ── 6. Settle event loop (micro/macrotasks + dynamic scripts)
                 await _settle_page(session, rounds=_SETTLE_ROUNDS)
+
+                # ── 6a. Fire load (readyState → complete), settle handlers
+                if js_runtime is not None and js_runtime.is_available():
+                    js_runtime.dispatch_load()
+                    await js_runtime.drain_microtasks()
+                    await _settle_page(session, rounds=3)
         except TimeoutError:
             settle_timed_out = True
             log.warning(
@@ -516,13 +533,17 @@ async def _process_dynamic_scripts(session: Any) -> int:
     if not network or not js_runtime or not js_runtime.is_available():
         return 0
 
+    import json as _json
+
     base_url = getattr(session, "_current_url", "about:blank") or "about:blank"
     loaded = 0
     # Drain the queue (scripts may enqueue more during execution)
     while pending:
         entry = pending.pop(0)
         src = entry["src"]
+        node_id = entry.get("node_id")
         resolved_url = urljoin(base_url, src)
+        ok = False
         try:
             resp = await network.get(
                 resolved_url,
@@ -535,10 +556,28 @@ async def _process_dynamic_scripts(session: Any) -> int:
                 resource_type="script",
             )
             if resp.ok and resp.text.strip():
-                js_runtime.load_script(resp.text, src_hint=resolved_url)
+                result = js_runtime.load_script(resp.text, src_hint=resolved_url)
+                ok = result.ok
                 await js_runtime.drain_microtasks()
                 loaded += 1
         except Exception as exc:
             log.debug("Dynamic script load failed (%s): %s", resolved_url[:60], exc)
+
+        # Fire the script element's load/error event — webpack's chunk
+        # loader (__webpack_require__.l) resolves its chunk Promise from
+        # exactly this event; without it every code-split import hangs.
+        if node_id:
+            event = "load" if ok else "error"
+            js_runtime.eval_safe(
+                f"(function() {{"
+                f"  var el = _elementCache[{_json.dumps(node_id)}];"
+                f"  if (!el) return false;"
+                f"  var ev = {{type: {_json.dumps(event)}, target: el}};"
+                f"  if (el.on{event}) try {{ el.on{event}(ev); }} catch(e) {{}}"
+                f"  if (el.dispatchEvent) try {{ el.dispatchEvent(ev); }} catch(e) {{}}"
+                f"  return true;"
+                f"}})()"
+            )
+            await js_runtime.drain_microtasks()
 
     return loaded

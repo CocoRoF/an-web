@@ -1046,7 +1046,7 @@ async def safe_browse():
 ## 테스트
 
 ```bash
-# 전체 테스트 실행 (1554개)
+# 전체 테스트 실행 (1565개)
 pytest
 
 # 커버리지 포함
@@ -1059,7 +1059,7 @@ pytest tests/unit/dom/ -v
 pytest tests/integration/ -v
 ```
 
-**테스트 스위트 (1554개 테스트):**
+**테스트 스위트 (1565개 테스트):**
 
 | 스위트 | 수량 | 대상 |
 |---|---|---|
@@ -1137,7 +1137,7 @@ Apache-2.0
 git clone https://github.com/CocoRoF/an-web
 cd an-web
 pip install -e ".[dev]"
-pytest                    # 1554개 테스트 모두 통과해야 함
+pytest                    # 1565개 테스트 모두 통과해야 함
 ruff check an_web/        # 린팅
 mypy an_web/              # 타입 체크
 ```

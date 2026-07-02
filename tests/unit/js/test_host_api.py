@@ -106,7 +106,13 @@ class TestDocumentBasics:
         assert ev(runtime, "document.documentURI") == "https://example.com/"
 
     def test_ready_state(self, rt):
+        # readyState follows the document lifecycle: 'loading' while page
+        # scripts run, 'interactive' at DOMContentLoaded, 'complete' at load.
         runtime, _ = rt
+        assert ev(runtime, "document.readyState") == "loading"
+        runtime.dispatch_dom_content_loaded()
+        assert ev(runtime, "document.readyState") == "interactive"
+        runtime.dispatch_load()
         assert ev(runtime, "document.readyState") == "complete"
 
     def test_node_type(self, rt):

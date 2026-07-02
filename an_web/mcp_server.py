@@ -429,6 +429,30 @@ async def browser_network_request(index: int) -> str:
 
 
 @mcp.tool()
+async def browser_console_messages(level: str = "error") -> str:
+    """Return console messages the page logged ('error', 'warn', 'log', or 'all')."""
+    import json as _json
+
+    session = await _get_session()
+    rt = getattr(session, "js_runtime", None)
+    if rt is None or not rt.is_available():
+        return "### Result\nJS runtime unavailable."
+    arg = "" if level == "all" else level
+    raw = rt.eval_safe(f"_getConsoleMessages({_json.dumps(arg) if arg else ''})").value
+    try:
+        msgs = _json.loads(raw or "[]")
+    except Exception:
+        msgs = []
+    if not msgs:
+        return f"### Result\nNo console messages (level={level})."
+    lines = ["### Result"]
+    for m in msgs[-50:]:
+        text = m.get("text", "").replace("\n", " | ")[:300]
+        lines.append(f"- [{m.get('level')}] {text}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
 async def browser_close() -> str:
     """Close the current session (a fresh one is created on next use)."""
     global _session

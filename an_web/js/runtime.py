@@ -572,6 +572,7 @@ class JSRuntime:
     def dispatch_dom_content_loaded(self) -> None:
         """Fire DOMContentLoaded on both document and window."""
         self.eval_safe(
+            "if (document) document.readyState = 'interactive';"
             "var _dce = new Event('DOMContentLoaded');"
             "if (document && document.dispatchEvent) document.dispatchEvent(_dce);"
             "if (window && window.dispatchEvent) window.dispatchEvent(_dce);"
@@ -580,6 +581,7 @@ class JSRuntime:
     def dispatch_load(self) -> None:
         """Fire window load event."""
         self.eval_safe(
+            "if (document) document.readyState = 'complete';"
             "if (window && window.dispatchEvent) "
             "window.dispatchEvent(new Event('load'));"
         )
