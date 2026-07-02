@@ -396,9 +396,23 @@ var _nodeIdCounter  = 2000000;   // high start to avoid collision
 
 var _consoleMessages = [];
 
-function _py_console_log()  { /* no-op in V8 — output captured by _consoleMessages */ }
-function _py_console_warn() {}
-function _py_console_error(){}
+// Console capture — pages and frameworks report failures here; agents
+// (and our own debugging) read them via _getConsoleMessages().
+var _consoleMessages = [];
+function _pushConsole(level, msg) {
+    _consoleMessages.push({level: level, text: String(msg).substring(0, 600)});
+    if (_consoleMessages.length > 300) _consoleMessages.shift();
+}
+function _py_console_log(msg)   { _pushConsole('log', msg); }
+function _py_console_warn(msg)  { _pushConsole('warn', msg); }
+function _py_console_error(msg) { _pushConsole('error', msg); }
+function _getConsoleMessages(level) {
+    var out = [];
+    for (var i = 0; i < _consoleMessages.length; i++) {
+        if (!level || _consoleMessages[i].level === level) out.push(_consoleMessages[i]);
+    }
+    return JSON.stringify(out);
+}
 
 // ── Document metadata ────────────────────────────────────────────────────
 
@@ -1217,6 +1231,9 @@ function _safeParse(s) {
 var console = (function() {
     function _fmt(args) {
         return Array.prototype.slice.call(args).map(function(a) {
+            if (a && (a instanceof Error || (typeof a.message === 'string' && typeof a.stack === 'string'))) {
+                return a.stack || (a.name + ': ' + a.message);
+            }
             if (typeof a === 'object') try { return JSON.stringify(a); } catch(e) { return String(a); }
             return String(a);
         }).join(' ');
@@ -1246,23 +1263,85 @@ var console = (function() {
 function EventTarget() {
     this._listeners = {};
 }
+// Guard every method: objects adopt these via prototype chains without
+// running the constructor, so this._listeners may not exist yet.
 EventTarget.prototype.addEventListener = function(type, fn, options) {
+    if (!this._listeners) this._listeners = {};
     if (!this._listeners[type]) this._listeners[type] = [];
     this._listeners[type].push(fn);
 };
 EventTarget.prototype.removeEventListener = function(type, fn) {
+    if (!this._listeners) return;
     var list = this._listeners[type];
     if (!list) return;
     var idx = list.indexOf(fn);
     if (idx >= 0) list.splice(idx, 1);
 };
 EventTarget.prototype.dispatchEvent = function(event) {
+    if (!this._listeners) this._listeners = {};
     var type = typeof event === 'string' ? event : event.type;
     var list = (this._listeners[type] || []).slice();
     for (var i = 0; i < list.length; i++) {
         try { list[i].call(this, event); } catch(e) {}
     }
     return true;
+};
+
+// ── AbortController / AbortSignal ─────────────────────────────────────────────
+// Required by webpack runtime chunks and every modern fetch wrapper —
+// missing this killed entire module systems at load time.
+
+function AbortSignal() {
+    EventTarget.call(this);
+    this.aborted = false;
+    this.reason = undefined;
+    this.onabort = null;
+}
+AbortSignal.prototype = Object.create(EventTarget.prototype);
+AbortSignal.prototype.constructor = AbortSignal;
+AbortSignal.prototype.throwIfAborted = function() {
+    if (this.aborted) throw this.reason;
+};
+AbortSignal.abort = function(reason) {
+    var s = new AbortSignal();
+    s.aborted = true;
+    s.reason = reason !== undefined ? reason : new Error('AbortError');
+    return s;
+};
+AbortSignal.timeout = function(ms) {
+    var s = new AbortSignal();
+    setTimeout(function() {
+        if (!s.aborted) {
+            s.aborted = true;
+            s.reason = new Error('TimeoutError');
+            if (s.onabort) try { s.onabort({type: 'abort', target: s}); } catch(e) {}
+            s.dispatchEvent({type: 'abort', target: s});
+        }
+    }, ms);
+    return s;
+};
+AbortSignal.any = function(signals) {
+    var s = new AbortSignal();
+    for (var i = 0; i < (signals || []).length; i++) {
+        if (signals[i] && signals[i].aborted) {
+            s.aborted = true;
+            s.reason = signals[i].reason;
+            break;
+        }
+    }
+    return s;
+};
+
+function AbortController() {
+    this.signal = new AbortSignal();
+}
+AbortController.prototype.abort = function(reason) {
+    var s = this.signal;
+    if (s.aborted) return;
+    s.aborted = true;
+    s.reason = reason !== undefined ? reason : new Error('AbortError');
+    if (s.onabort) try { s.onabort({type: 'abort', target: s}); } catch(e) {}
+    s.dispatchEvent({type: 'abort', target: s});
 };
 
 // ── Element proxy ─────────────────────────────────────────────────────────────
@@ -1860,7 +1939,11 @@ var document = (function() {
     doc._listeners = {};
     doc.nodeType = 9;
     doc.nodeName = '#document';
-    doc.readyState = 'complete';
+    // Lifecycle: 'loading' while page scripts execute, 'interactive' at
+    // DOMContentLoaded, 'complete' at load — frameworks key real work
+    // off this (Next.js closes its RSC flight stream at DOMContentLoaded;
+    // reporting 'complete' during script execution truncates the stream).
+    doc.readyState = 'loading';
     doc.compatMode = 'CSS1Compat';
     doc.characterSet = 'UTF-8';
     doc.charset = 'UTF-8';
@@ -2023,6 +2106,20 @@ var document = (function() {
             id: '', className: '', textContent: '', innerHTML: '',
             attributes: {}, children: []
         });
+    };
+    doc.createElementNS = function(ns, tag) {
+        var el = doc.createElement(tag);
+        el.namespaceURI = ns;
+        return el;
+    };
+    doc.createComment = function(text) {
+        var raw = _safeParse(_py_create_text_node(''));
+        var c = raw ? _makeElement(raw) : _makeElement({nodeId: '_c_' + (_elementIndex + 1), tag: '#comment', nodeType: 8});
+        c.nodeType = 8;
+        c.nodeName = '#comment';
+        c.data = String(text === undefined ? '' : text);
+        c.nodeValue = c.data;
+        return c;
     };
     doc.createTextNode = function(text) {
         var raw = _safeParse(_py_create_text_node(text));
@@ -3083,6 +3180,15 @@ window.InputEvent = function(type, init) {
     this.data = (init || {}).data || null;
     this.inputType = (init || {}).inputType || '';
 };
+// PromiseRejectionEvent must exist: core-js's feature detection treats
+// its absence as "native Promise is broken" and installs its own
+// Promise polyfill, whose microtask pump spins forever in this
+// environment (observed on Next.js polyfills chunks).
+window.PromiseRejectionEvent = function(type, init) {
+    window.Event.call(this, type, init);
+    this.promise = (init || {}).promise;
+    this.reason = (init || {}).reason;
+};
 
 // DOMParser for runtime HTML parsing — parses into an isolated scratch
 // document so parsed content never leaks into (or wipes) the live page.
@@ -3097,15 +3203,168 @@ window.DOMParser.prototype.parseFromString = function(str, type) {
     return sdoc;
 };
 
-// TextEncoder/TextDecoder
-window.TextEncoder = function() {};
+// TextEncoder/TextDecoder — real UTF-8, not charCode passthrough.
+// React's RSC flight parser navigates the byte stream by offset; a
+// non-UTF-8 encoder breaks offsets on any non-ASCII page and the
+// parser loops forever.
+window.TextEncoder = function() { this.encoding = 'utf-8'; };
 window.TextEncoder.prototype.encode = function(str) {
-    var arr = [];
-    for (var i = 0; i < str.length; i++) arr.push(str.charCodeAt(i));
-    return new Uint8Array(arr);
+    str = String(str === undefined ? '' : str);
+    var out = [];
+    for (var i = 0; i < str.length; i++) {
+        var c = str.codePointAt(i);
+        if (c > 0xFFFF) i++;
+        if (c < 0x80) out.push(c);
+        else if (c < 0x800) out.push(0xC0 | (c >> 6), 0x80 | (c & 63));
+        else if (c < 0x10000) out.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+        else out.push(0xF0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    }
+    return new Uint8Array(out);
 };
-window.TextDecoder = function() {};
-window.TextDecoder.prototype.decode = function(buf) { return String.fromCharCode.apply(null, buf); };
+window.TextEncoder.prototype.encodeInto = function(str, dest) {
+    var bytes = this.encode(str);
+    var n = Math.min(bytes.length, dest.length);
+    for (var i = 0; i < n; i++) dest[i] = bytes[i];
+    return { read: str.length, written: n };
+};
+window.TextDecoder = function(label) { this.encoding = label || 'utf-8'; };
+window.TextDecoder.prototype.decode = function(buf, opts) {
+    if (buf === undefined || buf === null) return '';
+    var bytes;
+    if (buf instanceof Uint8Array) bytes = buf;
+    else if (buf && buf.buffer instanceof ArrayBuffer) bytes = new Uint8Array(buf.buffer, buf.byteOffset || 0, buf.byteLength);
+    else if (buf instanceof ArrayBuffer) bytes = new Uint8Array(buf);
+    else bytes = new Uint8Array(buf);
+    var out = '', i = 0, len = bytes.length;
+    while (i < len) {
+        var b = bytes[i++];
+        if (b < 0x80) {
+            out += String.fromCharCode(b);
+        } else if (b < 0xE0) {
+            out += String.fromCharCode(((b & 31) << 6) | (bytes[i++] & 63));
+        } else if (b < 0xF0) {
+            out += String.fromCharCode(((b & 15) << 12) | ((bytes[i++] & 63) << 6) | (bytes[i++] & 63));
+        } else {
+            var cp = ((b & 7) << 18) | ((bytes[i++] & 63) << 12) | ((bytes[i++] & 63) << 6) | (bytes[i++] & 63);
+            cp -= 0x10000;
+            out += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 1023));
+        }
+    }
+    return out;
+};
+
+// ── Streams API ───────────────────────────────────────────────────────────────
+// A REAL queue-backed ReadableStream: React's RSC flight client reads
+// its payload through one of these — a stub that reports 'done'
+// immediately silently drops the entire payload ("Connection closed").
+window.ReadableStream = function(underlyingSource) {
+    var self = this;
+    this.locked = false;
+    this._queue = [];
+    this._closed = false;
+    this._storedError = null;
+    this._waiters = [];
+    var controller = {
+        enqueue: function(chunk) {
+            if (self._closed) return;
+            if (self._waiters.length) {
+                self._waiters.shift().resolve({value: chunk, done: false});
+            } else {
+                self._queue.push(chunk);
+            }
+        },
+        close: function() {
+            if (self._closed) return;
+            self._closed = true;
+            while (self._waiters.length) {
+                self._waiters.shift().resolve({value: undefined, done: true});
+            }
+        },
+        error: function(e) {
+            if (self._closed) return;
+            self._closed = true;
+            self._storedError = e || new Error('stream error');
+            while (self._waiters.length) {
+                self._waiters.shift().reject(self._storedError);
+            }
+        },
+    };
+    Object.defineProperty(controller, 'desiredSize', {
+        get: function() { return self._closed ? null : 1; },
+    });
+    this._controller = controller;
+    this._source = underlyingSource || {};
+    if (this._source.start) {
+        try { this._source.start(controller); }
+        catch(e) { controller.error(e); }
+    }
+};
+window.ReadableStream.prototype.getReader = function() {
+    var self = this;
+    this.locked = true;
+    return {
+        read: function() {
+            if (self._queue.length) {
+                return Promise.resolve({value: self._queue.shift(), done: false});
+            }
+            if (self._storedError) return Promise.reject(self._storedError);
+            if (self._closed) return Promise.resolve({value: undefined, done: true});
+            // Give pull-based sources a chance to produce data
+            if (self._source.pull) {
+                try { self._source.pull(self._controller); } catch(e) { self._controller.error(e); }
+                if (self._queue.length) {
+                    return Promise.resolve({value: self._queue.shift(), done: false});
+                }
+                if (self._closed) return Promise.resolve({value: undefined, done: true});
+            }
+            return new Promise(function(resolve, reject) {
+                self._waiters.push({resolve: resolve, reject: reject});
+            });
+        },
+        cancel: function() { self._closed = true; return Promise.resolve(); },
+        releaseLock: function() { self.locked = false; },
+        closed: Promise.resolve(),
+    };
+};
+window.ReadableStream.prototype.cancel = function() {
+    this._closed = true;
+    return Promise.resolve();
+};
+window.ReadableStream.prototype.pipeThrough = function(t) { return (t && t.readable) || this; };
+window.ReadableStream.prototype.pipeTo = function() { return Promise.resolve(); };
+window.ReadableStream.prototype.tee = function() { return [this, this]; };
+
+window.WritableStream = function(underlyingSink) { this._sink = underlyingSink || {}; this.locked = false; };
+window.WritableStream.prototype.getWriter = function() {
+    return {
+        write: function() { return Promise.resolve(); },
+        close: function() { return Promise.resolve(); },
+        abort: function() { return Promise.resolve(); },
+        releaseLock: function() {},
+        ready: Promise.resolve(),
+        closed: Promise.resolve(),
+    };
+};
+window.WritableStream.prototype.abort = function() { return Promise.resolve(); };
+
+window.TransformStream = function() {
+    this.readable = new window.ReadableStream();
+    this.writable = new window.WritableStream();
+};
+window.TextEncoderStream = function() {
+    this.readable = new window.ReadableStream();
+    this.writable = new window.WritableStream();
+};
+window.TextDecoderStream = function() {
+    this.readable = new window.ReadableStream();
+    this.writable = new window.WritableStream();
+};
+
+if (typeof structuredClone === 'undefined') {
+    window.structuredClone = function(v) {
+        try { return JSON.parse(JSON.stringify(v)); } catch(e) { return v; }
+    };
+}
 
 // window dimensions
 window.innerWidth = 1920;
