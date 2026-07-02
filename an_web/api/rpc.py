@@ -88,7 +88,9 @@ def _validate_request(tool_name: str, params: dict[str, Any]) -> dict[str, Any]:
         ClickRequest,
         EvalJSRequest,
         ExtractRequest,
+        FetchRequest,
         NavigateRequest,
+        NetworkRequest,
         ScrollRequest,
         SelectRequest,
         SnapshotRequest,
@@ -109,6 +111,8 @@ def _validate_request(tool_name: str, params: dict[str, Any]) -> dict[str, Any]:
         "wait_for":  WaitForRequest,
         "scroll":    ScrollRequest,
         "eval_js":   EvalJSRequest,
+        "network":   NetworkRequest,
+        "fetch":     FetchRequest,
     }
 
     model_cls = _MODEL_MAP.get(tool_name)
@@ -180,6 +184,14 @@ async def _dispatch(
     if tool_name == "eval_js":
         from an_web.actions.eval_js import EvalJSAction
         return await EvalJSAction().execute(session, **params)
+
+    if tool_name == "network":
+        from an_web.actions.network import NetworkAction
+        return await NetworkAction().execute(session, **params)
+
+    if tool_name == "fetch":
+        from an_web.actions.fetch import FetchAction
+        return await FetchAction().execute(session, **params)
 
     return {
         "status": "failed",

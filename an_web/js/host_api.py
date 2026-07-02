@@ -1133,21 +1133,47 @@ function _py_get_fired_timers() {
     return JSON.stringify(fired);
 }
 
-// ── Fetch ────────────────────────────────────────────────────────────────
-// Synchronous fetch is not possible in V8.  The JS fetch() function
-// returns a Promise; the bridge queues requests for Python to resolve.
+// ── Fetch (async bridge) ─────────────────────────────────────────────────
+// Network I/O cannot run inside V8.  fetch()/XHR queue a request via the
+// bridge; the Python settle loop performs the HTTP call and invokes
+// _resolveFetch(id, dataJson) to settle the Promise / fire XHR events.
 
-function _py_fetch_sync(url, method, bodyJson, headersJson) {
-    // For synchronous callers (XHR), queue and return empty response
-    _bridgeCommands.push({type:'fetch', url:url, method:method, bodyJson:bodyJson, headersJson:headersJson});
-    return JSON.stringify({ok:false, status:0, text:'', error:'v8_async_only'});
-}
-
+var _fetchResolvers = {};
+var _fetchIdCounter = 0;
 var _resolvedFetches = {};
 
-function _py_fetch_async(requestId, url, method, bodyJson, headersJson) {
-    _bridgeCommands.push({type:'fetch_async', id:requestId, url:url, method:method, bodyJson:bodyJson, headersJson:headersJson});
+function _queueBridgeFetch(id, url, method, body, headersObj, kind) {
+    _bridgeCommands.push({
+        type: 'fetch_async', id: id, url: String(url),
+        method: (method || 'GET').toUpperCase(),
+        body: (body === undefined || body === null) ? null : String(body),
+        headersJson: JSON.stringify(headersObj || {}),
+        kind: kind,
+    });
 }
+
+function _resolveFetch(id, dataJson) {
+    var entry = _fetchResolvers[id];
+    if (!entry) return false;
+    delete _fetchResolvers[id];
+    var data;
+    try { data = JSON.parse(dataJson); } catch(e) { data = {error: 'bad_bridge_payload', ok: false, status: 0, text: ''}; }
+    _resolvedFetches[id] = {ok: data.ok, status: data.status};
+    if (entry.xhr) { _settleXHR(entry.xhr, data, entry.url); return true; }
+    if (data.error) {
+        entry.reject(new TypeError('fetch failed: ' + data.error));
+    } else {
+        entry.resolve(_makeFetchResponse(data, entry.url));
+    }
+    return true;
+}
+
+function _pendingFetchCount() {
+    var n = 0;
+    for (var k in _fetchResolvers) n++;
+    return n;
+}
+
 function _py_fetch_poll(requestId) {
     var r = _resolvedFetches[requestId];
     if (r) return JSON.stringify({resolved:true, result:r});
@@ -1243,8 +1269,24 @@ EventTarget.prototype.dispatchEvent = function(event) {
 
 var _elementIndex = 0;
 
+// One wrapper object per nodeId — browsers guarantee stable element
+// identity, and frameworks depend on it (React stores fiber pointers as
+// expando properties; jQuery stores event data).  Recreating wrappers on
+// every access silently breaks them.
+var _elementCache = {};
+
 function _makeElement(data) {
     if (!data) return null;
+    if (typeof data === 'string') data = _domTree.nodes[data];
+    if (!data) return null;
+    if (data.nodeId && _elementCache[data.nodeId]) {
+        var cached = _elementCache[data.nodeId];
+        // Refresh scalar fields from the mirror; expandos/listeners survive.
+        if (data.attributes) cached._attributes = data.attributes;
+        if (data.id !== undefined) cached.id = data.id || '';
+        if (data.className !== undefined) cached.className = data.className || '';
+        return cached;
+    }
     var proto = (typeof HTMLElement !== 'undefined') ? HTMLElement.prototype : EventTarget.prototype;
     if (data.nodeType === 3 && typeof Text !== 'undefined') proto = Text.prototype;
     if (data.nodeType === 8 && typeof Comment !== 'undefined') proto = Comment.prototype;
@@ -1807,6 +1849,7 @@ function _makeElement(data) {
         return 4; // FOLLOWING (default)
     };
 
+    if (el.nodeId) _elementCache[el.nodeId] = el;
     return el;
 }
 
@@ -2237,6 +2280,40 @@ function requestAnimationFrame(fn) {
 function cancelAnimationFrame(id) {
     clearTimeout(id);
 }
+function requestIdleCallback(fn) {
+    return setTimeout(function() {
+        fn({ didTimeout: false, timeRemaining: function() { return 50; } });
+    }, 1);
+}
+function cancelIdleCallback(id) {
+    clearTimeout(id);
+}
+
+// MessageChannel — used by React's scheduler for task scheduling.
+function MessagePort() {
+    this.onmessage = null;
+    this._other = null;
+}
+MessagePort.prototype.postMessage = function(data) {
+    var other = this._other;
+    if (!other) return;
+    setTimeout(function() {
+        if (typeof other.onmessage === 'function') {
+            try { other.onmessage({ data: data }); } catch(e) {}
+        }
+    }, 0);
+};
+MessagePort.prototype.start = function() {};
+MessagePort.prototype.close = function() {};
+MessagePort.prototype.addEventListener = function(type, fn) {
+    if (type === 'message') this.onmessage = fn;
+};
+function MessageChannel() {
+    this.port1 = new MessagePort();
+    this.port2 = new MessagePort();
+    this.port1._other = this.port2;
+    this.port2._other = this.port1;
+}
 
 // Fire all timers that the Python layer has marked as ready.
 // A wall-clock budget bounds each call: without it, heavy callbacks
@@ -2280,38 +2357,99 @@ function _fireReadyTimers() {
 }
 
 // ── fetch ─────────────────────────────────────────────────────────────────────
+// Real async fetch: the Promise stays pending until the Python settle
+// loop performs the HTTP request and calls _resolveFetch().
+
+function _makeFetchResponse(data, reqUrl) {
+    var hdrs = data.headers || {};
+    var hdrsLower = {};
+    for (var k in hdrs) hdrsLower[String(k).toLowerCase()] = hdrs[k];
+    var resp = {
+        ok: !!data.ok,
+        status: data.status || 0,
+        statusText: data.statusText || (data.ok ? 'OK' : ''),
+        url: data.url || reqUrl,
+        redirected: !!data.redirected,
+        type: 'basic',
+        bodyUsed: false,
+        headers: {
+            get: function(n) {
+                var v = hdrsLower[String(n).toLowerCase()];
+                return v === undefined ? null : v;
+            },
+            has: function(n) { return String(n).toLowerCase() in hdrsLower; },
+            forEach: function(fn) { for (var k in hdrsLower) fn(hdrsLower[k], k); },
+        },
+        text: function() { resp.bodyUsed = true; return Promise.resolve(data.text || ''); },
+        json: function() {
+            resp.bodyUsed = true;
+            try { return Promise.resolve(JSON.parse(data.text || 'null')); }
+            catch(e) { return Promise.reject(e); }
+        },
+        blob: function() { resp.bodyUsed = true; return Promise.resolve(new Blob([data.text || ''])); },
+        arrayBuffer: function() {
+            resp.bodyUsed = true;
+            var t = data.text || '';
+            var buf = new ArrayBuffer(t.length);
+            var view = new Uint8Array(buf);
+            for (var i = 0; i < t.length; i++) view[i] = t.charCodeAt(i) & 0xff;
+            return Promise.resolve(buf);
+        },
+        clone: function() { return _makeFetchResponse(data, reqUrl); },
+    };
+    return resp;
+}
+
+function _headersToObject(h) {
+    var out = {};
+    if (!h) return out;
+    if (typeof h.forEach === 'function' && typeof h.get === 'function') {
+        h.forEach(function(v, k) { out[k] = String(v); });
+    } else if (Array.isArray(h)) {
+        for (var i = 0; i < h.length; i++) out[h[i][0]] = String(h[i][1]);
+    } else {
+        for (var k in h) out[k] = String(h[k]);
+    }
+    return out;
+}
 
 function fetch(url, options) {
     options = options || {};
+    if (url !== null && typeof url === 'object' && url.url) {
+        // Request object
+        options.method = options.method || url.method;
+        options.headers = options.headers || url.headers;
+        options.body = options.body !== undefined ? options.body : url._body;
+        url = url.url;
+    }
     var method = (options.method || 'GET').toUpperCase();
-    var body   = options.body ? JSON.stringify(options.body) : 'null';
-    var headers = options.headers ? JSON.stringify(options.headers) : 'null';
-
+    var body = options.body;
+    var headersObj = _headersToObject(options.headers);
+    _fetchIdCounter++;
+    var id = 'f' + _fetchIdCounter;
     return new Promise(function(resolve, reject) {
-        try {
-            var raw = _py_fetch_sync(url, method, body, headers);
-            var data = JSON.parse(raw);
-            if (data.error && data.error !== 'async_context_fetch_not_supported') {
-                reject(new TypeError('fetch failed: ' + data.error));
-                return;
-            }
-            var resp = {
-                ok:     data.ok,
-                status: data.status,
-                url:    data.url || url,
-                headers: { get: function(n) { return (data.headers || {})[n] || null; } },
-                text:  function() { return Promise.resolve(data.text || ''); },
-                json:  function() { return Promise.resolve(JSON.parse(data.text || 'null')); },
-                blob:  function() { return Promise.resolve(new Blob([data.text || ''])); },
-            };
-            resolve(resp);
-        } catch(e) {
-            reject(new TypeError('fetch failed: ' + e.message));
-        }
+        _fetchResolvers[id] = { resolve: resolve, reject: reject, url: String(url) };
+        _queueBridgeFetch(id, url, method, body, headersObj, 'fetch');
     });
 }
 
-// ── XMLHttpRequest stub ───────────────────────────────────────────────────────
+function Request(url, options) {
+    options = options || {};
+    this.url = String(url);
+    this.method = (options.method || 'GET').toUpperCase();
+    this.headers = options.headers || {};
+    this._body = options.body;
+}
+function Headers(init) {
+    var store = _headersToObject(init);
+    this.get = function(n) { var v = store[String(n).toLowerCase()]; if (v !== undefined) return v; for (var k in store) { if (k.toLowerCase() === String(n).toLowerCase()) return store[k]; } return null; };
+    this.set = function(n, v) { store[String(n)] = String(v); };
+    this.has = function(n) { return this.get(n) !== null; };
+    this.append = function(n, v) { store[String(n)] = String(v); };
+    this.forEach = function(fn) { for (var k in store) fn(store[k], k); };
+}
+
+// ── XMLHttpRequest (async bridge) ─────────────────────────────────────────────
 
 function XMLHttpRequest() {
     this.readyState = 0;
@@ -2320,57 +2458,111 @@ function XMLHttpRequest() {
     this.responseText = '';
     this.response = null;
     this.responseType = '';
+    this.responseURL = '';
     this._headers = {};
+    this._responseHeaders = {};
     this._method = 'GET';
     this._url = '';
+    this._listeners = {};
     this.onload = null;
     this.onerror = null;
+    this.onloadend = null;
+    this.ontimeout = null;
     this.onreadystatechange = null;
+    this.withCredentials = false;
+    this.timeout = 0;
 }
 XMLHttpRequest.prototype.open = function(method, url) {
     this._method = method;
     this._url = url;
     this.readyState = 1;
+    this._fireReadyStateChange();
 };
 XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
-    this._headers[name] = value;
+    this._headers[name] = String(value);
+};
+XMLHttpRequest.prototype.addEventListener = function(type, fn) {
+    if (!this._listeners[type]) this._listeners[type] = [];
+    this._listeners[type].push(fn);
+};
+XMLHttpRequest.prototype.removeEventListener = function(type, fn) {
+    var list = this._listeners[type];
+    if (!list) return;
+    var idx = list.indexOf(fn);
+    if (idx >= 0) list.splice(idx, 1);
+};
+XMLHttpRequest.prototype._fire = function(type) {
+    var ev = { type: type, target: this };
+    var handler = this['on' + type];
+    if (handler) try { handler.call(this, ev); } catch(e) {}
+    var list = (this._listeners[type] || []).slice();
+    for (var i = 0; i < list.length; i++) {
+        try { list[i].call(this, ev); } catch(e) {}
+    }
+};
+XMLHttpRequest.prototype._fireReadyStateChange = function() {
+    if (this.onreadystatechange) try { this.onreadystatechange({target: this}); } catch(e) {}
+    var list = (this._listeners['readystatechange'] || []).slice();
+    for (var i = 0; i < list.length; i++) { try { list[i].call(this, {target: this}); } catch(e) {} }
 };
 XMLHttpRequest.prototype.send = function(body) {
-    var self = this;
-    var raw;
-    try {
-        raw = _py_fetch_sync(
-            self._url, self._method,
-            body ? JSON.stringify(body) : 'null',
-            JSON.stringify(self._headers)
-        );
-        var data = JSON.parse(raw);
-        self.readyState = 4;
-        self.status     = data.status || 0;
-        self.statusText = data.ok ? 'OK' : 'Error';
-        self.responseText = data.text || '';
-        self.response    = self.responseText;
-    } catch(e) {
-        self.readyState = 4;
-        self.status = 0;
-    }
-    if (self.onreadystatechange) try { self.onreadystatechange(); } catch(e) {}
-    if (self.readyState === 4) {
-        if (self.status >= 200 && self.status < 300 && self.onload) {
-            try { self.onload({ target: self }); } catch(e) {}
-        } else if (self.onerror) {
-            try { self.onerror(); } catch(e) {}
-        }
-    }
+    _fetchIdCounter++;
+    var id = 'x' + _fetchIdCounter;
+    this.readyState = 2;
+    _fetchResolvers[id] = { xhr: this, url: String(this._url) };
+    _queueBridgeFetch(id, this._url, this._method, body, this._headers, 'xhr');
 };
-XMLHttpRequest.prototype.abort = function() {};
-XMLHttpRequest.prototype.getResponseHeader = function(name) { return null; };
-XMLHttpRequest.prototype.getAllResponseHeaders = function() { return ''; };
+XMLHttpRequest.prototype.abort = function() { this.readyState = 0; };
+XMLHttpRequest.prototype.getResponseHeader = function(name) {
+    var target = String(name).toLowerCase();
+    for (var k in this._responseHeaders) {
+        if (String(k).toLowerCase() === target) return this._responseHeaders[k];
+    }
+    return null;
+};
+XMLHttpRequest.prototype.getAllResponseHeaders = function() {
+    var out = '';
+    for (var k in this._responseHeaders) out += k + ': ' + this._responseHeaders[k] + '\r\n';
+    return out;
+};
+XMLHttpRequest.prototype.overrideMimeType = function() {};
 XMLHttpRequest.UNSENT = 0;
 XMLHttpRequest.OPENED = 1;
 XMLHttpRequest.HEADERS_RECEIVED = 2;
 XMLHttpRequest.LOADING = 3;
 XMLHttpRequest.DONE = 4;
+
+// Pristine references captured before page scripts run — pages (e.g.
+// Next.js) monkey-patch globalThis.fetch, and host tooling (eval_js)
+// must not depend on those wrappers.
+globalThis.__anweb_fetch = fetch;
+globalThis.__anweb_xhr = XMLHttpRequest;
+
+// Called by _resolveFetch when the Python host finishes an XHR request.
+function _settleXHR(x, data, reqUrl) {
+    x.readyState = 4;
+    if (data.error) {
+        x.status = 0;
+        x.statusText = 'error';
+        x._fireReadyStateChange();
+        x._fire('error');
+        x._fire('loadend');
+        return;
+    }
+    x.status = data.status || 0;
+    x.statusText = data.statusText || (data.ok ? 'OK' : '');
+    x.responseText = data.text || '';
+    x.responseURL = data.url || reqUrl;
+    x._responseHeaders = data.headers || {};
+    if (x.responseType === 'json') {
+        try { x.response = JSON.parse(x.responseText); } catch(e) { x.response = null; }
+    } else {
+        x.response = x.responseText;
+    }
+    x._fireReadyStateChange();
+    x._fire('load');
+    x._fire('loadend');
+}
 
 // ── performance ───────────────────────────────────────────────────────────────
 

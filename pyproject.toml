@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "an-web"
-version = "0.6.0"
+version = "0.7.0"
 description = "AN-Web: AI-Native Web Browser Engine — executes the web as an actionable state machine for AI agents"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -40,6 +40,12 @@ dev = [
     "mypy>=1.10.0",
     "ruff>=0.4.0",
 ]
+mcp = [
+    "mcp>=1.2.0",
+]
+
+[project.scripts]
+an-web-mcp = "an_web.mcp_server:main"
 
 [project.urls]
 Homepage = "https://github.com/CocoRoF/an-web"

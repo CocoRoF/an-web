@@ -872,17 +872,29 @@ class TestFetchAPI:
         assert ev(runtime, "fetch('/x') instanceof Promise") is True
 
     @pytest.mark.asyncio
-    async def test_fetch_promise_eventually_settles(self, rt):
+    async def test_fetch_promise_settles_via_bridge(self, rt):
         runtime, _ = rt
         runtime.eval_safe("""
         var _settled = false;
-        fetch('https://example.com/')
-            .then(function() { _settled = true; })
+        var _json = null;
+        fetch('https://example.com/api')
+            .then(function(r) { return r.json(); })
+            .then(function(j) { _settled = true; _json = j.a; })
             .catch(function() { _settled = true; });
         """)
         await runtime.settle(microtask_rounds=3)
-        r = runtime.eval_safe("_settled")
-        assert r.value is True
+        assert runtime.eval_safe("_settled").value is False
+        pending = getattr(runtime.session, "_pending_fetches", {})
+        assert len(pending) == 1
+        rid = next(iter(pending))
+        import json as _json_mod
+        payload = _json_mod.dumps(_json_mod.dumps(
+            {"ok": True, "status": 200, "text": '{"a": 7}'}
+        ))
+        runtime.eval_safe(f"_resolveFetch('{rid}', {payload})")
+        await runtime.settle(microtask_rounds=3)
+        assert runtime.eval_safe("_settled").value is True
+        assert runtime.eval_safe("_json").value == 7
 
     def test_xhr_constructor(self, rt):
         runtime, _ = rt

@@ -90,7 +90,11 @@ class ExtractAction(Action):
             elif mode == "json":
                 results = _extract_json(doc, query.get("selector", "script[type='application/json']"))  # type: ignore[union-attr]
             elif mode == "html":
-                results = _extract_html(doc, query.get("selector", "body"))  # type: ignore[union-attr]
+                results = _extract_html(
+                    doc,
+                    query.get("selector", "body"),  # type: ignore[union-attr]
+                    include_scripts=bool(query.get("include_scripts", False)),  # type: ignore[union-attr]
+                )
             else:
                 return self._make_failure("extract", f"unknown_mode:{mode}")
         except Exception as exc:
@@ -326,25 +330,51 @@ def _extract_json(doc: Any, selector: str) -> list[dict[str, Any]]:
 # ─── HTML mode ─────────────────────────────────────────────────────────────────
 
 
-def _extract_html(doc: Any, selector: str) -> list[dict[str, Any]]:
+_VOID_TAGS = frozenset({
+    "area", "base", "br", "col", "embed", "hr", "img", "input",
+    "link", "meta", "param", "source", "track", "wbr",
+})
+# Non-content elements dropped from html-mode output by default — script
+# payloads (webpack chunks, RSC streams) are noise for AI extraction.
+_HTML_NOISE_TAGS = frozenset({"script", "style", "template", "noscript"})
+
+
+def _serialize_html(node: Any, include_scripts: bool = False) -> str:
+    """Serialize a DOM subtree to HTML."""
+    from an_web.dom.nodes import Element, TextNode
+
+    if isinstance(node, TextNode):
+        return node.data
+    if not isinstance(node, Element):
+        return ""
+    if not include_scripts and node.tag in _HTML_NOISE_TAGS:
+        return ""
+    attrs = "".join(
+        f' {k}="{v}"' for k, v in (node.attributes or {}).items()
+    )
+    if node.tag in _VOID_TAGS:
+        return f"<{node.tag}{attrs}>"
+    inner = "".join(
+        _serialize_html(c, include_scripts) for c in node.children
+    )
+    return f"<{node.tag}{attrs}>{inner}</{node.tag}>"
+
+
+def _extract_html(
+    doc: Any, selector: str, include_scripts: bool = False
+) -> list[dict[str, Any]]:
     """
     Extract the outer HTML string of matching elements.
 
-    Falls back to text_content if outer_html is not available.
+    script/style/template/noscript subtrees are omitted unless
+    ``include_scripts`` is True.
     """
     from an_web.dom.document import query_selector_all
     elements = query_selector_all(doc, selector)
     results = []
     for el in elements:
-        html = ""
-        if hasattr(el, "outer_html"):
-            html = el.outer_html or ""
-        elif hasattr(el, "inner_html"):
-            html = el.inner_html or ""
-        elif hasattr(el, "text_content"):
-            html = el.text_content or ""
         results.append({
             "node_id": getattr(el, "node_id", ""),
-            "html": html,
+            "html": _serialize_html(el, include_scripts=include_scripts),
         })
     return results

@@ -602,8 +602,9 @@ class TestFetchStub:
         assert r.value is True
 
     @pytest.mark.asyncio
-    async def test_fetch_promise_settles(self, rt):
-        """Fetch promise should resolve (even if error due to no real network)."""
+    async def test_fetch_promise_queues_bridge_request(self, rt):
+        """fetch() queues a host request; the promise stays pending until
+        the settle loop performs it (async bridge semantics)."""
         rt.eval_safe("""
         var _fetchDone = false;
         fetch('https://example.com/')
@@ -611,8 +612,16 @@ class TestFetchStub:
             .catch(function() { _fetchDone = true; });
         """)
         await rt.drain_microtasks()
-        r = rt.eval_safe("_fetchDone")
-        assert r.value is True
+        assert rt.eval_safe("_fetchDone").value is False
+        pending = getattr(rt.session, "_pending_fetches", {})
+        assert len(pending) == 1
+        # Resolving via the bridge settles the promise
+        rid = next(iter(pending))
+        rt.eval_safe(
+            f"_resolveFetch('{rid}', JSON.stringify({{ok: true, status: 200, text: 'x'}}))"
+        )
+        await rt.drain_microtasks()
+        assert rt.eval_safe("_fetchDone").value is True
 
 
 # ─────────────────────────────────────────────────────────────────────────────

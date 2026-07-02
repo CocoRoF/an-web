@@ -29,10 +29,11 @@ async with ANWebEngine() as engine:
 - [Quick Start](#quick-start)
 - [Core Concepts](#core-concepts)
 - [Usage Patterns — Three Levels of API](#usage-patterns--three-levels-of-api)
-- [All 11 Tools Reference](#all-11-tools-reference)
+- [All 13 Tools Reference](#all-13-tools-reference)
 - [Semantic Targeting](#semantic-targeting)
 - [Data Extraction](#data-extraction)
 - [PageSemantics — The AI World Model](#pagesemantics--the-ai-world-model)
+- [MCP Server — an-web-mcp](#mcp-server--an-web-mcp)
 - [AI Model Integration (Claude / OpenAI)](#ai-model-integration-claude--openai)
 - [Policy & Safety](#policy--safety)
 - [Tracing & Replay](#tracing--replay)
@@ -134,7 +135,7 @@ async with ANWebEngine() as engine:
 ```
 
 Every interaction uses the same `session.act({...})` pattern.
-One method, 11 tools, zero boilerplate.
+One method, 13 tools, zero boilerplate.
 
 ---
 
@@ -155,7 +156,7 @@ ANWebEngine (process-level, async context manager)
   └── Session (one per "browser tab")
         ├── navigate(url)       → load page, run JS, settle
         ├── snapshot()          → return PageSemantics object
-        ├── act({tool, ...})    → execute any of the 11 tools
+        ├── act({tool, ...})    → execute any of the 13 tools
         ├── execute_script(js)  → direct JavaScript evaluation
         ├── back()              → navigate to previous URL
         └── close()             → cleanup resources
@@ -186,7 +187,7 @@ AN-Web provides three levels of API so you can choose the right abstraction for 
 
 **Simplest. Recommended for most use cases.**
 
-One method handles all 11 tools. The input is a plain dict:
+One method handles all 13 tools. The input is a plain dict:
 
 ```python
 async with ANWebEngine() as engine:
@@ -287,7 +288,7 @@ Pipeline: Parse → Validate → Normalize → Policy Check → Dispatch → Col
 
 ---
 
-## All 11 Tools Reference
+## All 13 Tools Reference
 
 ### `navigate` — Load a URL
 
@@ -379,6 +380,51 @@ result = await session.act({
     "tool": "eval_js",
     "script": "Array.from(document.querySelectorAll('a')).map(a => a.href)"
 })
+
+# Promises are awaited (like Playwright's evaluate) — fetch/XHR the
+# script starts are performed by the engine before returning:
+result = await session.act({
+    "tool": "eval_js",
+    "script": "fetch('/api/items').then(r => r.json())",
+})
+result["effects"]["raw_value"]   # → parsed JSON
+```
+
+### `fetch` — Agent-Initiated HTTP (APIRequestContext)
+
+Perform an HTTP request with the session's cookies and policy, without
+going through page JavaScript — the equivalent of Playwright's
+APIRequestContext. The reliable way to pull data from the APIs a page
+uses; hostile or broken page JS cannot interfere.
+
+```python
+result = await session.act({"tool": "fetch", "url": "/api/v1/posts"})
+result["effects"]["json"]     # parsed body for JSON responses
+result["effects"]["status"]   # HTTP status
+result["effects"]["body"]     # raw text (capped at 200k chars)
+
+# POST with body/headers; relative URLs resolve against the current page
+await session.act({
+    "tool": "fetch", "url": "/api/search", "method": "POST",
+    "headers": {"Content-Type": "application/json"},
+    "body": '{"q": "python"}',
+})
+```
+
+### `network` — Runtime Network Activity
+
+Every fetch/XHR the page performs at runtime is logged. When content is
+missing from the DOM (client-side rendering), the data is usually here.
+
+```python
+result = await session.act({"tool": "network"})
+result["effects"]["requests"]
+# → [{"index": 0, "method": "GET", "url": ".../api/posts",
+#     "status": 200, "content_type": "application/json",
+#     "body": "<2KB preview>", "body_size": 65902, ...}]
+
+# Full body of one request:
+result = await session.act({"tool": "network", "index": 0})
 ```
 
 ---
@@ -544,6 +590,60 @@ AN-Web automatically classifies pages into semantic types:
 | `form` | Generic form | Contact form |
 | `error` | Error page (404, 500) | Not Found |
 | `generic` | Other | Landing page |
+
+---
+
+## MCP Server — an-web-mcp
+
+AN-Web ships an MCP (Model Context Protocol) server with a tool surface
+modelled on Microsoft's playwright-mcp — agents already fluent in that
+contract feel at home, minus the Chromium.
+
+```bash
+# Run directly
+uvx --from 'an-web[mcp]' an-web-mcp
+
+# Or register with Claude Code
+claude mcp add an-web -- uvx --from 'an-web[mcp]' an-web-mcp
+```
+
+```json
+// Claude Desktop / any MCP host
+{
+  "mcpServers": {
+    "an-web": {
+      "command": "uvx",
+      "args": ["--from", "an-web[mcp]", "an-web-mcp"]
+    }
+  }
+}
+```
+
+**Tools** (13): `browser_navigate`, `browser_navigate_back`,
+`browser_snapshot`, `browser_click`, `browser_type`,
+`browser_select_option`, `browser_wait_for`, `browser_evaluate`,
+`browser_extract`, `browser_fetch`, `browser_network_requests`,
+`browser_network_request`, `browser_close`
+
+Conventions follow playwright-mcp:
+
+- `browser_snapshot` returns a compact accessibility-style tree; interactive
+  elements carry `[ref=nN]` handles.
+- Action tools take `element` (human-readable description, for audit) +
+  `target` (a ref from the latest snapshot, or a CSS selector).
+- Every mutating tool returns a fresh snapshot inline — no follow-up
+  round trip needed.
+- `browser_fetch` / `browser_network_requests` expose the data plane
+  directly: when a page renders content client-side, the agent reads the
+  API payload instead of scraping pixels.
+
+Environment configuration:
+
+| Variable | Effect |
+|---|---|
+| `ANWEB_ALLOWED_DOMAINS` | Comma-separated domain allowlist |
+| `ANWEB_BLOCKED_DOMAINS` | Comma-separated domain blocklist |
+| `ANWEB_NAV_TIMEOUT` | Navigation settle budget in seconds (default 15) |
 
 ---
 
@@ -999,7 +1099,7 @@ async def safe_browse():
 ## Testing
 
 ```bash
-# Run all tests (1540 tests)
+# Run all tests (1554 tests)
 pytest
 
 # With coverage
@@ -1012,7 +1112,7 @@ pytest tests/unit/dom/ -v
 pytest tests/integration/ -v
 ```
 
-**Test Suite (1540 tests):**
+**Test Suite (1554 tests):**
 
 | Suite | Count | Covers |
 |---|---|---|
@@ -1041,7 +1141,7 @@ pytest tests/integration/ -v
 |---|---|---|
 | `navigate(url, timeout=None)` | `dict` | Load URL, build DOM, execute JS, settle (default 15s settle budget) |
 | `snapshot()` | `PageSemantics` | Structured semantic page state (object) |
-| `act(tool_call)` | `dict` | Execute any of the 11 tools |
+| `act(tool_call)` | `dict` | Execute any of the 13 tools |
 | `execute_script(js)` | `Any` | Direct JavaScript evaluation |
 | `back()` | `dict` | Navigate to previous URL |
 | `close()` | `None` | Release resources |
@@ -1090,7 +1190,7 @@ Apache-2.0
 git clone https://github.com/CocoRoF/an-web
 cd an-web
 pip install -e ".[dev]"
-pytest                    # all 1540 tests should pass
+pytest                    # all 1554 tests should pass
 ruff check an_web/        # linting
 mypy an_web/              # type checking
 ```

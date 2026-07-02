@@ -97,6 +97,42 @@ class Action(ABC):
 
         return None
 
+    async def _settle_after_action(
+        self, session: Session, budget_s: float = 5.0
+    ) -> int:
+        """
+        Settle async work triggered by an action's event handlers.
+
+        Mirrors real-browser behaviour (and playwright-mcp's
+        waitForCompletion): fetch/XHR requests started by click/input
+        handlers are performed and their Promises resolved, timers fire,
+        and dynamically inserted scripts load — all within *budget_s*.
+
+        Returns the number of async work items processed.
+        """
+        import asyncio as _asyncio
+        import time as _time
+
+        from an_web.actions.navigate import (
+            _process_dynamic_scripts,
+            _process_pending_fetches,
+        )
+
+        js_runtime = getattr(session, "js_runtime", None)
+        deadline = _time.monotonic() + budget_s
+        total = 0
+        while _time.monotonic() < deadline:
+            activity = 0
+            if js_runtime is not None and js_runtime.is_available():
+                activity += await js_runtime.drain_microtasks()
+            activity += await _process_pending_fetches(session)
+            activity += await _process_dynamic_scripts(session)
+            if not activity:
+                break
+            total += activity
+            await _asyncio.sleep(0.01)
+        return total
+
     def _check_policy(
         self,
         session: Session,
