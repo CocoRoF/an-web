@@ -9,10 +9,14 @@ if TYPE_CHECKING:
     from an_web.core.session import Session
     from an_web.dom.semantics import ActionResult
 
+# Stringified results larger than this are truncated — an AI agent
+# consuming tool output never needs multi-megabyte strings.
+_MAX_RESULT_CHARS = 100_000
+
 
 class EvalJSAction(Action):
     """
-    Evaluate arbitrary JavaScript in the current page's QuickJS context.
+    Evaluate arbitrary JavaScript in the current page's V8 context.
 
     The result is stringified and returned in ``effects["result"]``.
     Useful for inspecting page state, triggering custom JS logic, or
@@ -56,13 +60,19 @@ class EvalJSAction(Action):
             )
 
         raw = eval_result.value
+        text = str(raw) if raw is not None else None
+        truncated = False
+        if text is not None and len(text) > _MAX_RESULT_CHARS:
+            text = text[:_MAX_RESULT_CHARS]
+            truncated = True
         return ActionResult(
             status="ok",
             action="eval_js",
             effects={
-                "result": str(raw) if raw is not None else None,
+                "result": text,
                 "raw_value": raw,
                 "raw_type": type(raw).__name__,
                 "available": True,
+                "truncated": truncated,
             },
         )

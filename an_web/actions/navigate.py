@@ -36,6 +36,9 @@ _MAX_SCRIPT_TIME = 30.0
 _SETTLE_ROUNDS = 10
 # Max macrotask wait per settle round (ms)
 _MACROTASK_WAIT_MS = 200
+# Default wall-clock budget for script execution + settle (seconds).
+# Fetch/parse are excluded — they have their own network timeouts.
+_NAVIGATE_BUDGET_S = 15.0
 
 
 class NavigateAction(Action):
@@ -57,9 +60,12 @@ class NavigateAction(Action):
         self,
         session: Session,
         url: str = "",
+        timeout: float | None = None,
         **kwargs: Any,
     ) -> ActionResult:
         from an_web.dom.semantics import ActionResult
+
+        budget_s = timeout if timeout and timeout > 0 else _NAVIGATE_BUDGET_S
 
         # ── 1. Policy check ───────────────────────────────────────────
         policy_failure = self._check_policy(session, "navigate", url=url)
@@ -106,30 +112,66 @@ class NavigateAction(Action):
             )
             snapshot_id = snap.snapshot_id
 
+        # ── 4b. Re-inject DOM into V8 now that the document is parsed ──
+        js_runtime = getattr(session, "js_runtime", None)
+        if js_runtime is not None and js_runtime.is_available():
+            try:
+                from an_web.js.host_api import reinject_dom_state
+                reinject_dom_state(js_runtime.ctx, session)
+            except Exception:
+                pass
+
         # ── 5. Execute scripts (inline + external, in document order) ─
         scripts_found = 0
         scripts_executed = 0
         external_loaded = 0
-        js_runtime = getattr(session, "js_runtime", None)
+        settle_timed_out = False
 
-        if js_runtime is not None and js_runtime.is_available():
-            scripts_found, scripts_executed, external_loaded = (
-                await _execute_scripts_full(
-                    document, js_runtime, session, response.url
-                )
+        # Wall-clock budget for script execution + settle.  Individual V8
+        # evals are capped by JSRuntime's per-eval timeout; this asyncio
+        # deadline bounds the overall loop between evals.
+        try:
+            async with asyncio.timeout(budget_s):
+                if js_runtime is not None and js_runtime.is_available():
+                    # Clear dynamic script queue before initial execution
+                    session._pending_dynamic_scripts = []  # type: ignore[attr-defined]
+                    scripts_found, scripts_executed, external_loaded = (
+                        await _execute_scripts_full(
+                            document, js_runtime, session, response.url
+                        )
+                    )
+
+                # ── 5b. Fire DOMContentLoaded + load (HTML5 lifecycle) ─
+                if js_runtime is not None and js_runtime.is_available():
+                    js_runtime.dispatch_dom_content_loaded()
+                    await js_runtime.drain_microtasks()
+                    js_runtime.dispatch_load()
+                    await js_runtime.drain_microtasks()
+
+                # ── 6. Settle event loop (micro/macrotasks + dynamic scripts)
+                await _settle_page(session, rounds=_SETTLE_ROUNDS)
+        except TimeoutError:
+            settle_timed_out = True
+            log.warning(
+                "navigate settle budget (%.1fs) exceeded for %s — "
+                "page returned in current state", budget_s, url,
             )
 
-        # ── 5b. Fire DOMContentLoaded + load (HTML5 lifecycle) ────────
+        # ── 6b. Sync JS DOM mutations back to Python DOM ──────────────
         if js_runtime is not None and js_runtime.is_available():
-            js_runtime.dispatch_dom_content_loaded()
-            await js_runtime.drain_microtasks()
-            js_runtime.dispatch_load()
-            await js_runtime.drain_microtasks()
+            try:
+                from an_web.js.host_api import sync_dom_mutations
+                sync_dom_mutations(js_runtime.ctx, session)
+            except Exception:
+                pass
 
-        # ── 6. Settle event loop (microtasks + macrotasks) ────────────
-        await _settle_page(session, rounds=_SETTLE_ROUNDS)
+        # Count dynamic scripts that were loaded during settle
+        dynamic_loaded = len(js_runtime._scripts_loaded) - scripts_found \
+            if js_runtime and js_runtime.is_available() else 0
+        dynamic_loaded = max(0, dynamic_loaded)
 
         # ── 7. Return ActionResult ────────────────────────────────────
+        total_scripts = scripts_found + dynamic_loaded
         return ActionResult(
             status="ok",
             action="navigate",
@@ -140,9 +182,11 @@ class NavigateAction(Action):
                 "status_code": response.status,
                 "dom_ready": True,
                 "redirect_count": response.redirect_count,
-                "scripts_found": scripts_found,
+                "scripts_found": total_scripts,
                 "scripts_executed": scripts_executed,
                 "external_loaded": external_loaded,
+                "dynamic_loaded": dynamic_loaded,
+                "settle_timeout": settle_timed_out,
             },
             state_delta_id=snapshot_id,
             recommended_next_actions=[{"tool": "snapshot"}],
@@ -286,7 +330,7 @@ async def _execute_scripts_full(
 async def _settle_page(session: Any, rounds: int = 5) -> None:
     """
     Full page settle: drain microtasks, fire timers, process fetches,
-    settle network.
+    load dynamic scripts, settle network.
 
     Runs multiple rounds to handle timer-triggered scripts that enqueue
     more microtasks, timers, or fetch requests.
@@ -314,17 +358,22 @@ async def _settle_page(session: Any, rounds: int = 5) -> None:
         if fetched > 0:
             activity = True
 
-        # 4. Drain microtasks again (macrotask/fetch callbacks may have queued promises)
+        # 4. Load dynamically inserted <script> elements
+        loaded = await _process_dynamic_scripts(session)
+        if loaded > 0:
+            activity = True
+
+        # 5. Drain microtasks again (macrotask/fetch callbacks may have queued promises)
         if js_runtime and js_runtime.is_available():
             drained = await js_runtime.drain_microtasks()
             if drained > 0:
                 activity = True
 
-        # 5. Network settle
+        # 6. Network settle
         if scheduler:
             await scheduler.settle_network(timeout=1.0)
 
-        # 6. DOM mutation flush
+        # 7. DOM mutation flush
         if scheduler:
             await scheduler.flush_dom_mutations()
 
@@ -357,13 +406,11 @@ async def _process_pending_fetches(session: Any) -> int:
 
         url = info.get("url", "")
         method = info.get("method", "GET")
-        body_json = info.get("body_json", "null")
         headers_json = info.get("headers_json", "null")
 
         try:
             import json
             headers = json.loads(headers_json) if headers_json and headers_json != "null" else {}
-            body = json.loads(body_json) if body_json and body_json != "null" else None
 
             if "Referer" not in headers:
                 headers["Referer"] = getattr(session, "_current_url", "") or ""
@@ -387,9 +434,7 @@ async def _process_pending_fetches(session: Any) -> int:
             # Resolve the JS promise via eval
             js_runtime = getattr(session, "js_runtime", None)
             if js_runtime and js_runtime.is_available():
-                result_json = json.dumps(result)
-                # the _py_fetch_poll will now return resolved=True
-                # but we also need to trigger any waiting code
+                # Trigger any waiting code / resolve promises
                 await js_runtime.drain_microtasks()
 
         except Exception as exc:
@@ -399,3 +444,51 @@ async def _process_pending_fetches(session: Any) -> int:
             processed += 1
 
     return processed
+
+
+async def _process_dynamic_scripts(session: Any) -> int:
+    """
+    Fetch and execute dynamically inserted <script src> elements.
+
+    When JS code does ``document.createElement('script')`` +
+    ``el.src = '...'`` + ``parent.appendChild(el)``, the script URL
+    is queued in ``session._pending_dynamic_scripts``.  This function
+    fetches and evaluates those scripts, mirroring real browser behaviour.
+
+    Returns the number of scripts loaded.
+    """
+    pending = getattr(session, "_pending_dynamic_scripts", None)
+    if not pending:
+        return 0
+
+    network = getattr(session, "network", None)
+    js_runtime = getattr(session, "js_runtime", None)
+    if not network or not js_runtime or not js_runtime.is_available():
+        return 0
+
+    base_url = getattr(session, "_current_url", "about:blank") or "about:blank"
+    loaded = 0
+    # Drain the queue (scripts may enqueue more during execution)
+    while pending:
+        entry = pending.pop(0)
+        src = entry["src"]
+        resolved_url = urljoin(base_url, src)
+        try:
+            resp = await network.get(
+                resolved_url,
+                headers={
+                    "Sec-Fetch-Dest": "script",
+                    "Sec-Fetch-Mode": "no-cors",
+                    "Sec-Fetch-Site": "same-origin",
+                    "Referer": base_url,
+                },
+                resource_type="script",
+            )
+            if resp.ok and resp.text.strip():
+                js_runtime.load_script(resp.text, src_hint=resolved_url)
+                await js_runtime.drain_microtasks()
+                loaded += 1
+        except Exception as exc:
+            log.debug("Dynamic script load failed (%s): %s", resolved_url[:60], exc)
+
+    return loaded

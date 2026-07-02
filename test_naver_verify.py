@@ -69,15 +69,12 @@ async def main():
                 break
         print(f"\nSearch input: {'FOUND' if search_input else 'NOT FOUND'}")
 
-        # Sample text content
+        # Sample text content — search the full document, not just #root
+        # (Naver uses React islands across multiple containers)
         print(f"\n--- Sample Content ---")
-        if root:
-            texts = []
-            for n in root.iter_descendants():
-                if isinstance(n, TextNode) and n.data.strip() and len(n.data.strip()) > 1:
-                    texts.append(n.data.strip()[:80])
-            for t in texts[:15]:
-                print(f"  {t}")
+        all_text = [n for n in document.iter_descendants() if isinstance(n, TextNode) and n.data.strip() and len(n.data.strip()) > 1]
+        for t in all_text[:15]:
+            print(f"  {t.data.strip()[:80]}")
 
         # Element tag distribution
         tags: dict[str, int] = {}
@@ -88,15 +85,22 @@ async def main():
         for tag, count in top_tags:
             print(f"  <{tag}>: {count}")
 
+        # Check React islands have rendered content
+        react_islands = ['newsstand', 'shopping', 'feed', 'account']
+        islands_with_content = sum(
+            1 for rid in react_islands
+            if (el := document.get_element_by_id(rid)) and len(el.children) > 0
+        )
+
         # Assertions
         print(f"\n--- Verification ---")
         checks = [
             ("DOM has 200+ elements", len(all_elements) >= 200),
             ("Text nodes > 50", len(text_nodes) > 50),
             ("JS nodes created > 100", len(js_created) > 100),
-            ("#root has children", len(root_children) > 0),
+            ("React islands rendered (3+/4)", islands_with_content >= 3),
             ("Search input exists", search_input is not None),
-            ("React content rendered", any("뉴스" in t.data for t in [n for n in root.iter_descendants() if isinstance(n, TextNode)])),
+            ("Rich element types (img/a/li)", tags.get("img", 0) > 5 and tags.get("a", 0) > 20),
         ]
         all_pass = True
         for name, passed in checks:

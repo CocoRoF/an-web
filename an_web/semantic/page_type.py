@@ -266,10 +266,22 @@ def _classify_from_tree(
     if dialogs:
         signals.append(f"semantic:dialog({len(dialogs)})")
 
-    # Price-like content in names → product/checkout
-    for node in tree.find_interactive():
+    # Price-like content in names → product/checkout.
+    # Links are excluded from currency-symbol matching: story/product titles
+    # like "Startup raises $10M" are navigation, not commerce signals.
+    price_nodes = []
+    for node in interactive:
         name = (node.name or "").lower()
-        if "price" in name or "total" in name or "$" in name or "€" in name:
+        if "price" in name or "total" in name:
+            price_nodes.append(node)
+        elif ("$" in name or "€" in name) and node.role != "link":
+            price_nodes.append(node)
+    if price_nodes:
+        # A link-dense page (news feed, catalog) showing prices is a
+        # listing, not a checkout flow — checkout pages have few links.
+        if len(links) < 10:
             votes["checkout"] = max(votes.get("checkout", 0.0), 0.45)
             signals.append("semantic:price_signal")
-            break
+        else:
+            votes["listing"] = max(votes.get("listing", 0.0), 0.40)
+            signals.append("semantic:price_in_listing")

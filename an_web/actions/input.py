@@ -1,7 +1,7 @@
 """
 Input actions — type, clear, select.
 
-Pattern from Lightpanda actions.zig:
+Pattern:
     1. Resolve element
     2. Precondition: check tag + disabled state
     3. Set DOM value attribute

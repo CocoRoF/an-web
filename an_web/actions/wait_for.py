@@ -45,7 +45,25 @@ class WaitForAction(Action):
             if session.scheduler:
                 await session.scheduler.settle_network(timeout=30.0)
         elif condition == "dom_stable":
-            await asyncio.sleep(0.5)  # stub: real impl watches mutation count
+            # Stable when two consecutive samples of the DOM fingerprint
+            # (node count) match.  The outer asyncio.wait_for bounds this.
+            previous = -1
+            while True:
+                doc = getattr(session, "_current_document", None)
+                current = sum(1 for _ in doc.iter_descendants()) if doc else 0
+                if current == previous:
+                    return
+                previous = current
+                await asyncio.sleep(0.15)
+        elif condition == "selector" and selector:
+            # Wait until the selector matches at least one element.
+            while True:
+                doc = getattr(session, "_current_document", None)
+                if doc:
+                    from an_web.dom.document import query_selector
+                    if query_selector(doc, selector) is not None:
+                        return
+                await asyncio.sleep(0.1)
         elif condition == "element_visible" and selector:
             for _ in range(50):  # poll up to 5s
                 doc = getattr(session, "_current_document", None)

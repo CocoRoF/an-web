@@ -393,9 +393,6 @@ def find_click_target(
     - The occluding element, if prefer_interactive=True and the occluder is interactive
     - The original target, if the occluder is not interactive (or prefer_interactive=False)
     - None, if node_id is not found at all
-
-    This mirrors Lightpanda's find_click_target() behavior: if a modal covers the
-    viewport, clicking should interact with the modal, not the element behind it.
     """
 
     target: Element | None = None

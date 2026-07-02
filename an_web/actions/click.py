@@ -1,7 +1,7 @@
 """
 Click action — MouseEvent dispatch with full event loop flush.
 
-Pattern from Lightpanda actions.zig click():
+Pattern:
     1. Resolve element (CSS selector / node_id / semantic query)
     2. Precondition: check visibility + disabled state
     3. Dispatch mousedown → mouseup → click (real JS events or attribute markers)
@@ -348,7 +348,7 @@ def _dispatch_mouse_events(element: Any, session: Any) -> list[str]:
     """
     Dispatch mousedown → mouseup → click on the element.
 
-    If a JS runtime is available, fires real DOM MouseEvents via QuickJS
+    If a JS runtime is available, fires real DOM MouseEvents via V8
     so that JS event listeners actually trigger.  Falls back to attribute
     markers (for headless DOM-only mode).
 

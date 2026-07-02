@@ -1,8 +1,5 @@
 """
 SemanticNode model — the AI-native DOM representation.
-
-Corresponds to Lightpanda's SemanticTree.zig NodeData struct,
-but extended with AI-specific affordances and page-level context.
 """
 from __future__ import annotations
 
@@ -16,15 +13,6 @@ class SemanticNode:
     AI-enriched DOM node.
 
     This is what AN-Web exposes to AI agents instead of raw DOM.
-    Fields map to Lightpanda's SemanticTree NodeData:
-        node_id        → CDPNode.Id
-        tag            → node_name
-        role           → axn.getRole()
-        name           → axn.getName()
-        value          → input.getValue() / select.getValue()
-        xpath          → XPath segment
-        is_interactive → classifyInteractivity()
-        visible        → checkVisibilityCached()
     """
 
     node_id: str
@@ -112,7 +100,6 @@ class ActionResult:
     """
     Structured result of an AI action.
 
-    Corresponds to Lightpanda's action return structure.
     Includes recommended_next_actions for AI planning assistance.
     """
 
@@ -157,9 +144,6 @@ class ActionResult:
 class PageSemantics:
     """
     AI-facing representation of a page's current state.
-
-    Corresponds to Lightpanda's SemanticTree JSON output,
-    extended with page-level classification and action ranking.
     """
 
     page_type: str          # "login_form" | "search" | "listing" | "detail" | ...

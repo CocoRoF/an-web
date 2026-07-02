@@ -39,6 +39,7 @@ class TestJSError:
         assert "simple" in str(err)
 
     def test_from_quickjs_exception_type_prefix(self):
+        """Backward-compat alias still works."""
         class FakeExc(Exception):
             pass
         exc = FakeExc("TypeError: cannot read property\n    at <eval>:1")
@@ -48,12 +49,29 @@ class TestJSError:
         assert "at <eval>:1" in err.stack
 
     def test_from_quickjs_exception_no_prefix(self):
+        """Backward-compat alias still works."""
         class FakeExc(Exception):
             pass
         exc = FakeExc("plain error message")
         err = JSError.from_quickjs_exception(exc)
         assert err.js_type == "Error"
         assert err.message == "plain error message"
+
+    def test_from_v8_exception_type_prefix(self):
+        class FakeExc(Exception):
+            pass
+        exc = FakeExc("ReferenceError: x is not defined\n    at <eval>:1")
+        err = JSError.from_v8_exception(exc)
+        assert err.js_type == "ReferenceError"
+        assert "x is not defined" in err.message
+
+    def test_from_v8_exception_no_prefix(self):
+        class FakeExc(Exception):
+            pass
+        exc = FakeExc("some V8 error")
+        err = JSError.from_v8_exception(exc)
+        assert err.js_type == "Error"
+        assert err.message == "some V8 error"
 
     def test_is_exception(self):
         err = JSError(message="oops")

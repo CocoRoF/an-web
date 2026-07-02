@@ -1,9 +1,6 @@
 """
 Semantic extraction engine — DOM → AI world model.
 
-Corresponds to Lightpanda's SemanticTree.zig walk() function,
-extended with page-level classification and action ranking.
-
 Primary API:
     extractor = SemanticExtractor()
     page = extractor.extract_from_document(doc, url="https://example.com")
@@ -24,7 +21,7 @@ class SemanticExtractor:
     """
     Transforms DOM tree into AI-readable PageSemantics.
 
-    Walk order and visibility logic mirrors Lightpanda SemanticTree.zig:
+    Walk order and visibility logic:
     - Skip metadata tags (head, script, style, svg)
     - Skip invisible elements (display:none, hidden attr)
     - Skip pure whitespace text nodes

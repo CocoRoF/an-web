@@ -1,9 +1,13 @@
 # AN-Web: AI-Native Web Browser Engine
-## 구현 계획서 v1.0
+## 구현 계획서 v1.1
 
 > 작성일: 2026-03-24
+> 최종 수정: 2026-03-27 (V8 마이그레이션 반영)
 > 기반 분석: lightpanda-io/browser (Zig), ai_native_browser_engine_plan.md
 > 목표: Python-native AI execution runtime for the web
+
+> **[v0.5.0 변경]** JS 엔진을 QuickJS에서 V8 (PyMiniRacer)으로 마이그레이션 완료.
+> V8은 Chrome과 동일한 엔진으로, ES2024+ 완전 지원 및 실제 사이트 호환성이 크게 향상됨.
 
 ---
 
@@ -20,7 +24,7 @@
 | 항목 | Lightpanda | AN-Web |
 |------|-----------|--------|
 | 구현 언어 | Zig (시스템 언어) | Python 3.12+ (AI 제어 계층) |
-| JS 엔진 | V8 (Chromium V8) | QuickJS (경량 임베딩) |
+| JS 엔진 | V8 (Chromium V8) | V8 via PyMiniRacer (Chrome 동급 호환성) |
 | HTML 파서 | html5ever (Rust) | selectolax(Lexbor) + html5lib |
 | 네트워크 | libcurl | httpx (async) |
 | 인터페이스 | CDP (Chrome DevTools Protocol) | AI Tool API (Python-native) |
@@ -36,7 +40,7 @@
 2. **actions.zig 패턴**: `click`, `fill`, `scroll` 등 액션이 event dispatch + DOM mutation + event flush 패턴으로 구성된다. 이 패턴을 Python transaction 모델로 차용한다.
 3. **Session 계층 설계**: Browser → Session → Page 계층에서 Session이 cookie jar, storage, navigation history를 공유한다. 동일 구조를 Python으로 채택한다.
 4. **Event Loop 분리**: `runMicrotasks()`, `runMacrotasks()`, `pumpMessageLoop()`가 명확히 분리되어 있다. Python asyncio 위에 같은 구조를 구현한다.
-5. **V8 vs QuickJS**: Lightpanda는 V8을 사용하여 높은 호환성을 달성하지만, 빌드 복잡도가 매우 높다. AN-Web은 AI 타깃 사이트 중심으로 QuickJS로 시작한다.
+5. **V8 선택**: Lightpanda와 동일하게 V8을 사용한다. PyMiniRacer를 통해 Python에서 V8을 경량으로 임베딩하여, 빌드 복잡도 없이 Chrome 동급 JS 호환성을 달성한다.
 
 ---
 
@@ -60,7 +64,7 @@
 │  ┌─────────────────▼───────────────────────────┐ │
 │  │           Execution Plane                   │ │
 │  │  NetworkLoader │ HTMLParser │ DOMCore        │ │
-│  │  JSBridge(QuickJS) │ EventLoop │ LayoutLite  │ │
+│  │  JSBridge(V8)      │ EventLoop │ LayoutLite  │ │
 │  └─────────────────┬───────────────────────────┘ │
 │                    │                             │
 │  ┌─────────────────▼───────────────────────────┐ │
@@ -90,7 +94,7 @@ an_web/
 │   └── semantics.py       # SemanticNode 모델 + 추출 로직
 │
 ├── js/
-│   ├── runtime.py         # QuickJS 런타임 래퍼
+│   ├── runtime.py         # V8 (PyMiniRacer) 런타임 래퍼
 │   ├── host_api.py        # document/window/fetch/timer 구현
 │   ├── bridge.py          # JS ↔ Python 객체 마샬링
 │   └── timers.py          # setTimeout/queueMicrotask/Promise drain
@@ -201,35 +205,37 @@ class PageSemantics:
 
 ## 4. 핵심 서브시스템 구현 계획
 
-### 4.1 JS Runtime Bridge (QuickJS)
+### 4.1 JS Runtime Bridge (V8 via PyMiniRacer)
 
-Lightpanda는 V8을 사용하지만 AN-Web은 QuickJS를 선택한다.
+Lightpanda와 동일하게 V8 엔진을 사용한다. PyMiniRacer를 통해 Python에서 V8을 임베딩한다.
+
+> **참고**: PyMiniRacer는 `add_callable()`을 지원하지 않으므로, Python 함수를 JS에서
+> 직접 호출할 수 없다. 대신 모든 `_py_*` 함수를 순수 JS로 구현하고, DOM 상태를
+> JSON으로 사전 주입한 뒤 mutation log를 통해 변경사항을 동기화한다.
 
 ```python
 # js/runtime.py
-import quickjs  # quickjs-py 또는 동등 바인딩
+from py_mini_racer import MiniRacer
 
 class JSRuntime:
     def __init__(self, session):
-        self.ctx = quickjs.Context()
+        self.ctx = MiniRacer()
         self.session = session
         self._setup_host_api()
 
     def _setup_host_api(self):
-        # Lightpanda의 Browser.zig가 env에 host API를 설정하듯,
-        # Python에서 QuickJS context에 document/window 등을 주입
-        self.ctx.set_global("document", DocumentProxy(self.session))
-        self.ctx.set_global("window", WindowProxy(self.session))
-        self.ctx.set_global("fetch", FetchProxy(self.session))
-        self.ctx.set_global("setTimeout", self.session.scheduler.set_timeout)
-        self.ctx.set_global("queueMicrotask", self.session.scheduler.queue_microtask)
+        # DOM 트리를 JSON으로 직렬화하여 V8에 주입
+        # 모든 host API는 순수 JS로 사전 주입된 _domTree, _sessionState에서 동작
+        install_host_api(self.ctx, self.session)
 
     def eval(self, script: str) -> any:
-        return self.ctx.eval(script)
+        result = self.ctx.eval(script)
+        self._process_bridge_commands()  # mutation sync
+        return result
 
     async def drain_microtasks(self):
-        # Lightpanda의 runMicrotasks() 대응
-        self.ctx.execute_pending_jobs()
+        # V8은 eval() 후 microtask를 자동 flush
+        self.ctx.eval('typeof _fireReadyTimers==="function"&&_fireReadyTimers()')
 ```
 
 ### 4.2 Event Loop (asyncio 기반)
@@ -424,14 +430,14 @@ await session.act({
 
 | 작업 | 산출물 |
 |------|--------|
-| QuickJS Python 바인딩 평가 | PoC 코드 + 성능 측정 |
+| ~~QuickJS~~ → V8 (PyMiniRacer) 바인딩 평가 | PoC 코드 + 성능 측정 ✅ |
 | selectolax vs html5lib 비교 | 파서 선택 결정 |
 | DOM 모델 최소 스펙 정의 | SemanticNode 스키마 v1 |
 | 최소 host API 목록 정의 | host_api_spec.md |
 | ADR 작성 | architecture_decisions.md |
 
 **핵심 결정 사항:**
-- QuickJS 바인딩 라이브러리 선택 (quickjs-py / python-quickjs)
+- ~~QuickJS~~ → V8 바인딩 라이브러리 선택: **PyMiniRacer** ✅
 - DOM 내부 표현 (순수 Python dict vs 커스텀 Node 클래스)
 - 1차 타깃 사이트 유형 (로그인 폼, 검색, 데이터 추출 중 우선순위)
 
@@ -443,7 +449,7 @@ await session.act({
 |------|------|
 | 1~2주 | NetworkLoader (httpx) + HTMLParser (selectolax) |
 | 2~3주 | DOM Core (Node/Element/Document/selector) |
-| 3~4주 | QuickJS bridge + document/window host API 기초 |
+| 3~4주 | V8 bridge + document/window host API 기초 |
 | 4~5주 | setTimeout/queueMicrotask/Promise drain |
 | 5~6주 | click/type/submit actions + event dispatch |
 | 6~7주 | Cookie/localStorage/sessionStorage |
@@ -495,11 +501,12 @@ await session.act({
 - asyncio 기반 비동기 제어 계층
 - 빠른 프로토타이핑과 semantic layer 구현 적합
 
-### 7.2 JS 엔진: QuickJS
+### 7.2 JS 엔진: V8 (PyMiniRacer)
 
-- Lightpanda: V8 (강력하지만 빌드 복잡, 무거움)
-- AN-Web: QuickJS (임베딩 용이, ES2023 지원, footprint 작음)
-- AI 타깃 사이트 중심 → host API 설계가 핵심, 엔진 성능보다 제어 용이성 우선
+- Lightpanda: V8 (Zig에서 직접 빌드, 복잡)
+- AN-Web: V8 via PyMiniRacer (pip install로 간편 설치, Chrome 동급 호환성)
+- ES2024+ 완전 지원, 자동 microtask flush, webpack/React 완벽 호환
+- **주의**: `add_callable()` 미지원 → 순수 JS host API + mutation log 아키텍처 채택
 
 ### 7.3 HTML 파서: selectolax + html5lib
 
@@ -533,7 +540,7 @@ await session.act({
 
 | 리스크 | 확률 | 대응 전략 |
 |--------|------|-----------|
-| QuickJS host API 구현 범위 과다 | 높음 | 타깃 사이트 중심 최소 집합으로 시작, failure-driven 확장 |
+| V8 host API 구현 범위 과다 | 높음 | 타깃 사이트 중심 최소 집합으로 시작, failure-driven 확장 |
 | 현대 SPA(React/Vue) 호환성 부족 | 중간 | Compatibility fixtures 운영, Phase 2에서 점진 보완 |
 | Python asyncio + JS event loop 동기화 오류 | 중간 | deterministic scheduler + 명시적 drain checkpoint |
 | Python 성능 병목 | 낮음 | 초기엔 수용, 병목 구간 프로파일링 후 Rust/C 확장 점진 검토 |
@@ -557,7 +564,7 @@ await session.act({
 ## 11. 첫 90일 실행 계획
 
 ### Day 1-15: 기반 결정
-- [ ] QuickJS Python 바인딩 PoC
+- [x] ~~QuickJS~~ → V8 (PyMiniRacer) 바인딩 PoC ✅
 - [ ] selectolax vs html5lib 성능/정확성 비교
 - [ ] 최소 DOM 모델 설계 (SemanticNode 스키마)
 - [ ] ADR 문서 작성
@@ -565,7 +572,7 @@ await session.act({
 ### Day 16-30: 최소 실행 엔진
 - [ ] NetworkLoader (httpx) 구현
 - [ ] HTMLParser 연동 + DOM Tree 생성
-- [ ] QuickJS context + document/window 기초 host API
+- [x] V8 context + document/window 기초 host API ✅
 - [ ] `navigate()` + `snapshot()` 동작
 
 ### Day 31-45: 액션 구현
@@ -597,7 +604,7 @@ await session.act({
 ## 12. 참고 자료
 
 - [lightpanda-io/browser](https://github.com/lightpanda-io/browser) - 참조 구현체
-- [QuickJS](https://bellard.org/quickjs/) - JS 엔진
+- [PyMiniRacer](https://github.com/nicolo-ribaudo/pimini-racer) - V8 임베딩 (기존 QuickJS에서 마이그레이션)
 - [selectolax](https://github.com/rushter/selectolax) - HTML 파서
 - [WHATWG HTML Standard](https://html.spec.whatwg.org/) - HTML/DOM 표준
 - [MDN Microtasks Guide](https://developer.mozilla.org/en-US/docs/Web/API/HTML_DOM_API/Microtask_guide) - 이벤트 루프

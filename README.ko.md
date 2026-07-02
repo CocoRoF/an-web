@@ -53,13 +53,13 @@ AN-Web은 **처음부터** AI 에이전트 루프를 위해 설계되었습니�
 | 관점 | 기존 헤드리스 브라우저 | AN-Web |
 |---|---|---|
 | **주요 출력** | 스크린샷 / DOM 문자열 | `PageSemantics` — 구조화된 월드 모델 |
-| **JS 엔진** | V8 (Chromium 전체) | QuickJS (경량, 임베디드) |
+| **JS 엔진** | V8 (Chromium 전체) | V8 via PyMiniRacer (Chrome 동급, 경량 임베딩) |
 | **지연시간** | 500ms+ 콜드 스타트 | 액션당 < 50ms |
 | **메모리** | 300–800 MB | ~30 MB |
 | **액션 타겟팅** | CSS 셀렉터 / XPath 전용 | 시맨틱: `{"by": "role", "role": "button", "text": "로그인"}` |
 | **정책 & 안전** | 내장 없음 | 도메인 규칙, 속도 제한, 샌드박스, 승인 프로세스 |
 | **관측성** | 외부 트레이싱 | 내장 `ArtifactCollector`, `StructuredLogger`, `ReplayEngine` |
-| **SPA 지원** | Full V8 | QuickJS + 호스트 Web API (webpack 5, React 18, jQuery) |
+| **SPA 지원** | Full V8 | V8 + 호스트 Web API (webpack 5, React 18, jQuery) |
 
 ---
 
@@ -90,7 +90,7 @@ pip install -e ".[dev]"
 | `selectolax` | 고속 HTML 파서 (Lexbor 백엔드) |
 | `html5lib` | 스펙 호환 폴백 파서 |
 | `pydantic` | 요청/응답 검증 |
-| `quickjs` | 임베디드 JavaScript 엔진 |
+| `mini-racer` | 임베디드 V8 JavaScript 엔진 (V8 14.x) |
 | `cssselect` | CSS 셀렉터 파싱 |
 
 ---
@@ -788,9 +788,9 @@ trace_dict = tools.history_as_trace()
 
 ## JavaScript 실행 & SPA 지원
 
-### 임베디드 QuickJS 런타임
+### 임베디드 V8 런타임
 
-AN-Web은 포괄적인 호스트 Web API 레이어를 갖춘 QuickJS JavaScript 엔진을 내장합니다:
+AN-Web은 포괄적인 호스트 Web API 레이어를 갖춘 V8 JavaScript 엔진(PyMiniRacer 경유)을 내장합니다:
 
 ```python
 # 도구 인터페이스를 통해
@@ -808,7 +808,7 @@ await js.drain_microtasks()              # Promise 체인 처리
 
 ### 호스트 Web API 지원 범위
 
-호스트 API 레이어는 Python DOM ↔ QuickJS를 브릿지하며, 브라우저 호환 API를 제공합니다:
+호스트 API 레이어는 Python DOM ↔ V8를 브릿지하며, 브라우저 호환 API를 제공합니다:
 
 | 카테고리 | API |
 |---|---|
@@ -851,7 +851,7 @@ AN-Web은 현대적인 싱글 페이지 애플리케이션을 렌더링할 수 �
 │              실행 플레인                                  │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐  │
 │  │ DOM Core │  │ JS Bridge│  │ Network  │  │Layout  │  │
-│  │ nodes/   │  │ QuickJS  │  │ httpx +  │  │Lite    │  │
+│  │ nodes/   │  │ V8       │  │ httpx +  │  │Lite    │  │
 │  │ selectors│  │ host_api │  │ cookies  │  │hit_test│  │
 │  └──────────┘  └──────────┘  └──────────┘  └────────┘  │
 ├─────────────────────────────────────────────────────────┤
@@ -866,7 +866,7 @@ AN-Web은 현대적인 싱글 페이지 애플리케이션을 렌더링할 수 �
 an_web/
 ├── core/         # ANWebEngine, Session, Scheduler, SnapshotManager, PageState
 ├── dom/          # Node/Element/Document, CSS 셀렉터, Mutation, Semantics
-├── js/           # QuickJS 브릿지, JSRuntime, 호스트 Web API (DOM ↔ QuickJS 브릿지)
+├── js/           # V8 브릿지, JSRuntime, 호스트 Web API (DOM ↔ V8 브릿지)
 ├── net/          # NetworkClient (httpx), CookieJar, ResourceLoader
 ├── actions/      # navigate, click, type, submit, extract, scroll, eval_js, wait_for
 ├── layout/       # Visibility, flow 추론, hit-testing, LayoutEngine
@@ -999,7 +999,7 @@ async def safe_browse():
 ## 테스트
 
 ```bash
-# 전체 테스트 실행 (1524개)
+# 전체 테스트 실행 (1540개)
 pytest
 
 # 커버리지 포함
@@ -1012,12 +1012,12 @@ pytest tests/unit/dom/ -v
 pytest tests/integration/ -v
 ```
 
-**테스트 스위트 (1524개 테스트):**
+**테스트 스위트 (1540개 테스트):**
 
 | 스위트 | 수량 | 대상 |
 |---|---|---|
 | DOM / 셀렉터 / 파서 | ~330 | 코어 DOM 트리, CSS 셀렉터, HTML 파싱 |
-| JS 브릿지 + 런타임 + 호스트 API | ~300 | QuickJS 평가, Promise 드레인, 호스트 Web API |
+| JS 브릿지 + 런타임 + 호스트 API | ~300 | V8 평가, Promise 드레인, 호스트 Web API |
 | 스케줄러 / 세션 / 엔진 | ~130 | 이벤트 루프, 내비게이션, 스토리지, 스냅샷 |
 | 액션 | ~190 | click, type, submit, extract, scroll, eval_js |
 | 레이아웃 | ~160 | Visibility, flow, hit-testing |
@@ -1039,7 +1039,7 @@ pytest tests/integration/ -v
 
 | 메서드 | 반환 타입 | 설명 |
 |---|---|---|
-| `navigate(url)` | `dict` | URL 로드, DOM 구축, JS 실행, 안정화 |
+| `navigate(url, timeout=None)` | `dict` | URL 로드, DOM 구축, JS 실행, 안정화 (기본 15초 예산) |
 | `snapshot()` | `PageSemantics` | 구조화된 시맨틱 페이지 상태 (객체) |
 | `act(tool_call)` | `dict` | 11개 도구 중 하나 실행 |
 | `execute_script(js)` | `Any` | JavaScript 직접 실행 |
@@ -1090,7 +1090,7 @@ Apache-2.0
 git clone https://github.com/CocoRoF/an-web
 cd an-web
 pip install -e ".[dev]"
-pytest                    # 1524개 테스트 모두 통과해야 함
+pytest                    # 1540개 테스트 모두 통과해야 함
 ruff check an_web/        # 린팅
 mypy an_web/              # 타입 체크
 ```

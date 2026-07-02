@@ -13,7 +13,7 @@ class Action(ABC):
     """
     Base class for all AN-Web actions.
 
-    Pattern (from Lightpanda actions.zig):
+    Pattern:
         1. precondition  — verify action can be performed
         2. execute       — perform the DOM/event operation
         3. event_flush   — drain microtasks + network
@@ -79,7 +79,21 @@ class Action(ABC):
             text = target.get("text", "")
             candidates = tree.find_by_text(text)
             if candidates:
-                return self._resolve_by_node_id(candidates[0].node_id, session)
+                # find_by_text matches partially, so "new" also matches the
+                # page root named "Hacker News".  Prefer exact-text matches,
+                # then interactive elements, then the tightest name.
+                query = text.strip().lower()
+
+                def _rank(c: Any) -> tuple[int, int, int]:
+                    name = (c.name or "").strip().lower()
+                    return (
+                        0 if name == query else 1,
+                        0 if getattr(c, "is_interactive", False) else 1,
+                        len(name),
+                    )
+
+                best = min(candidates, key=_rank)
+                return self._resolve_by_node_id(best.node_id, session)
 
         return None
 

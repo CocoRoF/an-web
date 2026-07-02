@@ -75,14 +75,16 @@ class SnapshotRequest(BaseModel):
 
 class WaitForRequest(BaseModel):
     tool: Literal["wait_for"] = "wait_for"
-    condition: Literal["network_idle", "dom_stable", "element_visible"]
+    condition: Literal["network_idle", "dom_stable", "selector", "element_visible"]
     selector: str | None = None
     timeout_ms: int = 5000
 
     @model_validator(mode="after")
     def _check_element_visible(self) -> WaitForRequest:
-        if self.condition == "element_visible" and not self.selector:
-            raise ValueError("selector is required for condition='element_visible'")
+        if self.condition in ("selector", "element_visible") and not self.selector:
+            raise ValueError(
+                f"selector is required for condition={self.condition!r}"
+            )
         return self
 
 
