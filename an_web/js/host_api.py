@@ -26,10 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from typing import TYPE_CHECKING, Any
-
-from an_web.js.bridge import marshal_document, marshal_element
 
 if TYPE_CHECKING:
     from an_web.core.session import Session
@@ -613,7 +610,13 @@ function _py_query_selector_all(selector) {
 
 function _py_get_element_by_id(elemId) {
     var nid = _domTree.idIndex[elemId];
-    return nid ? _nodeToJson(nid) : 'null';
+    if (!nid) return 'null';
+    // Per spec, getElementById only returns CONNECTED elements — the id
+    // index also holds detached/scratch nodes (DOMParser, createElement).
+    if (nid !== _domTree.rootId && !_isDescendantOf(nid, _domTree.rootId)) {
+        return 'null';
+    }
+    return _nodeToJson(nid);
 }
 
 function _py_get_elements_by_tag(tag) {
@@ -1116,8 +1119,12 @@ function _py_set_timeout_ms(delayMs, callbackKey) {
 }
 function _py_clear_timeout(timerId) { delete _timerRegistry[timerId]; }
 function _py_get_fired_timers() {
+    // Cap the batch: timer callbacks may register more ready timers,
+    // and an uncapped batch lets setTimeout(fn, 0) chains cascade
+    // indefinitely inside a single eval.
     var now = Date.now(), fired = [];
     for (var tid in _timerRegistry) {
+        if (fired.length >= 50) break;
         if (_timerRegistry[tid].fireAt <= now) {
             fired.push(parseInt(tid));
             delete _timerRegistry[tid];
@@ -1252,7 +1259,10 @@ function _makeElement(data) {
     el._textContent = data.textContent || '';
     el._innerHTML   = data.innerHTML || '';
     el._attributes  = data.attributes || {};
-    el._children    = (data.children || []).map(_makeElement);
+    // data.children holds node-ID strings from the Python mirror — never
+    // wrap them eagerly (wrong types + O(n²) on big trees).  The children
+    // getter lazily resolves via _py_get_children on first access.
+    el._children    = [];
     el.ownerDocument = (typeof document !== 'undefined') ? document : null;
     el.sourceIndex  = _elementIndex++;
     el.nodeName     = el.tagName || (el.nodeType === 3 ? '#text' : '');
@@ -1703,7 +1713,7 @@ function _makeElement(data) {
         }
     };
     el.prepend      = function() {
-        var first = el._children[0] || null;
+        var first = el.children[0] || null;
         for (var i = arguments.length - 1; i >= 0; i--) {
             var node = arguments[i];
             if (typeof node === 'string') {
@@ -1760,7 +1770,7 @@ function _makeElement(data) {
 
     el.contains = function(other) {
         if (!other) return false;
-        var kids = el._children;
+        var kids = el.children;
         for (var i = 0; i < kids.length; i++) {
             if (kids[i].nodeId === other.nodeId) return true;
             if (kids[i].contains && kids[i].contains(other)) return true;
@@ -1817,9 +1827,34 @@ var document = (function() {
     doc.ownerDocument = null;
     doc.parentNode = null;
     doc.parentElement = null;
+    // Scratch documents — an isolated document-like context for libraries
+    // that need a throwaway parsing document (jQuery buildFragment/support
+    // tests, DOMParser).  Its html/head/body are detached js_ nodes, so
+    // scratch mutations never touch the live page.  createElement etc. are
+    // inherited from the real document: created nodes stay detached until
+    // a script explicitly appends them into the live tree.
+    function _makeScratchDocument(title) {
+        var sdoc = Object.create(doc);
+        var shtml = doc.createElement('html');
+        var shead = doc.createElement('head');
+        var sbody = doc.createElement('body');
+        shtml.appendChild(shead);
+        shtml.appendChild(sbody);
+        Object.defineProperty(sdoc, 'documentElement', { get: function() { return shtml; } });
+        Object.defineProperty(sdoc, 'head', { get: function() { return shead; } });
+        Object.defineProperty(sdoc, 'body', { get: function() { return sbody; } });
+        var stitle = String(title || '');
+        Object.defineProperty(sdoc, 'title', {
+            get: function() { return stitle; },
+            set: function(v) { stitle = String(v); },
+        });
+        return sdoc;
+    }
+    doc._makeScratchDocument = _makeScratchDocument;
+
     doc.implementation = {
-        createDocument: function() { return doc; },
-        createHTMLDocument: function(title) { return doc; },
+        createDocument: function() { return _makeScratchDocument(''); },
+        createHTMLDocument: function(title) { return _makeScratchDocument(title); },
         createDocumentType: function(name, publicId, systemId) {
             var dt = new DocumentType();
             dt.name = name;
@@ -1968,11 +2003,21 @@ var document = (function() {
         return { type: '', bubbles: false, cancelable: false, initEvent: function(t) { this.type = t; } };
     };
 
-    // Write — appends parsed HTML to body for basic document.write support
+    // Write — appends parsed HTML to body for basic document.write support.
+    // Append-only by design: the old innerHTML get+set round-trip re-parsed
+    // the whole body through the naive fragment parser and could replace
+    // real content with a lossy copy.
     doc.write = function(html) {
-        if (html && doc.body) {
-            doc.body.innerHTML = doc.body.innerHTML + html;
+        if (!html) return;
+        var bodyId = _cssSelectOne(_domTree.rootId, 'body');
+        if (!bodyId) return;
+        var frag = _parseHtmlFragment(String(html));
+        var bn = _domTree.nodes[bodyId];
+        for (var i = 0; i < frag.length; i++) {
+            frag[i].parentId = bodyId;
+            if (bn && bn.children) bn.children.push(frag[i].nodeId);
         }
+        _mutationLog.push({type:'appendHTML', nodeId: bodyId, html: String(html)});
     };
     doc.writeln = function(html) { doc.write((html || '') + '\n'); };
     doc.open = function() {};
@@ -2193,32 +2238,45 @@ function cancelAnimationFrame(id) {
     clearTimeout(id);
 }
 
-// Fire all timers that the Python layer has marked as ready
+// Fire all timers that the Python layer has marked as ready.
+// A wall-clock budget bounds each call: without it, heavy callbacks
+// (e.g. mw.loader executing dozens of modules) block the engine for
+// tens of seconds inside one eval.
+var _FIRE_TIMERS_BUDGET_MS = 500;
+
 function _fireReadyTimers() {
     var firedStr = _py_get_fired_timers();
     var fired = JSON.parse(firedStr);
+    var start = Date.now();
+    var ran = 0;
     for (var i = 0; i < fired.length; i++) {
         var tid = fired[i];
         var key = _timerIdToKey[tid];
-        if (key && _timerCallbacks[key]) {
-            try {
-                _timerCallbacks[key]();
-            } catch(e) {
-                console.error('Timer callback error:', e);
-            }
-            // Check if it's an interval — re-register
-            if (_intervalCallbacks[tid]) {
-                var interval = _intervalCallbacks[tid];
-                var newId = _py_set_timeout_ms(interval.delay, interval.key);
-                _timerIdToKey[newId] = interval.key;
-                _intervalCallbacks[newId] = interval;
-                delete _intervalCallbacks[tid];
-            }
-            delete _timerCallbacks[key];
-            delete _timerIdToKey[tid];
+        if (!key || !_timerCallbacks[key]) continue;
+        if (Date.now() - start > _FIRE_TIMERS_BUDGET_MS) {
+            // Budget exhausted — re-queue so the callback fires on the
+            // next drain instead of being lost.
+            _timerRegistry[tid] = {fireAt: Date.now(), key: key};
+            continue;
         }
+        try {
+            _timerCallbacks[key]();
+        } catch(e) {
+            console.error('Timer callback error:', e);
+        }
+        ran++;
+        // Check if it's an interval — re-register
+        if (_intervalCallbacks[tid]) {
+            var interval = _intervalCallbacks[tid];
+            var newId = _py_set_timeout_ms(interval.delay, interval.key);
+            _timerIdToKey[newId] = interval.key;
+            _intervalCallbacks[newId] = interval;
+            delete _intervalCallbacks[tid];
+        }
+        delete _timerCallbacks[key];
+        delete _timerIdToKey[tid];
     }
-    return fired.length;
+    return ran;
 }
 
 // ── fetch ─────────────────────────────────────────────────────────────────────
@@ -2834,10 +2892,17 @@ window.InputEvent = function(type, init) {
     this.inputType = (init || {}).inputType || '';
 };
 
-// DOMParser for runtime HTML parsing
+// DOMParser for runtime HTML parsing — parses into an isolated scratch
+// document so parsed content never leaks into (or wipes) the live page.
 window.DOMParser = function() {};
 window.DOMParser.prototype.parseFromString = function(str, type) {
-    return document;
+    var sdoc = document._makeScratchDocument
+        ? document._makeScratchDocument('')
+        : document.implementation.createHTMLDocument('');
+    try {
+        if (str) sdoc.body.innerHTML = String(str);
+    } catch(e) {}
+    return sdoc;
 };
 
 // TextEncoder/TextDecoder
@@ -2959,7 +3024,8 @@ def sync_dom_mutations(ctx: Any, session: Any) -> None:
     """
     try:
         raw = ctx.eval(
-            "typeof _getMutationLog === 'function' ? _getMutationLog() : '[]'"
+            "typeof _getMutationLog === 'function' ? _getMutationLog() : '[]'",
+            timeout=10_000,
         )
         if not raw or raw == "[]":
             return
@@ -3051,42 +3117,41 @@ def sync_dom_mutations(ctx: Any, session: Any) -> None:
             elif mt == "setInnerHTML":
                 el = _find_node(session, mut["nodeId"])
                 if el:
-                    el.children.clear()
+                    html_str = mut.get("html", "")
+                    if _is_catastrophic_wipe(el, html_str):
+                        log.warning(
+                            "sync: refusing innerHTML wipe of <%s> "
+                            "(%d chars replacing large parsed subtree)",
+                            getattr(el, "tag", "?"), len(html_str),
+                        )
+                    else:
+                        el.children.clear()
+                        if html_str.strip():
+                            _append_parsed_fragment(session, el, html_str)
+
+            elif mt == "appendHTML":
+                el = _find_node(session, mut["nodeId"])
+                if el:
                     html_str = mut.get("html", "")
                     if html_str.strip():
-                        try:
-                            from an_web.browser.parser import parse_html
-                            doc = getattr(session, "_current_document", None)
-                            base_url = getattr(
-                                session, "_current_url", "about:blank"
-                            )
-                            frag_doc = parse_html(
-                                f"<div>{html_str}</div>", base_url=base_url
-                            )
-                            for node in frag_doc.iter_descendants():
-                                if isinstance(node, Element) and node.tag == "div":
-                                    for child in list(node.children):
-                                        child.parent = el
-                                        el.children.append(child)
-                                        if doc and isinstance(child, Element):
-                                            doc.register_element(child)
-                                            for desc in child.iter_descendants():
-                                                if isinstance(desc, Element):
-                                                    doc.register_element(desc)
-                                    break
-                        except Exception as exc:
-                            log.debug("sync innerHTML error: %s", exc)
+                        _append_parsed_fragment(session, el, html_str)
 
             elif mt == "setTextContent":
                 el = _find_node(session, mut["nodeId"])
                 if el:
-                    el.children.clear()
                     text = mut.get("text", "")
-                    if text:
-                        tn = TextNode(
-                            node_id=f"py_sync_{id(el)}", data=text
+                    if _is_catastrophic_wipe(el, text):
+                        log.warning(
+                            "sync: refusing textContent wipe of <%s>",
+                            getattr(el, "tag", "?"),
                         )
-                        el.append_child(tn)
+                    else:
+                        el.children.clear()
+                        if text:
+                            tn = TextNode(
+                                node_id=f"py_sync_{id(el)}", data=text
+                            )
+                            el.append_child(tn)
 
             elif mt == "removeNode":
                 target = _find_node(session, mut["nodeId"])
@@ -3119,6 +3184,62 @@ def sync_dom_mutations(ctx: Any, session: Any) -> None:
     _graft_orphan_subtrees(session)
 
 
+def _is_catastrophic_wipe(el: Any, replacement: str) -> bool:
+    """Detect a destructive content replacement on a structural node.
+
+    Scripts legitimately replace container contents (React roots start
+    empty), but nothing on the real web legitimately replaces a large
+    parsed <body>/<html>/<head> subtree with a tiny fragment — that
+    pattern only arises from shim aliasing bugs or hostile input, and
+    replaying it destroys the page for extraction.
+    """
+    if getattr(el, "tag", "") not in ("body", "html", "head"):
+        return False
+    if len(replacement or "") >= 1_000:
+        return False
+    descendants = 0
+    for _ in el.iter_descendants():
+        descendants += 1
+        if descendants > 200:
+            return True
+    return False
+
+
+def _append_parsed_fragment(session: Any, el: Any, html_str: str) -> None:
+    """Parse an HTML fragment and append its nodes as children of *el*."""
+    from an_web.dom.nodes import Element
+
+    try:
+        from an_web.browser.parser import parse_html
+        doc = getattr(session, "_current_document", None)
+        base_url = getattr(session, "_current_url", "about:blank")
+        frag_doc = parse_html(f"<div>{html_str}</div>", base_url=base_url)
+        for node in frag_doc.iter_descendants():
+            if isinstance(node, Element) and node.tag == "div":
+                for child in list(node.children):
+                    child.parent = el
+                    el.children.append(child)
+                    if doc and isinstance(child, Element):
+                        doc.register_element(child)
+                        for desc in child.iter_descendants():
+                            if isinstance(desc, Element):
+                                doc.register_element(desc)
+                break
+    except Exception as exc:
+        log.debug("sync fragment append error: %s", exc)
+
+
+# Orphan roots with these tags are never grafted — they are either
+# scratch-document scaffolding or non-content elements.
+_GRAFT_EXCLUDED_TAGS = frozenset({
+    "html", "head", "body", "script", "style", "meta", "link",
+    "title", "template", "form",
+})
+# Minimum visible text length for an orphan subtree to be considered
+# real content (filters out library feature-detection fragments).
+_GRAFT_MIN_TEXT = 40
+
+
 def _graft_orphan_subtrees(session: Any) -> None:
     """Attach floating JS-created subtrees to the document body.
 
@@ -3148,6 +3269,9 @@ def _graft_orphan_subtrees(session: Any) -> None:
     if body is None:
         return
 
+    grafted_ids: set[str] = getattr(session, "_grafted_node_ids", set())
+    session._grafted_node_ids = grafted_ids
+
     grafted = 0
     for nid, node in list(js_nodes.items()):
         if not isinstance(node, Element):
@@ -3158,12 +3282,24 @@ def _graft_orphan_subtrees(session: Any) -> None:
         # Skip if already in the document tree
         if node.parent is not None:
             continue
+        # Never graft scratch-document scaffolding or non-content roots
+        if node.tag in _GRAFT_EXCLUDED_TAGS:
+            continue
+        # Require real content — library feature-detection fragments are
+        # tiny or empty and must not pollute the page
+        if len((node.text_content or "").strip()) < _GRAFT_MIN_TEXT:
+            continue
+        # A node grafted once and later removed by a script was removed
+        # intentionally — do not resurrect it
+        if nid in grafted_ids:
+            continue
         # Graft under <body>
         body.append_child(node)
         doc.register_element(node)
         for desc in node.iter_descendants():
             if isinstance(desc, Element):
                 doc.register_element(desc)
+        grafted_ids.add(nid)
         grafted += 1
 
     if grafted:

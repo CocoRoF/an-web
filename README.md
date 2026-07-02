@@ -90,7 +90,7 @@ pip install -e ".[dev]"
 | `selectolax` | Fast HTML parser (Lexbor backend) |
 | `html5lib` | Spec-compliant fallback parser |
 | `pydantic` | Request/response validation |
-| `py-mini-racer` | Embedded V8 JavaScript engine |
+| `mini-racer` | Embedded V8 JavaScript engine (V8 14.x) |
 | `cssselect` | CSS selector parsing |
 
 ---
@@ -999,7 +999,7 @@ async def safe_browse():
 ## Testing
 
 ```bash
-# Run all tests (1525 tests)
+# Run all tests (1540 tests)
 pytest
 
 # With coverage
@@ -1012,7 +1012,7 @@ pytest tests/unit/dom/ -v
 pytest tests/integration/ -v
 ```
 
-**Test Suite (1525 tests):**
+**Test Suite (1540 tests):**
 
 | Suite | Count | Covers |
 |---|---|---|
@@ -1039,7 +1039,7 @@ pytest tests/integration/ -v
 
 | Method | Returns | Description |
 |---|---|---|
-| `navigate(url)` | `dict` | Load URL, build DOM, execute JS, settle |
+| `navigate(url, timeout=None)` | `dict` | Load URL, build DOM, execute JS, settle (default 15s settle budget) |
 | `snapshot()` | `PageSemantics` | Structured semantic page state (object) |
 | `act(tool_call)` | `dict` | Execute any of the 11 tools |
 | `execute_script(js)` | `Any` | Direct JavaScript evaluation |
@@ -1090,7 +1090,7 @@ Apache-2.0
 git clone https://github.com/CocoRoF/an-web
 cd an-web
 pip install -e ".[dev]"
-pytest                    # all 1525 tests should pass
+pytest                    # all 1540 tests should pass
 ruff check an_web/        # linting
 mypy an_web/              # type checking
 ```

@@ -36,6 +36,9 @@ _MAX_SCRIPT_TIME = 30.0
 _SETTLE_ROUNDS = 10
 # Max macrotask wait per settle round (ms)
 _MACROTASK_WAIT_MS = 200
+# Default wall-clock budget for script execution + settle (seconds).
+# Fetch/parse are excluded — they have their own network timeouts.
+_NAVIGATE_BUDGET_S = 15.0
 
 
 class NavigateAction(Action):
@@ -57,9 +60,12 @@ class NavigateAction(Action):
         self,
         session: Session,
         url: str = "",
+        timeout: float | None = None,
         **kwargs: Any,
     ) -> ActionResult:
         from an_web.dom.semantics import ActionResult
+
+        budget_s = timeout if timeout and timeout > 0 else _NAVIGATE_BUDGET_S
 
         # ── 1. Policy check ───────────────────────────────────────────
         policy_failure = self._check_policy(session, "navigate", url=url)
@@ -119,25 +125,37 @@ class NavigateAction(Action):
         scripts_found = 0
         scripts_executed = 0
         external_loaded = 0
+        settle_timed_out = False
 
-        if js_runtime is not None and js_runtime.is_available():
-            # Clear dynamic script queue before initial execution
-            session._pending_dynamic_scripts = []  # type: ignore[attr-defined]
-            scripts_found, scripts_executed, external_loaded = (
-                await _execute_scripts_full(
-                    document, js_runtime, session, response.url
-                )
+        # Wall-clock budget for script execution + settle.  Individual V8
+        # evals are capped by JSRuntime's per-eval timeout; this asyncio
+        # deadline bounds the overall loop between evals.
+        try:
+            async with asyncio.timeout(budget_s):
+                if js_runtime is not None and js_runtime.is_available():
+                    # Clear dynamic script queue before initial execution
+                    session._pending_dynamic_scripts = []  # type: ignore[attr-defined]
+                    scripts_found, scripts_executed, external_loaded = (
+                        await _execute_scripts_full(
+                            document, js_runtime, session, response.url
+                        )
+                    )
+
+                # ── 5b. Fire DOMContentLoaded + load (HTML5 lifecycle) ─
+                if js_runtime is not None and js_runtime.is_available():
+                    js_runtime.dispatch_dom_content_loaded()
+                    await js_runtime.drain_microtasks()
+                    js_runtime.dispatch_load()
+                    await js_runtime.drain_microtasks()
+
+                # ── 6. Settle event loop (micro/macrotasks + dynamic scripts)
+                await _settle_page(session, rounds=_SETTLE_ROUNDS)
+        except TimeoutError:
+            settle_timed_out = True
+            log.warning(
+                "navigate settle budget (%.1fs) exceeded for %s — "
+                "page returned in current state", budget_s, url,
             )
-
-        # ── 5b. Fire DOMContentLoaded + load (HTML5 lifecycle) ────────
-        if js_runtime is not None and js_runtime.is_available():
-            js_runtime.dispatch_dom_content_loaded()
-            await js_runtime.drain_microtasks()
-            js_runtime.dispatch_load()
-            await js_runtime.drain_microtasks()
-
-        # ── 6. Settle event loop (microtasks + macrotasks + dynamic scripts)
-        await _settle_page(session, rounds=_SETTLE_ROUNDS)
 
         # ── 6b. Sync JS DOM mutations back to Python DOM ──────────────
         if js_runtime is not None and js_runtime.is_available():
@@ -168,6 +186,7 @@ class NavigateAction(Action):
                 "scripts_executed": scripts_executed,
                 "external_loaded": external_loaded,
                 "dynamic_loaded": dynamic_loaded,
+                "settle_timeout": settle_timed_out,
             },
             state_delta_id=snapshot_id,
             recommended_next_actions=[{"tool": "snapshot"}],

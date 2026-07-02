@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -50,6 +51,12 @@ class JSError(Exception):
         lines = raw_msg.splitlines()
         first = lines[0] if lines else raw_msg
         stack = "\n".join(lines[1:]) if len(lines) > 1 else ""
+
+        # mini-racer >= 0.12 prefixes messages with a source location,
+        # e.g. "<anonymous>:1: TypeError: ...". Strip it before parsing.
+        loc = re.match(r"^\s*<[^>]*>:\d+:\s*(.*)$", first)
+        if loc:
+            first = loc.group(1)
 
         if ":" in first:
             js_type, _, message = first.partition(":")

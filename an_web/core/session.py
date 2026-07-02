@@ -147,7 +147,7 @@ class Session:
     # Navigation
     # ------------------------------------------------------------------
 
-    async def navigate(self, url: str) -> dict[str, Any]:
+    async def navigate(self, url: str, timeout: float | None = None) -> dict[str, Any]:
         """
         Load a URL, build the DOM, and settle the page.
 
@@ -170,7 +170,7 @@ class Session:
         if self.js_runtime is not None:
             self.js_runtime.on_page_load()
 
-        result = await NavigateAction().execute(session=self, url=url)
+        result = await NavigateAction().execute(session=self, url=url, timeout=timeout)
 
         if result.is_ok():
             self._history.append(self._current_url)

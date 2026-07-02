@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "an-web"
-version = "0.5.0"
+version = "0.6.0"
 description = "AN-Web: AI-Native Web Browser Engine — executes the web as an actionable state machine for AI agents"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -28,7 +28,7 @@ dependencies = [
     "html5lib>=1.1",
     "pydantic>=2.7.0",
     "cssselect>=1.2.0",
-    "py-mini-racer>=0.6.0",
+    "mini-racer>=0.12.4",
 ]
 
 [project.optional-dependencies]

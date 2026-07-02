@@ -51,6 +51,19 @@ class ComplexSelector:
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
+
+def element_matches(element: Element, selector: str) -> bool:
+    """Return True if *element* matches *selector* (combinators included)."""
+    selector = selector.strip()
+    if not selector:
+        return False
+    try:
+        complex_sel = _parse_complex(selector)
+    except Exception:
+        return _simple_match(element, selector)
+    return _matches_complex(element, complex_sel)
+
+
 class SelectorEngine:
     """CSS selector matching against AN-Web DOM tree."""
 

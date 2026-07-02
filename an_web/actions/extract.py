@@ -199,16 +199,16 @@ def _extract_structured(doc: Any, query: dict[str, Any]) -> list[dict[str, Any]]
 
 
 def _query_in(element: Any, selector: str) -> Any:
-    """Query within a specific element's subtree."""
+    """Query within a specific element's subtree (full CSS engine)."""
     if not selector:
         return element
-    # Use iter_descendants for a simple linear scan (no full CSS engine on subtrees)
     if not hasattr(element, "iter_descendants"):
         return None
-    # Try exact tag match first for performance
+    from an_web.dom.nodes import Element
+    from an_web.dom.selectors import element_matches
+
     for desc in element.iter_descendants():
-        # Minimal matching: support simple "tag", ".class", "#id", "tag.class"
-        if _matches_simple_selector(desc, selector):
+        if isinstance(desc, Element) and element_matches(desc, selector):
             return desc
     return None
 

@@ -90,7 +90,7 @@ pip install -e ".[dev]"
 | `selectolax` | 고속 HTML 파서 (Lexbor 백엔드) |
 | `html5lib` | 스펙 호환 폴백 파서 |
 | `pydantic` | 요청/응답 검증 |
-| `py-mini-racer` | 임베디드 V8 JavaScript 엔진 |
+| `mini-racer` | 임베디드 V8 JavaScript 엔진 (V8 14.x) |
 | `cssselect` | CSS 셀렉터 파싱 |
 
 ---
@@ -999,7 +999,7 @@ async def safe_browse():
 ## 테스트
 
 ```bash
-# 전체 테스트 실행 (1525개)
+# 전체 테스트 실행 (1540개)
 pytest
 
 # 커버리지 포함
@@ -1012,7 +1012,7 @@ pytest tests/unit/dom/ -v
 pytest tests/integration/ -v
 ```
 
-**테스트 스위트 (1525개 테스트):**
+**테스트 스위트 (1540개 테스트):**
 
 | 스위트 | 수량 | 대상 |
 |---|---|---|
@@ -1039,7 +1039,7 @@ pytest tests/integration/ -v
 
 | 메서드 | 반환 타입 | 설명 |
 |---|---|---|
-| `navigate(url)` | `dict` | URL 로드, DOM 구축, JS 실행, 안정화 |
+| `navigate(url, timeout=None)` | `dict` | URL 로드, DOM 구축, JS 실행, 안정화 (기본 15초 예산) |
 | `snapshot()` | `PageSemantics` | 구조화된 시맨틱 페이지 상태 (객체) |
 | `act(tool_call)` | `dict` | 11개 도구 중 하나 실행 |
 | `execute_script(js)` | `Any` | JavaScript 직접 실행 |
@@ -1090,7 +1090,7 @@ Apache-2.0
 git clone https://github.com/CocoRoF/an-web
 cd an-web
 pip install -e ".[dev]"
-pytest                    # 1525개 테스트 모두 통과해야 함
+pytest                    # 1540개 테스트 모두 통과해야 함
 ruff check an_web/        # 린팅
 mypy an_web/              # 타입 체크
 ```

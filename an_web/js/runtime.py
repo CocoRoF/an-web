@@ -51,6 +51,13 @@ _MAX_MICROTASK_JOBS = 1000
 # V8 soft memory limit
 _V8_MEMORY_LIMIT = 256 * 1024 * 1024  # 256 MiB
 
+# Per-eval V8 CPU budgets (ms).  Without these, a single pathological
+# script (busy-wait, unbounded timer cascade) can block the engine for
+# minutes — V8 evals are synchronous and cannot be cancelled from asyncio.
+_DEFAULT_EVAL_TIMEOUT_MS = 5_000
+# Housekeeping evals (timer firing, bridge drains) get a tighter budget.
+_HOUSEKEEPING_EVAL_TIMEOUT_MS = 2_000
+
 # Minimum script size (bytes) to consider for polyfill detection.
 _POLYFILL_MIN_SIZE = 50_000
 
@@ -122,6 +129,35 @@ def _extract_webpack_runtime(source: str) -> str | None:
     return cleaned
 
 
+# All MiniRacer instances must be constructed AND closed on ONE dedicated
+# thread: the native layer segfaults when a context is disposed from a
+# different thread than the one that created it (V8 thread affinity), and
+# constructing on an asyncio-loop thread binds the context to that loop,
+# which then forbids per-eval timeouts.
+_creator_pool: Any = None
+
+
+def _create_mini_racer() -> Any:
+    """Create a MiniRacer whose context is NOT bound to our asyncio loop.
+
+    mini-racer >= 0.12 binds a new context to the currently-running
+    asyncio loop, and then refuses per-eval timeouts from that loop
+    ("use eval_cancelable").  Constructing the instance on a dedicated
+    creator thread (where no loop runs) makes mini-racer spawn its own
+    internal event loop, so ``eval(code, timeout=...)`` works from any
+    thread — including ours — via its thread-safe dispatch path.
+    """
+    from py_mini_racer import MiniRacer  # type: ignore[import]
+
+    global _creator_pool
+    if _creator_pool is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _creator_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="anweb-v8-init"
+        )
+    return _creator_pool.submit(MiniRacer).result()
+
+
 def _v8_to_py(value: Any, ctx: Any = None) -> Any:
     """Convert a PyMiniRacer return value to a Python native type.
 
@@ -132,9 +168,14 @@ def _v8_to_py(value: Any, ctx: Any = None) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
 
-    # JSObject — use V8 JSON.stringify if we have the context
     type_name = type(value).__name__
-    if type_name == "JSObject" and ctx is not None:
+    # mini-racer >= 0.12 returns a JSUndefined sentinel for undefined
+    if type_name == "JSUndefinedType":
+        return None
+
+    # JS object handle (JSObject in py-mini-racer 0.6, JSMappedObjectImpl /
+    # JSArrayImpl etc. in mini-racer >= 0.12) — use V8 JSON.stringify.
+    if type_name.startswith("JS") and ctx is not None:
         try:
             # Store in a temp var, stringify, then clean up
             ctx.eval("var __tmp_conv = null;")
@@ -182,8 +223,7 @@ class JSRuntime:
     def _try_init(self) -> None:
         """Attempt to create a V8 context via PyMiniRacer."""
         try:
-            from py_mini_racer import MiniRacer  # type: ignore[import]
-            ctx = MiniRacer()
+            ctx = _create_mini_racer()
             ctx.set_soft_memory_limit(_V8_MEMORY_LIMIT)
             self._ctx = ctx
             self._available = True
@@ -215,34 +255,48 @@ class JSRuntime:
     # Eval / call
     # ─────────────────────────────────────────────────────────────────────────
 
-    def eval(self, script: str) -> Any:
+    def eval(self, script: str, timeout_ms: int | None = None) -> Any:
         """
         Evaluate a JS script/expression and return the result.
 
         V8 automatically flushes microtasks after eval(), so Promise
         continuations (.then) are already settled when this returns.
 
+        Args:
+            script:     JavaScript source to evaluate.
+            timeout_ms: V8 CPU budget for this eval (defaults to
+                        ``_DEFAULT_EVAL_TIMEOUT_MS``).
+
         Raises:
-            JSError: if the script throws a JS exception.
+            JSError: if the script throws a JS exception or times out.
             RuntimeError: if V8 is not available.
         """
         if not self._available or not self._ctx:
             raise RuntimeError("JS runtime not available")
         try:
-            result = self._ctx.eval(script)
+            result = self._ctx.eval(
+                script, timeout=timeout_ms or _DEFAULT_EVAL_TIMEOUT_MS
+            )
             # Process any pending bridge commands after eval
             self._process_bridge_commands()
             return self._convert_result(result, script)
         except Exception as exc:
             raise JSError.from_v8_exception(exc) from exc
 
-    def eval_safe(self, script: str, default: Any = None) -> EvalResult:
+    def eval_safe(
+        self,
+        script: str,
+        default: Any = None,
+        timeout_ms: int | None = None,
+    ) -> EvalResult:
         """
         Like eval() but never raises — wraps result in EvalResult.
 
         Args:
-            script:  JavaScript source to evaluate.
-            default: Value to use as EvalResult.value on error.
+            script:     JavaScript source to evaluate.
+            default:    Value to use as EvalResult.value on error.
+            timeout_ms: V8 CPU budget for this eval (defaults to
+                        ``_DEFAULT_EVAL_TIMEOUT_MS``).
 
         Returns:
             EvalResult with .ok / .value / .error fields.
@@ -250,7 +304,9 @@ class JSRuntime:
         if not self._available or not self._ctx:
             return EvalResult.success(default)
         try:
-            raw = self._ctx.eval(script)
+            raw = self._ctx.eval(
+                script, timeout=timeout_ms or _DEFAULT_EVAL_TIMEOUT_MS
+            )
             self._process_bridge_commands()
             return EvalResult.success(self._convert_result(raw, script))
         except Exception as exc:
@@ -266,9 +322,14 @@ class JSRuntime:
         """
         if value is None or isinstance(value, (bool, int, float, str)):
             return value
-        if type(value).__name__ == "JSObject" and self._ctx and script:
+        if type(value).__name__ == "JSUndefinedType":
+            return None
+        if type(value).__name__.startswith("JS") and self._ctx and script:
             try:
-                json_str = self._ctx.eval(f"JSON.stringify({script})")
+                json_str = self._ctx.eval(
+                    f"JSON.stringify({script})",
+                    timeout=_HOUSEKEEPING_EVAL_TIMEOUT_MS,
+                )
                 if isinstance(json_str, str):
                     return json.loads(json_str)
             except Exception:
@@ -344,7 +405,8 @@ class JSRuntime:
         try:
             raw = self._ctx.eval(
                 "typeof _drainBridgeCommands === 'function'"
-                " ? _drainBridgeCommands() : '[]'"
+                " ? _drainBridgeCommands() : '[]'",
+                timeout=_HOUSEKEEPING_EVAL_TIMEOUT_MS,
             )
             if raw and raw != '[]':
                 commands = json.loads(raw) if isinstance(raw, str) else []
@@ -446,10 +508,13 @@ class JSRuntime:
 
         total = 0
         try:
-            # Fire any ready timers (implemented in JS)
+            # Fire any ready timers (implemented in JS).  The JS side also
+            # enforces a per-call budget; this timeout is the hard backstop
+            # against a single long-running timer callback.
             raw = self._ctx.eval(
                 "typeof _fireReadyTimers === 'function'"
-                " ? _fireReadyTimers() : 0"
+                " ? _fireReadyTimers() : 0",
+                timeout=_HOUSEKEEPING_EVAL_TIMEOUT_MS,
             )
             timers_fired = int(raw) if raw else 0
             total += timers_fired
@@ -533,9 +598,22 @@ class JSRuntime:
     # ─────────────────────────────────────────────────────────────────────────
 
     def close(self) -> None:
-        """Release the V8 context."""
+        """Release the V8 context (and its internal event-loop thread).
+
+        Disposal is routed through the same dedicated thread that created
+        the context — closing from another thread segfaults in V8.
+        """
+        ctx = self._ctx
         self._ctx = None
         self._available = False
+        if ctx is not None:
+            try:
+                if _creator_pool is not None:
+                    _creator_pool.submit(ctx.close).result(timeout=10)
+                else:
+                    ctx.close()
+            except Exception:
+                pass
 
     def __enter__(self) -> JSRuntime:
         return self
