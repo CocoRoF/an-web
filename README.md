@@ -74,7 +74,7 @@ Every number below was **measured, not estimated** — same host, same network, 
 success criteria for both engines. We publish losses alongside wins.
 
 > **Method** — 2026-07-03, Ubuntu 24.04, Python 3.12.3, 16 cores.
-> `an-web 0.8.0` vs `playwright 1.61.0` + Chromium 1228 (headless shell).
+> `an-web 0.9.0` vs `playwright 1.61.0` + Chromium 1228 (headless shell).
 > Success = non-empty title **and** visible text above a per-site threshold
 > **and** a minimum link count, extracted through each engine's own API.
 
@@ -101,14 +101,17 @@ success criteria for both engines. We publish losses alongside wins.
 | stackoverflow.com | ✅ **5.4 s** | ❌ HTTP 403 | Cloudflare blocked headless Chromium; AN-Web's plain HTTP client passed |
 | developer.mozilla.org | ✅ 0.8 s | ✅ 1.6 s | |
 | python.org | ✅ 15.4 s | ✅ 15.4 s | both hit their settle/network-idle budgets |
-| naver.com | ❌ | ✅ 8.4 s | **AN-Web loss** — the portal's JS stack needs a fuller browser environment than the shimmed Web API provides |
-| bbc.com | ✅ **4.4 s** | ✅ 15.6 s | Playwright waited out its network-idle timeout |
+| naver.com | ⚠️ 1.1 s partial | ✅ 8.4 s | v0.9.0: renders 1,000+ elements — menus, headlines, 110 links (was a dead shell in 0.8.x); text-dense sub-blocks still need a fuller env |
+| bbc.com | ✅ **5.1 s** | ✅ 15.6 s | Playwright waited out its network-idle timeout. AN-Web's SSR-preservation fallback engaged (page JS wiped content → pre-JS DOM restored, flagged `dom_restored`) |
 | hrletsgo.me (Next.js 14, client-fetched content) | ✅ 2.1 s | ✅ 1.5 s | client-side `fetch` data present in both; see hydration note in [Known Limitations](#known-limitations) |
 
-**Score: 8/10 vs 8/10 — with different failure modes.** AN-Web loses where a site's
-JS demands a full browser environment (naver). Playwright loses where anti-bot
+**Score: 8/10 vs 8/10 — with different failure modes.** AN-Web renders portals
+partially where their JS demands a fuller browser environment (naver — much
+improved in v0.9.0; daum/youtube still partial). Playwright loses where anti-bot
 walls target headless Chromium (stackoverflow) or where its idle heuristics stall
-(bbc). Pick per target; they compose well side by side.
+(bbc). Anti-bot walls that fingerprint plain HTTP clients block AN-Web instead
+(medium.com/npmjs.com 403, amazon.com 202). Pick per target; they compose well
+side by side.
 
 Reproduce it yourself — the harness is ~120 lines per engine:
 
@@ -1279,8 +1282,9 @@ you pick the tool — and reach for Playwright where it wins:
 | **WebSocket** | ❌ Absent | Pages that stream content over WS (live dashboards, chat) won't receive it. `fetch`/XHR are fully bridged. |
 | **Pointer realism** | ⚠️ Partial | `click`/`type`/`select`/`scroll`/`submit` are semantic events. There is no `hover`, drag-and-drop, or low-level key chords. |
 | **Screenshots** | 🚫 By design | AN-Web produces structured evidence, not pixels. If you need visual verification, use a pixel browser. |
-| **Anti-bot walls** | ⚠️ Different profile | AN-Web presents an ordinary HTTP-client TLS fingerprint: some walls block it, others block headless Chromium instead (in our bench, Cloudflare 403'd Playwright on stackoverflow.com while AN-Web passed — and naver.com served AN-Web a shell it couldn't render). Test your target. |
+| **Anti-bot walls** | ⚠️ Different profile | AN-Web presents an ordinary HTTP-client TLS fingerprint: some walls block it (medium.com/npmjs.com → 403, amazon.com → 202 interstitial), others block headless Chromium instead (Cloudflare 403'd Playwright on stackoverflow.com while AN-Web passed). Test your target. |
 | **React hydration** | ⚠️ Partial | SSR comment markers are preserved (v0.8.0) and client-fetched data reaches the snapshot exactly once, but hydration mismatches can still make *static* sections appear twice on some Next.js pages. |
+| **Silent non-render** | ⚠️ Some portals | A few JS-shell sites run all scripts without errors yet never commit content (daum.net, youtube.com partial). If page JS *wipes* server-rendered content instead, the SSR-preservation fallback restores the pre-JS DOM and flags `dom_restored` in navigate effects. |
 | **Script-heavy settle** | ⚠️ Cost | Sites like Wikipedia run seconds of JS in the settle loop. Cap it per call: `session.navigate(url, timeout=3)`. Server-rendered content is already complete at that point. |
 
 **Rule of thumb:** agent loops that *read, extract, fill, and submit* → AN-Web.

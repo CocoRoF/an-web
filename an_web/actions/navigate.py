@@ -95,6 +95,14 @@ class NavigateAction(Action):
         session._current_document = document  # type: ignore[attr-defined]
         session._current_url = response.url   # type: ignore[attr-defined]
 
+        # Pre-JS content size — used after settle to detect a client-side
+        # render that REPLACED server-rendered content with an empty shell
+        # (SPA boot succeeded but its data/render path can't complete in
+        # the shim environment). Real browsers never surface that state;
+        # for an agent the server-rendered DOM is strictly more truthful.
+        _pre_body = document.body
+        pre_js_text_len = len(_pre_body.inner_text) if _pre_body is not None else 0
+
         # ── 4. Snapshot ───────────────────────────────────────────────
         storage_state = getattr(session, "storage_state", lambda: {})()
         snapshot_id = ""
@@ -182,6 +190,29 @@ class NavigateAction(Action):
             except Exception:
                 pass
 
+        # ── 6c. SSR-preservation fallback ─────────────────────────────
+        # If page JS shrank the visible text to under 30% of the parsed
+        # HTML (e.g. an app shell replacing full server-rendered content),
+        # restore the pre-JS DOM. Flagged in effects as dom_restored.
+        dom_restored = False
+        if scripts_executed > 0 and pre_js_text_len > 1000:
+            try:
+                cur_doc = getattr(session, "_current_document", document)
+                cur_body = cur_doc.body if cur_doc is not None else None
+                post_text_len = len(cur_body.inner_text) if cur_body is not None else 0
+                if post_text_len < pre_js_text_len * 0.3:
+                    session._current_document = parse_html(  # type: ignore[attr-defined]
+                        response.text, base_url=response.url
+                    )
+                    dom_restored = True
+                    log.warning(
+                        "navigate: page JS reduced visible text %d -> %d chars on %s "
+                        "— restored pre-JS DOM (client render incomplete in shim env)",
+                        pre_js_text_len, post_text_len, response.url,
+                    )
+            except Exception:
+                pass
+
         # Count dynamic scripts that were loaded during settle
         dynamic_loaded = len(js_runtime._scripts_loaded) - scripts_found \
             if js_runtime and js_runtime.is_available() else 0
@@ -204,6 +235,7 @@ class NavigateAction(Action):
                 "external_loaded": external_loaded,
                 "dynamic_loaded": dynamic_loaded,
                 "settle_timeout": settle_timed_out,
+                "dom_restored": dom_restored,
             },
             state_delta_id=snapshot_id,
             recommended_next_actions=[{"tool": "snapshot"}],

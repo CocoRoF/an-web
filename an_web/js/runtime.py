@@ -500,7 +500,18 @@ class JSRuntime:
                 self._scripts_loaded.append(src_hint)
                 return EvalResult.success(None)
 
+        # Maintain document.currentScript across this evaluation — webpack
+        # derives its chunk publicPath from currentScript.src at module-init.
+        src_url = "" if src_hint.startswith("<") else src_hint
+        self.eval_safe(
+            "if (typeof document !== 'undefined' && "
+            "typeof __anweb_makeCurrentScript === 'function') "
+            f"document.currentScript = __anweb_makeCurrentScript({json.dumps(src_url)});"
+        )
         result = self.eval_safe(source)
+        self.eval_safe(
+            "if (typeof document !== 'undefined') document.currentScript = null;"
+        )
         self._scripts_loaded.append(src_hint)
         if not result.ok:
             log.debug("Script '%s' threw: %s", src_hint[:60], result.error)
