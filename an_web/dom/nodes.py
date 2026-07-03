@@ -14,6 +14,15 @@ from typing import Any
 # Elements whose text is never rendered — excluded from inner_text
 _NON_RENDERED_TAGS = frozenset({"script", "style", "template", "noscript"})
 
+# Inline-level elements: their boundaries do NOT imply a word break.
+# "a <a>high-level</a>, language" must render as "a high-level, language",
+# not "a high-level , language".
+_INLINE_TAGS = frozenset({
+    "a", "abbr", "b", "bdi", "bdo", "cite", "code", "data", "dfn", "em",
+    "i", "kbd", "mark", "q", "rp", "rt", "ruby", "s", "samp", "small",
+    "span", "strong", "sub", "sup", "time", "u", "var", "wbr",
+})
+
 
 class NodeType(Enum):
     ELEMENT = auto()
@@ -75,6 +84,22 @@ class TextNode(Node):
     @property
     def whole_text(self) -> str:
         return self.data
+
+
+@dataclass
+class CommentNode(Node):
+    """DOM Comment node (``<!-- -->``).
+
+    Preserved through parsing because React hydration walks comment
+    markers (``<!--$-->``, ``<!--/$-->``) to match SSR output; stripping
+    them forces a client re-render that duplicates content.
+    Never contributes to text_content / inner_text.
+    """
+    data: str = ""
+
+    def __init__(self, node_id: str, data: str) -> None:
+        super().__init__(node_type=NodeType.COMMENT, node_id=node_id)
+        self.data = data
 
 
 @dataclass
@@ -174,8 +199,9 @@ class Element(Node):
                 if child.visibility_state in ("hidden", "none"):
                     continue
                 child._collect_visible_text(parts)
-                # block-level elements imply a word break
-                parts.append(" ")
+                # block-level elements imply a word break; inline ones don't
+                if child.tag not in _INLINE_TAGS:
+                    parts.append(" ")
 
     def to_dict(self) -> dict[str, Any]:
         return {

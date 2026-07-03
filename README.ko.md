@@ -55,7 +55,7 @@ AN-Web은 **처음부터** AI 에이전트 루프를 위해 설계되었습니�
 | **주요 출력** | 스크린샷 / DOM 문자열 | `PageSemantics` — 구조화된 월드 모델 |
 | **JS 엔진** | V8 (Chromium 전체) | V8 via PyMiniRacer (Chrome 동급, 경량 임베딩) |
 | **지연시간** | 500ms+ 콜드 스타트 | 액션당 < 50ms |
-| **메모리** | 300–800 MB | ~30 MB |
+| **메모리** | 300–800 MB+ (브라우저 프로세스) | 유휴 ~40 MB; JS 헤비 멀티세션 시 수백 MB (동일 워크로드 기준 Chromium의 약 ½) |
 | **액션 타겟팅** | CSS 셀렉터 / XPath 전용 | 시맨틱: `{"by": "role", "role": "button", "text": "로그인"}` |
 | **정책 & 안전** | 내장 없음 | 도메인 규칙, 속도 제한, 샌드박스, 승인 프로세스 |
 | **관측성** | 외부 트레이싱 | 내장 `ArtifactCollector`, `StructuredLogger`, `ReplayEngine` |

@@ -56,7 +56,7 @@ AN-Web is designed **from scratch** for the AI agent loop:
 | **Primary output** | Screenshots / DOM strings | `PageSemantics` — structured world model |
 | **JS engine** | V8 (full Chromium) | V8 via PyMiniRacer (Chrome-grade, lightweight embed) |
 | **Latency** | 500 ms+ cold start | < 50 ms per action |
-| **Memory** | 300–800 MB | ~30 MB |
+| **Memory** | 300–800 MB+ (browser processes) | ~40 MB idle; a few hundred MB under heavy multi-session JS (still ~½ of Chromium on the same workload) |
 | **Action targeting** | CSS selectors / XPath only | Semantic: `{"by": "role", "role": "button", "text": "Sign In"}` |
 | **Policy & safety** | None built-in | Domain rules, rate limits, sandbox, approval flows |
 | **Observability** | External tracing | First-class `ArtifactCollector`, `StructuredLogger`, `ReplayEngine` |

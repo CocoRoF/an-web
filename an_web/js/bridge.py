@@ -234,6 +234,20 @@ def marshal_element(element: Any) -> dict[str, Any]:
                 "attributes": {},
                 "textContent": child.data,
             })
+        else:
+            from an_web.dom.nodes import CommentNode
+            if isinstance(child, CommentNode):
+                base["children"].append({
+                    "nodeId": child.node_id,
+                    "nodeType": 8,   # COMMENT_NODE
+                    "tag": "#comment",
+                    "tagName": "#comment",
+                    "id": "",
+                    "className": "",
+                    "attributes": {},
+                    "data": child.data,
+                    "textContent": "",
+                })
 
     return base
 
@@ -242,9 +256,11 @@ def _inner_html(element: Any) -> str:
     """Very lightweight innerHTML approximation."""
     parts: list[str] = []
     for child in getattr(element, "children", []):
-        from an_web.dom.nodes import Element, TextNode
+        from an_web.dom.nodes import CommentNode, Element, TextNode
         if isinstance(child, TextNode):
             parts.append(child.data)
+        elif isinstance(child, CommentNode):
+            parts.append(f"<!--{child.data}-->")
         elif isinstance(child, Element):
             attrs = "".join(
                 f' {k}="{v}"' for k, v in child.attributes.items()
