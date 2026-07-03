@@ -72,8 +72,8 @@ AN-Web은 **처음부터** AI 에이전트 루프를 위해 설계되었습니�
 아래 모든 수치는 **추정이 아닌 실측**입니다 — 동일 호스트·동일 네트워크·동일 성공 기준. 패배도 그대로 공개합니다.
 
 > **방법** — 2026-07-03, Ubuntu 24.04, Python 3.12.3, 16코어.
-> `an-web 0.9.0` vs `playwright 1.61.0` + Chromium 1228 (headless shell).
-> 성공 = 타이틀 존재 **및** 사이트별 임계치 이상의 가시 텍스트 **및** 최소 링크 수.
+> `an-web 0.9.1` vs `playwright 1.61.0` + Chromium 1228 (headless shell).
+> 성공 = 타이틀 존재 **및** 사이트별 임계치 이상의 body innerText **및** 최소 링크 수 — 동일 기준, 각 엔진 자체 API로 측정. 하네스는 [`benchmarks/`](benchmarks/)에 커밋됨.
 
 ### 리소스 풋프린트
 
@@ -89,20 +89,20 @@ AN-Web은 **처음부터** AI 에이전트 루프를 위해 설계되었습니�
 
 ### 유명 사이트 10곳 정면 비교
 
-| 사이트 | AN-Web | Playwright | 비고 |
-|---|---|---|---|
-| example.com | ✅ 0.7초 | ✅ 0.7초 | |
-| en.wikipedia.org (문서) | ✅ 9.8초 | ✅ 2.3초 | 추출 텍스트 **사실상 동일** (86,351 vs 86,352자); AN-Web은 JS settle 비용 — `navigate(timeout=3)`으로 상한 설정 가능 |
-| news.ycombinator.com | ➖ | ➖ | 양쪽 모두 동일한 197개 링크 추출; 페이지에 `<h*>`/`<p>`가 없어 공용 텍스트 기준 미적용 |
-| github.com | ✅ 1.6초 | ✅ 2.4초 | |
-| stackoverflow.com | ✅ **5.4초** | ❌ HTTP 403 | Cloudflare가 headless Chromium 차단; AN-Web의 일반 HTTP 클라이언트는 통과 |
-| developer.mozilla.org | ✅ 0.8초 | ✅ 1.6초 | |
-| python.org | ✅ 15.4초 | ✅ 15.4초 | 양쪽 모두 settle/network-idle 예산 소진 |
-| naver.com | ⚠️ 1.1초 부분 | ✅ 8.4초 | v0.9.0: 1,000+ 요소 렌더 — 메뉴·헤드라인·링크 110개 (0.8.x에선 죽은 셸); 텍스트 밀집 하위 블록은 아직 미완 |
-| bbc.com | ✅ **5.1초** | ✅ 15.6초 | Playwright는 network-idle 타임아웃까지 대기. AN-Web은 SSR 보존 폴백 작동 (JS가 콘텐츠 삭제 → 사전-JS DOM 복원, `dom_restored` 플래그) |
-| hrletsgo.me (Next.js 14, 클라이언트 fetch) | ✅ 2.1초 | ✅ 1.5초 | 클라이언트 `fetch` 데이터 양쪽 모두 도달; 하이드레이션 관련은 [알려진 한계](#알려진-한계) 참고 |
+| 사이트 | AN-Web | Playwright | body 텍스트 (aw / pw) | 비고 |
+|---|---|---|---|---|
+| example.com | ✅ 0.6초 | ✅ 0.7초 | 127 / 129 | |
+| en.wikipedia.org (문서) | ✅ 10.1초 | ✅ 2.4초 | 216,600 / 188,265 | AN-Web이 **더 많은** 텍스트 추출(접힌 섹션 포함); JS settle 비용은 `navigate(timeout=3)`으로 상한 설정 가능 |
+| news.ycombinator.com | ✅ 0.9초 | ✅ 1.4초 | 3,903 / 4,036 | 양쪽 동일 198개 링크 |
+| github.com | ✅ 1.6초 | ✅ 3.3초 | 6,890 / 5,893 | |
+| stackoverflow.com | ✅ **7.5초** | ❌ HTTP 403 | 10,607 / 265 | Cloudflare가 headless Chromium 차단; AN-Web의 일반 HTTP 클라이언트는 통과 |
+| developer.mozilla.org | ✅ 1.0초 | ✅ 1.8초 | 5,950 / 4,988 | |
+| python.org | ✅ 15.4초 | ✅ 15.5초 | 5,685 / 3,852 | 양쪽 모두 settle/network-idle 예산 소진 |
+| naver.com | ✅ **1.1초** | ✅ 10.2초 | 3,494 / 1,745 | v0.9.1: lazy 포털 블록 마운트 (IntersectionObserver 발화 + lazy fetch 디스패치) — 0.8.x에선 죽은 셸 |
+| bbc.com | ✅ **5.3초** | ✅ 15.6초 | 14,643 / 14,924 | Playwright는 network-idle 타임아웃까지 대기. AN-Web은 SSR 보존 폴백 작동 (`dom_restored` 플래그) |
+| hrletsgo.me (Next.js 14, 클라이언트 fetch) | ✅ 3.3초 | ✅ 1.7초 | 1,565 / 1,245 | 클라이언트 `fetch` 데이터 양쪽 모두 도달; [알려진 한계](#알려진-한계) 참고 |
 
-**스코어: 8/10 vs 8/10 — 실패 양상이 다릅니다.** AN-Web은 완전한 브라우저 환경을 요구하는 포털을 부분 렌더하고(naver — v0.9.0에서 대폭 개선; daum/youtube 부분), Playwright는 headless Chromium 겨냥 안티봇(stackoverflow)·idle 정체(bbc)에서 집니다. 일반 HTTP 클라이언트를 지문 차단하는 월은 AN-Web을 막습니다(medium/npmjs 403, amazon 202). 대상별로 골라 쓰거나 병행하십시오.
+**스코어: 10/10 vs 9/10.** 통과한 모든 사이트에서 AN-Web의 body 텍스트 양이 동등 이상. Playwright의 유일한 실패는 headless Chromium을 겨냥한 안티봇 월(stackoverflow)입니다. 역방향 월도 존재합니다 — 일반 HTTP 클라이언트를 지문 차단하는 사이트는 AN-Web을 막습니다(medium/npmjs 403, amazon 202 — 표 밖 집계, [알려진 한계](#알려진-한계) 참고). 일부 JS 셸 포털은 AN-Web에서 아직 부분 렌더입니다(daum.net, youtube.com). 대상별로 골라 쓰거나 병행하십시오.
 
 ---
 

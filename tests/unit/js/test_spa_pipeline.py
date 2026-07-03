@@ -176,3 +176,60 @@ class TestSPARenderPipeline:
             assert texts == ["문서 1", "문서 2"]
             snap = await session.snapshot()
             assert snap.semantic_tree.find_by_text("문서 1")
+
+
+
+class TestObserversFire:
+    """IntersectionObserver/ResizeObserver must invoke callbacks (v0.9.1).
+
+    Inert stubs left every lazy-loaded block on the modern web unrendered —
+    the callback that mounts content never ran (naver.com portal blocks).
+    """
+
+    async def test_intersection_observer_fires_with_visible_entry(self, rt):
+        rt.eval_safe("""
+            window.__io_result = null;
+            var el = document.createElement('div');
+            new IntersectionObserver(function(entries, obs) {
+                window.__io_result = {
+                    n: entries.length,
+                    isIntersecting: entries[0].isIntersecting,
+                    ratio: entries[0].intersectionRatio
+                };
+            }).observe(el);
+        """)
+        for _ in range(3):
+            await rt.drain_microtasks()
+        r = rt.eval_safe("JSON.stringify(window.__io_result)")
+        import json
+        assert json.loads(r.value) == {"n": 1, "isIntersecting": True, "ratio": 1}
+
+    async def test_resize_observer_fires_with_content_rect(self, rt):
+        rt.eval_safe("""
+            window.__ro_result = null;
+            var el = document.createElement('div');
+            new ResizeObserver(function(entries) {
+                window.__ro_result = {
+                    n: entries.length,
+                    hasRect: !!entries[0].contentRect,
+                    hasBox: entries[0].borderBoxSize.length === 1
+                };
+            }).observe(el);
+        """)
+        for _ in range(3):
+            await rt.drain_microtasks()
+        r = rt.eval_safe("JSON.stringify(window.__ro_result)")
+        import json
+        assert json.loads(r.value) == {"n": 1, "hasRect": True, "hasBox": True}
+
+    async def test_disconnect_prevents_callback(self, rt):
+        rt.eval_safe("""
+            window.__io_calls = 0;
+            var el = document.createElement('div');
+            var obs = new IntersectionObserver(function() { window.__io_calls++; });
+            obs.observe(el);
+            obs.disconnect();
+        """)
+        for _ in range(3):
+            await rt.drain_microtasks()
+        assert rt.eval_safe("window.__io_calls").value == 0
