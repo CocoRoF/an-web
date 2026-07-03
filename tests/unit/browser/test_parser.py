@@ -1,9 +1,8 @@
 """Unit tests for HTML parser bridge."""
 from __future__ import annotations
 
-import pytest
 from an_web.browser.parser import parse_html
-from an_web.dom.nodes import Document, Element, TextNode
+from an_web.dom.nodes import CommentNode, Document, Element, TextNode
 
 
 class TestParseHtmlBasic:
@@ -153,11 +152,18 @@ class TestParseHtmlSkippedTags:
         assert script is not None
         assert script.visibility_state == "none"
 
-    def test_style_not_in_dom(self):
+    def test_style_kept_hidden_and_empty(self):
+        # v0.7.2: style/template/noscript/meta stay in the DOM (hidden,
+        # childless) so React hydration's childNodes walk matches a real
+        # browser — but their CSS/inert text must NOT reach text surfaces.
         html = "<html><head><style>body{color:red}</style></head><body><p>hi</p></body></html>"
         doc = parse_html(html)
-        tags = {el.tag for el in doc.iter_elements()}
-        assert "style" not in tags
+        style = next((el for el in doc.iter_elements() if el.tag == "style"), None)
+        assert style is not None
+        assert style.visibility_state == "none"
+        assert style.children == []
+        body = doc.body
+        assert body is not None and "color" not in body.text_content
 
 
 class TestParseHtmlLoginForm:
@@ -211,3 +217,110 @@ class TestParseHtmlLoginForm:
         interactive = [el for el in doc.iter_elements() if el.is_interactive]
         # email input, password input, button
         assert len(interactive) >= 3
+
+
+class TestInlineTextInterleaving:
+    """Reading order of mixed inline content (v0.7.2 P0 fix).
+
+    The old css("*") walk concatenated all direct text of an element into a
+    single TextNode appended before its element children, destroying reading
+    order on virtually every text-heavy page.
+    """
+
+    MIXED = (
+        '<html><body><p id="t">Python is a <a href="/x">high-level</a>, '
+        '<a href="/y">general-purpose</a>\n<b>programming language</b> that '
+        'emphasizes <i>readability</i> and simplicity.</p></body></html>'
+    )
+
+    EXPECTED = ("Python is a high-level, general-purpose programming language "
+                "that emphasizes readability and simplicity.")
+
+    def _paragraph(self, doc: Document) -> Element:
+        for el in doc.iter_elements():
+            if el.tag == "p":
+                return el
+        raise AssertionError("no <p> parsed")
+
+    def test_text_content_preserves_reading_order(self):
+        doc = parse_html(self.MIXED)
+        p = self._paragraph(doc)
+        assert " ".join(p.text_content.split()) == self.EXPECTED
+
+    def test_inner_text_preserves_reading_order(self):
+        doc = parse_html(self.MIXED)
+        p = self._paragraph(doc)
+        assert " ".join(p.inner_text.split()) == self.EXPECTED
+
+    def test_children_interleaved_not_grouped(self):
+        doc = parse_html(self.MIXED)
+        p = self._paragraph(doc)
+        kinds = ["text" if isinstance(c, TextNode) else c.tag for c in p.children]
+        # text, a, text(","), a, text(ws-separator), b, text, i, text
+        assert kinds == ["text", "a", "text", "a", "text", "b", "text", "i", "text"]
+
+    def test_boundary_whitespace_kept_in_text_nodes(self):
+        doc = parse_html("<p>foo <b>bar</b> baz</p>")
+        p = next(el for el in doc.iter_elements() if el.tag == "p")
+        assert p.text_content == "foo bar baz"
+
+    def test_whitespace_only_node_between_inline_elements_kept(self):
+        doc = parse_html("<p><a>one</a>\n<a>two</a></p>")
+        p = next(el for el in doc.iter_elements() if el.tag == "p")
+        assert " ".join(p.text_content.split()) == "one two"
+
+    def test_interblock_indentation_dropped(self):
+        doc = parse_html("<div>\n  <p>a</p>\n  <p>b</p>\n</div>")
+        div = next(el for el in doc.iter_elements() if el.tag == "div")
+        # No stray whitespace-only text nodes between block children
+        assert [c.tag for c in div.children if isinstance(c, Element)] == ["p", "p"]
+        assert not any(isinstance(c, TextNode) for c in div.children)
+
+    def test_style_text_not_polluting_parent(self):
+        doc = parse_html("<div><style>.x{color:red}</style><p>visible</p></div>")
+        div = next(el for el in doc.iter_elements() if el.tag == "div")
+        assert "color" not in div.text_content
+        assert "visible" in div.text_content
+
+    def test_inline_tag_no_word_break_in_inner_text(self):
+        doc = parse_html("<p>see <a>link</a>, ok</p>")
+        p = next(el for el in doc.iter_elements() if el.tag == "p")
+        assert p.inner_text == "see link, ok"
+
+
+class TestCommentPreservation:
+    """Comments must survive parsing (React hydration markers, v0.7.2 P1)."""
+
+    def test_comment_nodes_parsed(self):
+        doc = parse_html('<div id="r"><!--$--><p>x</p><!--/$--></div>')
+        div = next(el for el in doc.iter_elements() if el.tag == "div")
+        kinds = [
+            (c.data if isinstance(c, CommentNode) else c.tag)
+            for c in div.children
+        ]
+        assert kinds == ["$", "p", "/$"]
+
+    def test_comment_excluded_from_text_content(self):
+        doc = parse_html("<div><!-- hidden -->visible</div>")
+        div = next(el for el in doc.iter_elements() if el.tag == "div")
+        assert div.text_content == "visible"
+        assert div.inner_text == "visible"
+
+    def test_multiline_comment_data(self):
+        doc = parse_html("<div><!-- line1\nline2 --></div>")
+        div = next(el for el in doc.iter_elements() if el.tag == "div")
+        comments = [c for c in div.children if isinstance(c, CommentNode)]
+        assert len(comments) == 1
+        assert "line1" in comments[0].data and "line2" in comments[0].data
+
+    def test_comment_serialized_to_v8_mirror(self):
+        from an_web.js.bridge import _inner_html, marshal_element
+        doc = parse_html('<div id="r"><!--$--><p>x</p></div>')
+        div = next(el for el in doc.iter_elements() if el.tag == "div")
+        marshaled = marshal_element(div)
+        node_types = [c["nodeType"] for c in marshaled["children"]]
+        assert 8 in node_types
+        comment_entry = next(c for c in marshaled["children"] if c["nodeType"] == 8)
+        assert comment_entry["data"] == "$"
+        assert comment_entry["textContent"] == ""
+        assert _inner_html(div) == "<!--$--><p>x</p>"

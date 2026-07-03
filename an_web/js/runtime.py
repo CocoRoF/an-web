@@ -57,6 +57,11 @@ _V8_MEMORY_LIMIT = 256 * 1024 * 1024  # 256 MiB
 _DEFAULT_EVAL_TIMEOUT_MS = 5_000
 # Housekeeping evals (timer firing, bridge drains) get a tighter budget.
 _HOUSEKEEPING_EVAL_TIMEOUT_MS = 2_000
+# After a drain eval is killed with zero timers fired, later drains on the
+# same page get this reduced budget (the pump is almost certainly spinning).
+_HOUSEKEEPING_REDUCED_TIMEOUT_MS = 400
+# Consecutive fruitless kills before we stop draining for this page.
+_DRAIN_KILL_GIVE_UP = 3
 
 # Minimum script size (bytes) to consider for polyfill detection.
 _POLYFILL_MIN_SIZE = 50_000
@@ -214,6 +219,9 @@ class JSRuntime:
         self._ctx: Any = None
         self._available: bool = False
         self._scripts_loaded: list[str] = []
+        # Runaway-pump backoff: consecutive drain evals killed by the V8
+        # CPU timeout without firing a single timer. See drain_microtasks.
+        self._drain_kills: int = 0
         self._try_init()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -249,6 +257,7 @@ class JSRuntime:
         """Re-create the V8 context (e.g. after navigation)."""
         self.close()
         self._scripts_loaded.clear()
+        self._drain_kills = 0  # fresh page → fresh chance
         self._try_init()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -520,6 +529,19 @@ class JSRuntime:
         if not self._available or not self._ctx:
             return 0
 
+        # Runaway-pump backoff: a page whose timer callback spins until the
+        # V8 CPU kill (pathological setTimeout pumps) would otherwise burn
+        # the full 2s budget on EVERY drain. After the first fruitless kill
+        # the budget drops sharply; after several, we stop trying entirely
+        # for this page (fresh page resets the counter).
+        if self._drain_kills >= _DRAIN_KILL_GIVE_UP:
+            return 0
+        timeout_ms = (
+            _HOUSEKEEPING_EVAL_TIMEOUT_MS
+            if self._drain_kills == 0
+            else _HOUSEKEEPING_REDUCED_TIMEOUT_MS
+        )
+
         total = 0
         try:
             # Fire any ready timers (implemented in JS).  The JS side also
@@ -528,10 +550,12 @@ class JSRuntime:
             raw = self._ctx.eval(
                 "typeof _fireReadyTimers === 'function'"
                 " ? _fireReadyTimers() : 0",
-                timeout=_HOUSEKEEPING_EVAL_TIMEOUT_MS,
+                timeout=timeout_ms,
             )
             timers_fired = int(raw) if raw else 0
             total += timers_fired
+            if timers_fired > 0:
+                self._drain_kills = 0  # real progress → restore full budget
 
             # V8 auto-flushes microtasks after the eval above,
             # so .then() chains from timer callbacks are settled.
@@ -544,7 +568,15 @@ class JSRuntime:
                 await asyncio.sleep(0)
 
         except Exception as exc:
-            log.debug("drain_microtasks error: %s", exc)
+            msg = str(exc).lower()
+            if "terminated" in msg or "timeout" in msg or "timed out" in msg:
+                self._drain_kills += 1
+                log.debug(
+                    "drain_microtasks: V8 kill #%d (budget %dms)",
+                    self._drain_kills, timeout_ms,
+                )
+            else:
+                log.debug("drain_microtasks error: %s", exc)
 
         return total
 

@@ -85,7 +85,7 @@ def reinject_dom_state(ctx: Any, session: Session) -> None:
 
 def _serialize_dom_tree(session: Session) -> str:
     """Walk the Python DOM and return a JSON string for V8."""
-    from an_web.dom.nodes import Element, TextNode
+    from an_web.dom.nodes import CommentNode, Element, TextNode
 
     doc = getattr(session, "_current_document", None)
     if doc is None:
@@ -146,6 +146,23 @@ def _serialize_dom_tree(session: Session) -> str:
                 "tag": "#text",
                 "data": node.data,
                 "textContent": node.data,
+                "parentId": parent_id,
+            }
+
+        elif isinstance(node, CommentNode):
+            # React hydration walks comment markers (<!--$--> etc.) via
+            # childNodes and reads .data — they must exist in the mirror.
+            nid = node.node_id
+            parent_id = (
+                getattr(node.parent, "node_id", None)
+                if node.parent else None
+            )
+            nodes[nid] = {
+                "nodeId": nid,
+                "nodeType": 8,
+                "tag": "#comment",
+                "data": node.data,
+                "textContent": "",
                 "parentId": parent_id,
             }
 
@@ -1386,8 +1403,15 @@ function _makeElement(data) {
     el._children    = [];
     el.ownerDocument = (typeof document !== 'undefined') ? document : null;
     el.sourceIndex  = _elementIndex++;
-    el.nodeName     = el.tagName || (el.nodeType === 3 ? '#text' : '');
-    el.nodeValue    = el.nodeType === 3 ? el._textContent : null;
+    el.nodeName     = el.tagName ||
+        (el.nodeType === 3 ? '#text' : (el.nodeType === 8 ? '#comment' : ''));
+    if (el.nodeType === 3 || el.nodeType === 8) {
+        // React hydration reads comment .data ('$', '/$', '$?') directly.
+        el.data      = data.data !== undefined ? data.data : el._textContent;
+        el.nodeValue = el.data;
+    } else {
+        el.nodeValue = null;
+    }
 
     // textContent — getter reads from Python, setter writes back
     Object.defineProperty(el, 'textContent', {
@@ -1705,7 +1729,14 @@ function _makeElement(data) {
         return el._children;
     }
     Object.defineProperty(el, 'children', {
-        get: function() { return _refreshChildren(); },
+        // Per spec: element-only collection (no text/comment nodes).
+        get: function() {
+            var ch = _refreshChildren(), out = [];
+            for (var i = 0; i < ch.length; i++) {
+                if (ch[i] && ch[i].nodeType === 1) out.push(ch[i]);
+            }
+            return out;
+        },
         configurable: true
     });
     Object.defineProperty(el, 'childNodes', {
