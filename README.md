@@ -25,6 +25,7 @@ async with ANWebEngine() as engine:
 ## Table of Contents
 
 - [Why AN-Web?](#why-an-web)
+- [Benchmarks vs Playwright](#benchmarks-vs-playwright)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Core Concepts](#core-concepts)
@@ -41,6 +42,7 @@ async with ANWebEngine() as engine:
 - [Architecture](#architecture)
 - [Testing](#testing)
 - [API Reference Summary](#api-reference-summary)
+- [Known Limitations](#known-limitations)
 - [License](#license)
 - [Contributing](#contributing)
 
@@ -54,9 +56,11 @@ AN-Web is designed **from scratch** for the AI agent loop:
 | Concern | Traditional Headless | AN-Web |
 |---|---|---|
 | **Primary output** | Screenshots / DOM strings | `PageSemantics` — structured world model |
-| **JS engine** | V8 (full Chromium) | V8 via PyMiniRacer (Chrome-grade, lightweight embed) |
-| **Latency** | 500 ms+ cold start | < 50 ms per action |
-| **Memory** | 300–800 MB+ (browser processes) | ~40 MB idle; a few hundred MB under heavy multi-session JS (still ~½ of Chromium on the same workload) |
+| **JS engine** | V8 (full Chromium) | V8 via mini-racer (Chrome-grade, lightweight embed) |
+| **Install** | pip **+ separate ~650 MB browser download** | pip only — no browser binaries, ~111 MB total |
+| **Cold start** | ~3.3 s browser launch *(measured)* | ~0.15–0.35 s engine + first session *(measured)* |
+| **Action latency** | ~1.9 ms IPC round-trip *(measured)* | ~0.04 ms in-process *(measured)* |
+| **Memory** | 1.38 GB peak on a 10-site crawl *(measured)* | 484 MB peak on the same crawl *(measured)* |
 | **Action targeting** | CSS selectors / XPath only | Semantic: `{"by": "role", "role": "button", "text": "Sign In"}` |
 | **Policy & safety** | None built-in | Domain rules, rate limits, sandbox, approval flows |
 | **Observability** | External tracing | First-class `ArtifactCollector`, `StructuredLogger`, `ReplayEngine` |
@@ -64,12 +68,78 @@ AN-Web is designed **from scratch** for the AI agent loop:
 
 ---
 
+## Benchmarks vs Playwright
+
+Every number below was **measured, not estimated** — same host, same network, same
+success criteria for both engines. We publish losses alongside wins.
+
+> **Method** — 2026-07-03, Ubuntu 24.04, Python 3.12.3, 16 cores.
+> `an-web 0.8.0` vs `playwright 1.61.0` + Chromium 1228 (headless shell).
+> Success = non-empty title **and** visible text above a per-site threshold
+> **and** a minimum link count, extracted through each engine's own API.
+
+### Resource footprint
+
+| Metric | AN-Web | Playwright + Chromium |
+|---|---|---|
+| Install steps | `pip install an-web` | `pip install playwright` **+** `playwright install chromium` |
+| Disk after install | **111 MB** | 136 MB (pip) + 646 MB (browsers) ≈ **782 MB** |
+| Extra download at setup | none | 114 MB browser archive |
+| Cold start (engine ready + first page context) | **0.15–0.35 s** | 3.3 s |
+| Warm per-action latency (`extract h1` ×20) | **0.04 ms** | 1.9 ms |
+| Peak process-tree RSS, 10-site crawl | **484 MB** | 1,382 MB |
+| Agent-facing snapshot of en.wikipedia.org | **13.7 k chars** (semantic tree) | 293 k chars (aria snapshot) |
+
+### 10 famous sites, head-to-head
+
+| Site | AN-Web | Playwright | Notes |
+|---|---|---|---|
+| example.com | ✅ 0.7 s | ✅ 0.7 s | |
+| en.wikipedia.org (article) | ✅ 9.8 s | ✅ 2.3 s | extracted text **near-identical** (86,351 vs 86,352 chars); AN-Web pays a JS-settle cost — pass `navigate(timeout=3)` to cap it |
+| news.ycombinator.com | ➖ | ➖ | both extract the identical 197 links; the page has no `<h*>`/`<p>` tags, so the shared text criterion doesn't apply |
+| github.com | ✅ 1.6 s | ✅ 2.4 s | |
+| stackoverflow.com | ✅ **5.4 s** | ❌ HTTP 403 | Cloudflare blocked headless Chromium; AN-Web's plain HTTP client passed |
+| developer.mozilla.org | ✅ 0.8 s | ✅ 1.6 s | |
+| python.org | ✅ 15.4 s | ✅ 15.4 s | both hit their settle/network-idle budgets |
+| naver.com | ❌ | ✅ 8.4 s | **AN-Web loss** — the portal's JS stack needs a fuller browser environment than the shimmed Web API provides |
+| bbc.com | ✅ **4.4 s** | ✅ 15.6 s | Playwright waited out its network-idle timeout |
+| hrletsgo.me (Next.js 14, client-fetched content) | ✅ 2.1 s | ✅ 1.5 s | client-side `fetch` data present in both; see hydration note in [Known Limitations](#known-limitations) |
+
+**Score: 8/10 vs 8/10 — with different failure modes.** AN-Web loses where a site's
+JS demands a full browser environment (naver). Playwright loses where anti-bot
+walls target headless Chromium (stackoverflow) or where its idle heuristics stall
+(bbc). Pick per target; they compose well side by side.
+
+Reproduce it yourself — the harness is ~120 lines per engine:
+
+```bash
+pip install an-web playwright psutil && playwright install chromium
+python benchmarks/bench_famous.py anweb && python benchmarks/bench_famous.py pw
+```
+
+Full harness, criteria, and raw-metric collection live in
+[`benchmarks/`](benchmarks/).
+
+---
+
 ## Installation
 
-**Requires:** Python 3.12+
+**Requires:** Python **3.12+**. That's the whole list.
 
 ```bash
 pip install an-web
+```
+
+> **No browser needed.** AN-Web does **not** download or depend on Chromium,
+> Chrome, Firefox, or any WebDriver. The V8 JavaScript engine ships *inside*
+> the `mini-racer` wheel as a prebuilt native library — `pip install` is the
+> entire setup, on a ~111 MB total footprint. There is no `an-web install`
+> post-step, no `PLAYWRIGHT_BROWSERS_PATH`, no apt packages.
+
+With the MCP server (for Claude Desktop / MCP clients):
+
+```bash
+pip install "an-web[mcp]"     # adds the `an-web-mcp` console script
 ```
 
 Or install from source:
@@ -83,7 +153,14 @@ pip install -e .
 pip install -e ".[dev]"
 ```
 
-**Dependencies** (all installed automatically):
+Using [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv add an-web            # in a project
+uv pip install an-web    # in a venv
+```
+
+**Dependencies** (all installed automatically by pip):
 
 | Package | Purpose |
 |---|---|
@@ -91,8 +168,21 @@ pip install -e ".[dev]"
 | `selectolax` | Fast HTML parser (Lexbor backend) |
 | `html5lib` | Spec-compliant fallback parser |
 | `pydantic` | Request/response validation |
-| `mini-racer` | Embedded V8 JavaScript engine (V8 14.x) |
+| `mini-racer` | Embedded V8 JavaScript engine (V8 14.x) — bundles V8, no system deps |
 | `cssselect` | CSS selector parsing |
+| `brotli` | Content-encoding support |
+
+**Platform notes**
+
+- Prebuilt `mini-racer` wheels cover Linux (glibc/manylinux), macOS (x86-64 & arm64), and Windows — no compiler needed.
+- **Alpine/musl containers are not supported** by the V8 wheel; use a `python:3.12-slim` (Debian) base image instead.
+- Works in plain Docker containers with no `--shm-size`, no seccomp tweaks, and no X/virtual-display setup — there is no browser process to sandbox.
+
+```dockerfile
+# Minimal working Dockerfile
+FROM python:3.12-slim
+RUN pip install --no-cache-dir an-web
+```
 
 ---
 
@@ -1175,6 +1265,26 @@ pytest tests/integration/ -v
 | `PageSemantics` | Full page state: page_type, title, url, primary_actions, inputs, blocking_elements, semantic_tree |
 | `SemanticNode` | Element in semantic tree: node_id, tag, role, name, value, is_interactive, visible, affordances, children |
 | `ActionResult` | Action outcome: status, action, effects, error, recommended_next_actions |
+
+---
+
+## Known Limitations
+
+AN-Web trades full browser fidelity for weight and speed. Know the trade before
+you pick the tool — and reach for Playwright where it wins:
+
+| Area | Status | Detail |
+|---|---|---|
+| **iframes** | ❌ Not executed | Frames appear as elements but their documents are not loaded or scripted. Many payment/login flows live in iframes — use Playwright for those. |
+| **WebSocket** | ❌ Absent | Pages that stream content over WS (live dashboards, chat) won't receive it. `fetch`/XHR are fully bridged. |
+| **Pointer realism** | ⚠️ Partial | `click`/`type`/`select`/`scroll`/`submit` are semantic events. There is no `hover`, drag-and-drop, or low-level key chords. |
+| **Screenshots** | 🚫 By design | AN-Web produces structured evidence, not pixels. If you need visual verification, use a pixel browser. |
+| **Anti-bot walls** | ⚠️ Different profile | AN-Web presents an ordinary HTTP-client TLS fingerprint: some walls block it, others block headless Chromium instead (in our bench, Cloudflare 403'd Playwright on stackoverflow.com while AN-Web passed — and naver.com served AN-Web a shell it couldn't render). Test your target. |
+| **React hydration** | ⚠️ Partial | SSR comment markers are preserved (v0.8.0) and client-fetched data reaches the snapshot exactly once, but hydration mismatches can still make *static* sections appear twice on some Next.js pages. |
+| **Script-heavy settle** | ⚠️ Cost | Sites like Wikipedia run seconds of JS in the settle loop. Cap it per call: `session.navigate(url, timeout=3)`. Server-rendered content is already complete at that point. |
+
+**Rule of thumb:** agent loops that *read, extract, fill, and submit* → AN-Web.
+Flows that *hover, drag, screenshot, pay inside an iframe, or stream over WS* → Playwright.
 
 ---
 
