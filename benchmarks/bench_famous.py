@@ -1,9 +1,10 @@
 """Famous-sites bench: an-web vs Playwright on the same 10 real-world sites.
 
 Usage: python bench_famous.py anweb|pw
-Writes famous_<engine>.json. Success criteria per site:
+Writes famous_<engine>.json. Success criteria per site (identical for both
+engines):
   - title non-empty
-  - visible text length >= threshold
+  - body innerText length >= threshold (tag-neutral visible-text metric)
   - at least `min_links` links extracted
 Everything is recorded honestly — failures stay failures.
 """
@@ -47,9 +48,12 @@ async def run_anweb(rec):
                 nav = await asyncio.wait_for(s.navigate(url), timeout=NAV_TIMEOUT_S + 30)
                 snap = await s.snapshot()
                 title = snap.title or ""
-                ex = await s.act({"tool": "extract", "query": "h1,h2,h3,p"})
-                paras = [x.get("text", "") for x in ex["effects"].get("results", [])]
-                text_len = sum(len(p) for p in paras)
+                ex = await s.act({"tool": "extract", "query": "body"})
+                _body = ex["effects"].get("results", [])
+                body_text = _body[0].get("text", "") if _body else ""
+                text_len = len(body_text)
+                exh = await s.act({"tool": "extract", "query": "h1,h2,h3,p"})
+                paras = [x.get("text", "") for x in exh["effects"].get("results", [])]
                 exl = await s.act({"tool": "extract", "query": "a"})
                 links = [x.get("text", "").strip() for x in exl["effects"].get("results", [])]
                 links = [x for x in links if x]
@@ -91,8 +95,9 @@ async def run_pw(rec):
                 except Exception:
                     pass  # busy sites never go idle; proceed
                 title = await pg.title()
+                body_text = await pg.inner_text("body")
+                text_len = len(body_text)
                 paras = await pg.locator("h1,h2,h3,p").all_inner_texts()
-                text_len = sum(len(p) for p in paras)
                 links = [x.strip() for x in await pg.locator("a").all_inner_texts() if x.strip()]
                 headline = next((p.strip() for p in paras if len(p.strip()) > 40), "")
                 status_code = resp.status if resp else None

@@ -74,9 +74,10 @@ Every number below was **measured, not estimated** — same host, same network, 
 success criteria for both engines. We publish losses alongside wins.
 
 > **Method** — 2026-07-03, Ubuntu 24.04, Python 3.12.3, 16 cores.
-> `an-web 0.9.0` vs `playwright 1.61.0` + Chromium 1228 (headless shell).
-> Success = non-empty title **and** visible text above a per-site threshold
-> **and** a minimum link count, extracted through each engine's own API.
+> `an-web 0.9.1` vs `playwright 1.61.0` + Chromium 1228 (headless shell).
+> Success = non-empty title **and** body innerText above a per-site threshold
+> **and** a minimum link count — identical criteria, each engine queried
+> through its own API. Harness committed in [`benchmarks/`](benchmarks/).
 
 ### Resource footprint
 
@@ -92,26 +93,27 @@ success criteria for both engines. We publish losses alongside wins.
 
 ### 10 famous sites, head-to-head
 
-| Site | AN-Web | Playwright | Notes |
-|---|---|---|---|
-| example.com | ✅ 0.7 s | ✅ 0.7 s | |
-| en.wikipedia.org (article) | ✅ 9.8 s | ✅ 2.3 s | extracted text **near-identical** (86,351 vs 86,352 chars); AN-Web pays a JS-settle cost — pass `navigate(timeout=3)` to cap it |
-| news.ycombinator.com | ➖ | ➖ | both extract the identical 197 links; the page has no `<h*>`/`<p>` tags, so the shared text criterion doesn't apply |
-| github.com | ✅ 1.6 s | ✅ 2.4 s | |
-| stackoverflow.com | ✅ **5.4 s** | ❌ HTTP 403 | Cloudflare blocked headless Chromium; AN-Web's plain HTTP client passed |
-| developer.mozilla.org | ✅ 0.8 s | ✅ 1.6 s | |
-| python.org | ✅ 15.4 s | ✅ 15.4 s | both hit their settle/network-idle budgets |
-| naver.com | ⚠️ 1.1 s partial | ✅ 8.4 s | v0.9.0: renders 1,000+ elements — menus, headlines, 110 links (was a dead shell in 0.8.x); text-dense sub-blocks still need a fuller env |
-| bbc.com | ✅ **5.1 s** | ✅ 15.6 s | Playwright waited out its network-idle timeout. AN-Web's SSR-preservation fallback engaged (page JS wiped content → pre-JS DOM restored, flagged `dom_restored`) |
-| hrletsgo.me (Next.js 14, client-fetched content) | ✅ 2.1 s | ✅ 1.5 s | client-side `fetch` data present in both; see hydration note in [Known Limitations](#known-limitations) |
+| Site | AN-Web | Playwright | body text (aw / pw) | Notes |
+|---|---|---|---|---|
+| example.com | ✅ 0.6 s | ✅ 0.7 s | 127 / 129 | |
+| en.wikipedia.org (article) | ✅ 10.1 s | ✅ 2.4 s | 216,600 / 188,265 | AN-Web extracts **more** text (collapsed sections included); it pays a JS-settle cost — pass `navigate(timeout=3)` to cap it |
+| news.ycombinator.com | ✅ 0.9 s | ✅ 1.4 s | 3,903 / 4,036 | identical 198 links on both |
+| github.com | ✅ 1.6 s | ✅ 3.3 s | 6,890 / 5,893 | |
+| stackoverflow.com | ✅ **7.5 s** | ❌ HTTP 403 | 10,607 / 265 | Cloudflare blocked headless Chromium; AN-Web's plain HTTP client passed |
+| developer.mozilla.org | ✅ 1.0 s | ✅ 1.8 s | 5,950 / 4,988 | |
+| python.org | ✅ 15.4 s | ✅ 15.5 s | 5,685 / 3,852 | both hit their settle/network-idle budgets |
+| naver.com | ✅ **1.1 s** | ✅ 10.2 s | 3,494 / 1,745 | v0.9.1: lazy portal blocks now mount (IntersectionObserver fires, lazy fetch dispatched) — was a dead shell in 0.8.x |
+| bbc.com | ✅ **5.3 s** | ✅ 15.6 s | 14,643 / 14,924 | Playwright waited out its network-idle timeout. AN-Web's SSR-preservation fallback engaged (page JS wiped content → pre-JS DOM restored, flagged `dom_restored`) |
+| hrletsgo.me (Next.js 14, client-fetched content) | ✅ 3.3 s | ✅ 1.7 s | 1,565 / 1,245 | client-side `fetch` data present in both; see hydration note in [Known Limitations](#known-limitations) |
 
-**Score: 8/10 vs 8/10 — with different failure modes.** AN-Web renders portals
-partially where their JS demands a fuller browser environment (naver — much
-improved in v0.9.0; daum/youtube still partial). Playwright loses where anti-bot
-walls target headless Chromium (stackoverflow) or where its idle heuristics stall
-(bbc). Anti-bot walls that fingerprint plain HTTP clients block AN-Web instead
-(medium.com/npmjs.com 403, amazon.com 202). Pick per target; they compose well
-side by side.
+**Score: 10/10 vs 9/10.** Body-text volumes are comparable or higher on AN-Web
+for every passing site. Playwright's one loss is an anti-bot wall targeting
+headless Chromium (stackoverflow). The reverse wall exists too: sites that
+fingerprint plain HTTP clients block AN-Web instead (medium.com/npmjs.com 403,
+amazon.com 202 — counted outside this table, see
+[Known Limitations](#known-limitations)). A few JS-shell portals remain partial
+for AN-Web (daum.net, youtube.com). Pick per target; the two compose well side
+by side.
 
 Reproduce it yourself — the harness is ~120 lines per engine:
 

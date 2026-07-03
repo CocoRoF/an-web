@@ -3395,11 +3395,62 @@ window.Blob = Blob;
 window.MutationObserver = function(cb) {
     return { observe: function() {}, disconnect: function() {}, takeRecords: function() { return []; } };
 };
-window.IntersectionObserver = function(cb) {
-    return { observe: function() {}, unobserve: function() {}, disconnect: function() {} };
+// IntersectionObserver — "everything is visible" semantics. A headless
+// text engine has no viewport, so every observed element intersects at
+// ratio 1 on the next tick. Inert stubs here left ALL lazy-loaded blocks
+// (portal sections, infinite feeds, below-the-fold content) unrendered:
+// the callback that mounts them never ran.
+window.IntersectionObserver = function(cb, options) {
+    var self = {
+        root: (options && options.root) || null,
+        rootMargin: (options && options.rootMargin) || '0px',
+        thresholds: (options && [].concat(options.threshold || 0)) || [0],
+        _active: true
+    };
+    function entryFor(el) {
+        var rect = { x: 0, y: 0, top: 0, left: 0, right: 1280, bottom: 720,
+                     width: 1280, height: 720 };
+        try { if (el.getBoundingClientRect) rect = el.getBoundingClientRect() || rect; } catch (e) {}
+        return { isIntersecting: true, intersectionRatio: 1, target: el,
+                 boundingClientRect: rect, intersectionRect: rect,
+                 rootBounds: { x: 0, y: 0, top: 0, left: 0, right: 1280,
+                               bottom: 720, width: 1280, height: 720 },
+                 time: _py_perf_now() };
+    }
+    self.observe = function(el) {
+        if (!el) return;
+        setTimeout(function() {
+            if (!self._active) return;
+            try { cb([entryFor(el)], self); } catch (e) {
+                console.error('IntersectionObserver callback error:', e);
+            }
+        }, 0);
+    };
+    self.unobserve = function() {};
+    self.disconnect = function() { self._active = false; };
+    self.takeRecords = function() { return []; };
+    return self;
 };
+// ResizeObserver — reports one nominal size per observed element.
 window.ResizeObserver = function(cb) {
-    return { observe: function() {}, unobserve: function() {}, disconnect: function() {} };
+    var self = { _active: true };
+    self.observe = function(el) {
+        if (!el) return;
+        setTimeout(function() {
+            if (!self._active) return;
+            var rect = { x: 0, y: 0, top: 0, left: 0, width: 1280, height: 720 };
+            try { if (el.getBoundingClientRect) rect = el.getBoundingClientRect() || rect; } catch (e) {}
+            var entry = { target: el, contentRect: rect,
+                          borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }],
+                          contentBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }] };
+            try { cb([entry], self); } catch (e) {
+                console.error('ResizeObserver callback error:', e);
+            }
+        }, 0);
+    };
+    self.unobserve = function() {};
+    self.disconnect = function() { self._active = false; };
+    return self;
 };
 window.PerformanceObserver = function(cb) {
     return { observe: function() {}, disconnect: function() {}, takeRecords: function() { return []; } };
