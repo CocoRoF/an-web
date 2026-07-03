@@ -1588,7 +1588,26 @@ function _makeElement(data) {
     });
     Object.defineProperty(el, 'src', {
         get: function() { return el._attributes['src'] || ''; },
-        set: function(v) { el.setAttribute('src', v); },
+        set: function(v) {
+            el.setAttribute('src', v);
+            // Images: loaders/tracking pixels do `img.src = url` and wait
+            // on onload — fire it async so their promises settle without a
+            // real fetch (dynamic <script src> load events are handled by
+            // the settle loop instead).
+            if (el.localName === 'img') {
+                setTimeout(function() {
+                    el.complete = true;
+                    el.naturalWidth = 1; el.naturalHeight = 1;
+                    var ev = { type: 'load', target: el };
+                    if (typeof el.onload === 'function') { try { el.onload(ev); } catch (e) {} }
+                    try {
+                        (el._listeners && el._listeners['load'] || []).forEach(function(f) {
+                            try { (f.handleEvent || f).call(el, ev); } catch (e) {}
+                        });
+                    } catch (e) {}
+                }, 0);
+            }
+        },
     });
     Object.defineProperty(el, 'name', {
         get: function() { return el._attributes['name'] || ''; },
@@ -1959,6 +1978,41 @@ function _makeElement(data) {
         return 4; // FOLLOWING (default)
     };
 
+    // Per-tag behaviour needed by real-world bundles.
+    if (el.localName === 'canvas') {
+        el.width = el.width || 300;
+        el.height = el.height || 150;
+        el.getContext = function(kind) {
+            if (kind !== '2d') return null;
+            // Minimal no-op 2D context: enough for feature detection and
+            // fingerprint-ish code paths that draw and read back.
+            return {
+                canvas: el, fillStyle: '#000', strokeStyle: '#000', font: '10px sans-serif',
+                globalAlpha: 1, lineWidth: 1, textBaseline: 'alphabetic', textAlign: 'start',
+                save: function(){}, restore: function(){}, scale: function(){},
+                rotate: function(){}, translate: function(){}, transform: function(){},
+                setTransform: function(){}, clearRect: function(){}, fillRect: function(){},
+                strokeRect: function(){}, beginPath: function(){}, closePath: function(){},
+                moveTo: function(){}, lineTo: function(){}, arc: function(){},
+                rect: function(){}, fill: function(){}, stroke: function(){},
+                clip: function(){}, drawImage: function(){}, fillText: function(){},
+                strokeText: function(){},
+                measureText: function(t) { return { width: String(t || '').length * 6 }; },
+                getImageData: function(x, y, w, h) {
+                    var n = Math.max(1, (w || 1) * (h || 1)) * 4;
+                    var data; try { data = new Uint8ClampedArray(n); } catch (e) { data = []; }
+                    return { data: data, width: w || 1, height: h || 1 };
+                },
+                putImageData: function(){},
+                createImageData: function(w, h) { return this.getImageData(0, 0, w, h); },
+                createLinearGradient: function() { return { addColorStop: function(){} }; },
+                createRadialGradient: function() { return { addColorStop: function(){} }; },
+                createPattern: function() { return null; }
+            };
+        };
+        el.toDataURL = function() { return 'data:image/png;base64,'; };
+        el.toBlob = function(cb) { setTimeout(function() { cb(null); }, 0); };
+    }
     if (el.nodeId) _elementCache[el.nodeId] = el;
     return el;
 }
@@ -1980,6 +2034,15 @@ var document = (function() {
     doc.charset = 'UTF-8';
     doc.inputEncoding = 'UTF-8';
     doc.contentType = 'text/html';
+    // Fields real-world bundles read at module-init time. currentScript is
+    // maintained per-script by the Python loader (webpack derives its
+    // publicPath from currentScript.src — undefined kills chunk resolution
+    // and later imports explode as "(0, x.yz) is not a function").
+    doc.currentScript = null;
+    doc.visibilityState = 'visible';
+    doc.hidden = false;
+    doc.referrer = '';
+    doc.hasFocus = function() { return true; };
     doc.defaultView = window;
     doc.ownerDocument = null;
     doc.parentNode = null;
@@ -2443,6 +2506,189 @@ function MessageChannel() {
     this.port2._other = this.port1;
 }
 
+// ── Web-platform compatibility shims (v0.9.0) ────────────────────────────────
+// Portal-grade bundles (naver, daum, ...) feature-detect or hard-require
+// these at module-init. Missing globals abort a module's evaluation and
+// leave webpack export objects half-built. Each shim is the smallest
+// implementation that keeps real bundles on their happy path or on a
+// graceful fallback path (e.g. indexedDB fails -> localForage falls back
+// to localStorage).
+
+// document.currentScript factory — called by the Python script loader
+// around every script evaluation.
+function __anweb_makeCurrentScript(src) {
+    var s = String(src || '');
+    return {
+        nodeType: 1, tagName: 'SCRIPT', nodeName: 'SCRIPT', localName: 'script',
+        src: s, type: 'text/javascript', charset: '', async: false, defer: false,
+        noModule: false, crossOrigin: null, integrity: '',
+        parentNode: (typeof document !== 'undefined' && (document.head || document.body)) || null,
+        getAttribute: function(n) {
+            if (n === 'src') return s || null;
+            if (n === 'type') return 'text/javascript';
+            return null;
+        },
+        hasAttribute: function(n) { return n === 'src' ? !!s : false; },
+        dataset: {}
+    };
+}
+
+// window.postMessage — same-window semantics: async 'message' event.
+function postMessage(data, targetOrigin) {
+    setTimeout(function() {
+        var ev;
+        try { ev = new Event('message'); } catch (e) { ev = { type: 'message' }; }
+        ev.data = data;
+        ev.origin = (typeof location !== 'undefined' && location.origin) || '';
+        ev.source = window;
+        try { window.dispatchEvent(ev); } catch (e) {}
+        if (typeof window.onmessage === 'function') {
+            try { window.onmessage(ev); } catch (e) {}
+        }
+    }, 0);
+}
+
+// Image / Audio constructors — tracking pixels and preloaders do
+// `new Image().src = url` and often wait on onload.
+function Image(w, h) {
+    var img = document.createElement('img');
+    if (w !== undefined) img.width = w;
+    if (h !== undefined) img.height = h;
+    return img;
+}
+function Audio(src) {
+    var a = document.createElement('audio');
+    a.play = function() { return Promise.resolve(); };
+    a.pause = function() {};
+    a.load = function() {};
+    a.canPlayType = function() { return ''; };
+    if (src !== undefined) a.src = src;
+    return a;
+}
+
+// FormData — minimal spec surface; the fetch bridge urlencodes it.
+function FormData(form) {
+    this._entries = [];
+}
+FormData.prototype.append = function(k, v) { this._entries.push([String(k), v]); };
+FormData.prototype.set = function(k, v) {
+    this.delete(k); this._entries.push([String(k), v]);
+};
+FormData.prototype.get = function(k) {
+    for (var i = 0; i < this._entries.length; i++)
+        if (this._entries[i][0] === k) return this._entries[i][1];
+    return null;
+};
+FormData.prototype.getAll = function(k) {
+    var out = [];
+    for (var i = 0; i < this._entries.length; i++)
+        if (this._entries[i][0] === k) out.push(this._entries[i][1]);
+    return out;
+};
+FormData.prototype.has = function(k) { return this.get(k) !== null; };
+FormData.prototype.delete = function(k) {
+    this._entries = this._entries.filter(function(e) { return e[0] !== k; });
+};
+FormData.prototype.forEach = function(fn) {
+    this._entries.forEach(function(e) { fn(e[1], e[0]); });
+};
+FormData.prototype.entries = function() { return this._entries.slice(); };
+FormData.prototype.keys = function() {
+    return this._entries.map(function(e) { return e[0]; });
+};
+FormData.prototype.values = function() {
+    return this._entries.map(function(e) { return e[1]; });
+};
+FormData.prototype.__anwebUrlencode = function() {
+    return this._entries.map(function(e) {
+        return encodeURIComponent(e[0]) + '=' + encodeURIComponent(String(e[1]));
+    }).join('&');
+};
+
+// File — Blob-alike with a name; enough for feature detection and uploads
+// that never actually leave the engine.
+function File(bits, name, opts) {
+    opts = opts || {};
+    var size = 0;
+    try {
+        for (var i = 0; i < (bits || []).length; i++) size += (bits[i].length || bits[i].size || 0);
+    } catch (e) {}
+    this.name = String(name || '');
+    this.size = size;
+    this.type = opts.type || '';
+    this.lastModified = opts.lastModified || 0;
+}
+
+// indexedDB — present but politely failing: libraries like localForage
+// see the API, try open(), get onerror, and fall back to localStorage.
+// (Absence, by contrast, crashes module init with a ReferenceError.)
+var indexedDB = {
+    open: function() {
+        var req = { onupgradeneeded: null, onsuccess: null, onerror: null,
+                    onblocked: null, result: null, readyState: 'pending',
+                    error: { name: 'NotSupportedError',
+                             message: 'indexedDB is not supported in an-web' } };
+        setTimeout(function() {
+            req.readyState = 'done';
+            if (typeof req.onerror === 'function') {
+                try { req.onerror({ target: req, type: 'error' }); } catch (e) {}
+            }
+        }, 0);
+        return req;
+    },
+    deleteDatabase: function() { return this.open(); },
+    databases: function() { return Promise.resolve([]); },
+    cmp: function(a, b) { return a < b ? -1 : (a > b ? 1 : 0); }
+};
+
+// WebSocket — connections always fail (async error+close), but the
+// constructor existing keeps realtime-optional bundles alive.
+function WebSocket(url, protocols) {
+    var self = this;
+    this.url = String(url || '');
+    this.protocol = ''; this.extensions = ''; this.bufferedAmount = 0;
+    this.binaryType = 'blob';
+    this.readyState = 0; // CONNECTING
+    this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null;
+    this._listeners = {};
+    setTimeout(function() {
+        self.readyState = 3; // CLOSED
+        var errEv = { type: 'error', target: self };
+        var closeEv = { type: 'close', code: 1006, reason: 'an-web: WebSocket not supported', wasClean: false, target: self };
+        if (typeof self.onerror === 'function') { try { self.onerror(errEv); } catch (e) {} }
+        (self._listeners['error'] || []).forEach(function(f) { try { f(errEv); } catch (e) {} });
+        if (typeof self.onclose === 'function') { try { self.onclose(closeEv); } catch (e) {} }
+        (self._listeners['close'] || []).forEach(function(f) { try { f(closeEv); } catch (e) {} });
+    }, 0);
+}
+WebSocket.CONNECTING = 0; WebSocket.OPEN = 1; WebSocket.CLOSING = 2; WebSocket.CLOSED = 3;
+WebSocket.prototype.send = function() {};
+WebSocket.prototype.close = function() { this.readyState = 3; };
+WebSocket.prototype.addEventListener = function(t, f) {
+    (this._listeners[t] = this._listeners[t] || []).push(f);
+};
+WebSocket.prototype.removeEventListener = function(t, f) {
+    this._listeners[t] = (this._listeners[t] || []).filter(function(x) { return x !== f; });
+};
+
+// Worker — constructible no-op that reports failure asynchronously.
+function Worker(url) {
+    var self = this;
+    this.onmessage = null; this.onerror = null;
+    setTimeout(function() {
+        if (typeof self.onerror === 'function') {
+            try { self.onerror({ type: 'error', message: 'an-web: Worker not supported' }); } catch (e) {}
+        }
+    }, 0);
+}
+Worker.prototype.postMessage = function() {};
+Worker.prototype.terminate = function() {};
+Worker.prototype.addEventListener = function(t, f) {
+    if (t === 'message') this.onmessage = f;
+    if (t === 'error') this.onerror = f;
+};
+Worker.prototype.removeEventListener = function() {};
+
 // Fire all timers that the Python layer has marked as ready.
 // A wall-clock budget bounds each call: without it, heavy callbacks
 // (e.g. mw.loader executing dozens of modules) block the engine for
@@ -2553,6 +2799,13 @@ function fetch(url, options) {
     var method = (options.method || 'GET').toUpperCase();
     var body = options.body;
     var headersObj = _headersToObject(options.headers);
+    // FormData bodies: serialize as urlencoded (the bridge sends strings).
+    if (body && typeof body.__anwebUrlencode === 'function') {
+        body = body.__anwebUrlencode();
+        var hasCT = false;
+        for (var hk in headersObj) { if (hk.toLowerCase() === 'content-type') { hasCT = true; break; } }
+        if (!hasCT) headersObj['Content-Type'] = 'application/x-www-form-urlencoded';
+    }
     _fetchIdCounter++;
     var id = 'f' + _fetchIdCounter;
     return new Promise(function(resolve, reject) {

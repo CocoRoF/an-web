@@ -72,7 +72,7 @@ AN-Web은 **처음부터** AI 에이전트 루프를 위해 설계되었습니�
 아래 모든 수치는 **추정이 아닌 실측**입니다 — 동일 호스트·동일 네트워크·동일 성공 기준. 패배도 그대로 공개합니다.
 
 > **방법** — 2026-07-03, Ubuntu 24.04, Python 3.12.3, 16코어.
-> `an-web 0.8.0` vs `playwright 1.61.0` + Chromium 1228 (headless shell).
+> `an-web 0.9.0` vs `playwright 1.61.0` + Chromium 1228 (headless shell).
 > 성공 = 타이틀 존재 **및** 사이트별 임계치 이상의 가시 텍스트 **및** 최소 링크 수.
 
 ### 리소스 풋프린트
@@ -98,11 +98,11 @@ AN-Web은 **처음부터** AI 에이전트 루프를 위해 설계되었습니�
 | stackoverflow.com | ✅ **5.4초** | ❌ HTTP 403 | Cloudflare가 headless Chromium 차단; AN-Web의 일반 HTTP 클라이언트는 통과 |
 | developer.mozilla.org | ✅ 0.8초 | ✅ 1.6초 | |
 | python.org | ✅ 15.4초 | ✅ 15.4초 | 양쪽 모두 settle/network-idle 예산 소진 |
-| naver.com | ❌ | ✅ 8.4초 | **AN-Web 패배** — 포털의 JS 스택이 shim Web API보다 완전한 브라우저 환경을 요구 |
-| bbc.com | ✅ **4.4초** | ✅ 15.6초 | Playwright는 network-idle 타임아웃까지 대기 |
+| naver.com | ⚠️ 1.1초 부분 | ✅ 8.4초 | v0.9.0: 1,000+ 요소 렌더 — 메뉴·헤드라인·링크 110개 (0.8.x에선 죽은 셸); 텍스트 밀집 하위 블록은 아직 미완 |
+| bbc.com | ✅ **5.1초** | ✅ 15.6초 | Playwright는 network-idle 타임아웃까지 대기. AN-Web은 SSR 보존 폴백 작동 (JS가 콘텐츠 삭제 → 사전-JS DOM 복원, `dom_restored` 플래그) |
 | hrletsgo.me (Next.js 14, 클라이언트 fetch) | ✅ 2.1초 | ✅ 1.5초 | 클라이언트 `fetch` 데이터 양쪽 모두 도달; 하이드레이션 관련은 [알려진 한계](#알려진-한계) 참고 |
 
-**스코어: 8/10 vs 8/10 — 실패 양상이 다릅니다.** AN-Web은 완전한 브라우저 환경을 요구하는 사이트(naver)에서 지고, Playwright는 headless Chromium을 겨냥한 안티봇(stackoverflow)이나 idle 휴리스틱 정체(bbc)에서 집니다. 대상별로 골라 쓰거나 병행하십시오.
+**스코어: 8/10 vs 8/10 — 실패 양상이 다릅니다.** AN-Web은 완전한 브라우저 환경을 요구하는 포털을 부분 렌더하고(naver — v0.9.0에서 대폭 개선; daum/youtube 부분), Playwright는 headless Chromium 겨냥 안티봇(stackoverflow)·idle 정체(bbc)에서 집니다. 일반 HTTP 클라이언트를 지문 차단하는 월은 AN-Web을 막습니다(medium/npmjs 403, amazon 202). 대상별로 골라 쓰거나 병행하십시오.
 
 ---
 
@@ -1202,7 +1202,8 @@ AN-Web은 완전한 브라우저 충실도를 무게·속도와 맞바꿉니다.
 | **WebSocket** | ❌ 부재 | WS 스트리밍(라이브 대시보드, 채팅) 콘텐츠 미수신. `fetch`/XHR은 완전 브리지됨. |
 | **포인터 리얼리즘** | ⚠️ 부분 | `click`/`type`/`select`/`scroll`/`submit`은 시맨틱 이벤트. `hover`, 드래그앤드롭, 저수준 키 코드는 없음. |
 | **스크린샷** | 🚫 의도적 부재 | AN-Web은 픽셀이 아닌 구조화된 증거를 생산. 시각 검증이 필요하면 픽셀 브라우저 사용. |
-| **안티봇 월** | ⚠️ 프로파일 상이 | AN-Web은 일반 HTTP 클라이언트 TLS 지문 — 일부 월은 이를 차단하고, 다른 월은 headless Chromium을 차단 (실측: stackoverflow.com에서 Cloudflare가 Playwright에 403, AN-Web은 통과 / naver.com은 AN-Web에 렌더 불가 셸 응답). 대상별 테스트 필수. |
+| **안티봇 월** | ⚠️ 프로파일 상이 | AN-Web은 일반 HTTP 클라이언트 TLS 지문 — 일부 월은 이를 차단하고(medium/npmjs → 403, amazon → 202 인터스티셜), 다른 월은 headless Chromium을 차단(stackoverflow.com에서 Cloudflare가 Playwright에 403, AN-Web은 통과). 대상별 테스트 필수. |
+| **조용한 미렌더** | ⚠️ 일부 포털 | 스크립트가 에러 없이 전부 돌아도 콘텐츠를 커밋하지 않는 JS 셸 사이트 존재(daum.net, youtube.com 부분). 반대로 JS가 SSR 콘텐츠를 *삭제*하면 SSR 보존 폴백이 사전-JS DOM을 복원하고 navigate effects에 `dom_restored`를 플래그합니다. |
 | **React 하이드레이션** | ⚠️ 부분 | SSR 주석 마커 보존(v0.8.0), 클라이언트 fetch 데이터는 정확히 1회 스냅샷 도달. 다만 일부 Next.js 페이지에서 *정적* 섹션이 중복 표시될 수 있음. |
 | **스크립트 헤비 settle** | ⚠️ 비용 | Wikipedia류 사이트는 settle 루프에서 수 초의 JS 실행. `session.navigate(url, timeout=3)`으로 상한 설정 — 서버 렌더 콘텐츠는 그 시점에 이미 완성되어 있음. |
 
