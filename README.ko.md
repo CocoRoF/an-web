@@ -25,6 +25,7 @@ async with ANWebEngine() as engine:
 ## 목차
 
 - [왜 AN-Web인가?](#왜-an-web인가)
+- [Playwright 실측 벤치마크](#playwright-실측-벤치마크)
 - [설치](#설치)
 - [빠른 시작](#빠른-시작)
 - [핵심 개념](#핵심-개념)
@@ -40,6 +41,7 @@ async with ANWebEngine() as engine:
 - [아키텍처](#아키텍처)
 - [테스트](#테스트)
 - [API 레퍼런스 요약](#api-레퍼런스-요약)
+- [알려진 한계](#알려진-한계)
 - [라이선스](#라이선스)
 - [기여하기](#기여하기)
 
@@ -53,9 +55,11 @@ AN-Web은 **처음부터** AI 에이전트 루프를 위해 설계되었습니�
 | 관점 | 기존 헤드리스 브라우저 | AN-Web |
 |---|---|---|
 | **주요 출력** | 스크린샷 / DOM 문자열 | `PageSemantics` — 구조화된 월드 모델 |
-| **JS 엔진** | V8 (Chromium 전체) | V8 via PyMiniRacer (Chrome 동급, 경량 임베딩) |
-| **지연시간** | 500ms+ 콜드 스타트 | 액션당 < 50ms |
-| **메모리** | 300–800 MB+ (브라우저 프로세스) | 유휴 ~40 MB; JS 헤비 멀티세션 시 수백 MB (동일 워크로드 기준 Chromium의 약 ½) |
+| **JS 엔진** | V8 (Chromium 전체) | V8 via mini-racer (Chrome 동급, 경량 임베딩) |
+| **설치** | pip **+ 별도 ~650 MB 브라우저 다운로드** | pip만 — 브라우저 바이너리 없음, 총 ~111 MB |
+| **콜드 스타트** | ~3.3초 브라우저 기동 *(실측)* | ~0.15–0.35초 엔진+첫 세션 *(실측)* |
+| **액션 지연** | ~1.9 ms IPC 왕복 *(실측)* | ~0.04 ms 인프로세스 *(실측)* |
+| **메모리** | 10개 사이트 순회 피크 1.38 GB *(실측)* | 동일 순회 피크 484 MB *(실측)* |
 | **액션 타겟팅** | CSS 셀렉터 / XPath 전용 | 시맨틱: `{"by": "role", "role": "button", "text": "로그인"}` |
 | **정책 & 안전** | 내장 없음 | 도메인 규칙, 속도 제한, 샌드박스, 승인 프로세스 |
 | **관측성** | 외부 트레이싱 | 내장 `ArtifactCollector`, `StructuredLogger`, `ReplayEngine` |
@@ -63,12 +67,62 @@ AN-Web은 **처음부터** AI 에이전트 루프를 위해 설계되었습니�
 
 ---
 
+## Playwright 실측 벤치마크
+
+아래 모든 수치는 **추정이 아닌 실측**입니다 — 동일 호스트·동일 네트워크·동일 성공 기준. 패배도 그대로 공개합니다.
+
+> **방법** — 2026-07-03, Ubuntu 24.04, Python 3.12.3, 16코어.
+> `an-web 0.8.0` vs `playwright 1.61.0` + Chromium 1228 (headless shell).
+> 성공 = 타이틀 존재 **및** 사이트별 임계치 이상의 가시 텍스트 **및** 최소 링크 수.
+
+### 리소스 풋프린트
+
+| 지표 | AN-Web | Playwright + Chromium |
+|---|---|---|
+| 설치 단계 | `pip install an-web` | `pip install playwright` **+** `playwright install chromium` |
+| 설치 후 디스크 | **111 MB** | 136 MB (pip) + 646 MB (브라우저) ≈ **782 MB** |
+| 셋업 시 추가 다운로드 | 없음 | 114 MB 브라우저 아카이브 |
+| 콜드 스타트 (엔진+첫 페이지 컨텍스트) | **0.15–0.35초** | 3.3초 |
+| 웜 액션 지연 (`extract h1` ×20) | **0.04 ms** | 1.9 ms |
+| 10개 사이트 순회 피크 RSS(프로세스 트리) | **484 MB** | 1,382 MB |
+| en.wikipedia.org 에이전트 스냅샷 크기 | **13.7k자** (시맨틱 트리) | 293k자 (aria 스냅샷) |
+
+### 유명 사이트 10곳 정면 비교
+
+| 사이트 | AN-Web | Playwright | 비고 |
+|---|---|---|---|
+| example.com | ✅ 0.7초 | ✅ 0.7초 | |
+| en.wikipedia.org (문서) | ✅ 9.8초 | ✅ 2.3초 | 추출 텍스트 **사실상 동일** (86,351 vs 86,352자); AN-Web은 JS settle 비용 — `navigate(timeout=3)`으로 상한 설정 가능 |
+| news.ycombinator.com | ➖ | ➖ | 양쪽 모두 동일한 197개 링크 추출; 페이지에 `<h*>`/`<p>`가 없어 공용 텍스트 기준 미적용 |
+| github.com | ✅ 1.6초 | ✅ 2.4초 | |
+| stackoverflow.com | ✅ **5.4초** | ❌ HTTP 403 | Cloudflare가 headless Chromium 차단; AN-Web의 일반 HTTP 클라이언트는 통과 |
+| developer.mozilla.org | ✅ 0.8초 | ✅ 1.6초 | |
+| python.org | ✅ 15.4초 | ✅ 15.4초 | 양쪽 모두 settle/network-idle 예산 소진 |
+| naver.com | ❌ | ✅ 8.4초 | **AN-Web 패배** — 포털의 JS 스택이 shim Web API보다 완전한 브라우저 환경을 요구 |
+| bbc.com | ✅ **4.4초** | ✅ 15.6초 | Playwright는 network-idle 타임아웃까지 대기 |
+| hrletsgo.me (Next.js 14, 클라이언트 fetch) | ✅ 2.1초 | ✅ 1.5초 | 클라이언트 `fetch` 데이터 양쪽 모두 도달; 하이드레이션 관련은 [알려진 한계](#알려진-한계) 참고 |
+
+**스코어: 8/10 vs 8/10 — 실패 양상이 다릅니다.** AN-Web은 완전한 브라우저 환경을 요구하는 사이트(naver)에서 지고, Playwright는 headless Chromium을 겨냥한 안티봇(stackoverflow)이나 idle 휴리스틱 정체(bbc)에서 집니다. 대상별로 골라 쓰거나 병행하십시오.
+
+---
+
 ## 설치
 
-**요구사항:** Python 3.12+
+**요구사항:** Python **3.12+** — 그게 전부입니다.
 
 ```bash
 pip install an-web
+```
+
+> **브라우저가 필요 없습니다.** AN-Web은 Chromium, Chrome, Firefox, WebDriver를
+> 다운로드하거나 요구하지 않습니다. V8 JavaScript 엔진은 `mini-racer` 휠 안에
+> 프리빌트 네이티브 라이브러리로 포함되어 있어 `pip install`이 셋업의 전부입니다
+> (총 ~111 MB). `an-web install` 같은 후속 단계도, apt 패키지도 없습니다.
+
+MCP 서버 포함 설치 (Claude Desktop / MCP 클라이언트용):
+
+```bash
+pip install "an-web[mcp]"     # an-web-mcp 콘솔 스크립트 추가
 ```
 
 소스에서 설치:
@@ -90,8 +144,21 @@ pip install -e ".[dev]"
 | `selectolax` | 고속 HTML 파서 (Lexbor 백엔드) |
 | `html5lib` | 스펙 호환 폴백 파서 |
 | `pydantic` | 요청/응답 검증 |
-| `mini-racer` | 임베디드 V8 JavaScript 엔진 (V8 14.x) |
+| `mini-racer` | 임베디드 V8 JavaScript 엔진 (V8 14.x) — V8 내장, 시스템 의존성 없음 |
 | `cssselect` | CSS 셀렉터 파싱 |
+| `brotli` | 콘텐츠 인코딩 지원 |
+
+**플랫폼 노트**
+
+- `mini-racer` 프리빌트 휠: Linux(glibc/manylinux), macOS(x86-64·arm64), Windows — 컴파일러 불필요.
+- **Alpine/musl 컨테이너는 미지원** (V8 휠 제약); `python:3.12-slim`(Debian) 베이스를 사용하십시오.
+- 브라우저 프로세스가 없으므로 Docker에서 `--shm-size`, seccomp 조정, 가상 디스플레이 없이 그대로 동작합니다.
+
+```dockerfile
+# 최소 동작 Dockerfile
+FROM python:3.12-slim
+RUN pip install --no-cache-dir an-web
+```
 
 ---
 
@@ -1122,6 +1189,24 @@ pytest tests/integration/ -v
 | `PageSemantics` | 전체 페이지 상태: page_type, title, url, primary_actions, inputs, blocking_elements, semantic_tree |
 | `SemanticNode` | 시맨틱 트리의 요소: node_id, tag, role, name, value, is_interactive, visible, affordances, children |
 | `ActionResult` | 액션 결과: status, action, effects, error, recommended_next_actions |
+
+---
+
+## 알려진 한계
+
+AN-Web은 완전한 브라우저 충실도를 무게·속도와 맞바꿉니다. 선택 전에 트레이드오프를 확인하고, Playwright가 이기는 영역에서는 Playwright를 쓰십시오:
+
+| 영역 | 상태 | 상세 |
+|---|---|---|
+| **iframe** | ❌ 미실행 | 프레임 요소는 보이지만 내부 문서는 로드/스크립팅되지 않음. 결제·로그인 플로우 다수가 iframe 기반 — 해당 플로우는 Playwright 사용 권장. |
+| **WebSocket** | ❌ 부재 | WS 스트리밍(라이브 대시보드, 채팅) 콘텐츠 미수신. `fetch`/XHR은 완전 브리지됨. |
+| **포인터 리얼리즘** | ⚠️ 부분 | `click`/`type`/`select`/`scroll`/`submit`은 시맨틱 이벤트. `hover`, 드래그앤드롭, 저수준 키 코드는 없음. |
+| **스크린샷** | 🚫 의도적 부재 | AN-Web은 픽셀이 아닌 구조화된 증거를 생산. 시각 검증이 필요하면 픽셀 브라우저 사용. |
+| **안티봇 월** | ⚠️ 프로파일 상이 | AN-Web은 일반 HTTP 클라이언트 TLS 지문 — 일부 월은 이를 차단하고, 다른 월은 headless Chromium을 차단 (실측: stackoverflow.com에서 Cloudflare가 Playwright에 403, AN-Web은 통과 / naver.com은 AN-Web에 렌더 불가 셸 응답). 대상별 테스트 필수. |
+| **React 하이드레이션** | ⚠️ 부분 | SSR 주석 마커 보존(v0.8.0), 클라이언트 fetch 데이터는 정확히 1회 스냅샷 도달. 다만 일부 Next.js 페이지에서 *정적* 섹션이 중복 표시될 수 있음. |
+| **스크립트 헤비 settle** | ⚠️ 비용 | Wikipedia류 사이트는 settle 루프에서 수 초의 JS 실행. `session.navigate(url, timeout=3)`으로 상한 설정 — 서버 렌더 콘텐츠는 그 시점에 이미 완성되어 있음. |
+
+**경험칙:** *읽기·추출·입력·제출* 에이전트 루프 → AN-Web. *hover·드래그·스크린샷·iframe 결제·WS 스트림* → Playwright.
 
 ---
 
